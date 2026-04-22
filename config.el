@@ -49,6 +49,13 @@
        :desc "Sync project to remote" "s" #'my/project-sync
        :desc "Run project remotely"   "r" #'my/project-run-remote
        :desc "Open vterm"             "t" #'my/project-remote-terminal))
+
+(set-popup-rule! "^\\*remote-vterm\\*$"
+  :side 'bottom
+  :size 0.3
+  :select t
+  :quit nil)
+
 ;; Whenever you reconfigure a package, make sure to wrap your config in an
 ;; `with-eval-after-load' block, otherwise Doom's defaults may override your
 ;; settings. E.g.
