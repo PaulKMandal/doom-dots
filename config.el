@@ -80,6 +80,15 @@
   ;; give Treemacs the actual click events
   (define-key evil-treemacs-state-map [mouse-1] #'treemacs-leftclick-action)
   (define-key evil-treemacs-state-map [double-mouse-1] #'treemacs-doubleclick-action))
+
+(after! projectile
+  (setq projectile-switch-project-action
+        (lambda ()
+          (treemacs-add-and-display-current-project-exclusively)
+          (projectile-find-file))))
+
+(map! "C-c t" #'treemacs-add-and-display-current-project-exclusively)
+
 ;; Here are some additional functions/macros that will help you configure Doom.
 ;;
 ;; - `load!' for loading external *.el files relative to this one
