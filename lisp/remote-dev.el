@@ -22,6 +22,24 @@
 (defvar-local my/remote-sync-excludes nil
   "Extra rsync excludes for this project.  Entries are rsync pattern strings.")
 
+;; Directory-local values for these variables are expected in projects that use
+;; the remote helpers.  Mark them safe by shape so Emacs does not repeatedly
+;; prompt for every project-specific host/path/command string.
+(defun my/remote--safe-string (value)
+  "Return non-nil when VALUE is a single-line string."
+  (and (stringp value)
+       (not (string-match-p "[\n\r]" value))))
+
+(put 'my/remote-host 'safe-local-variable #'my/remote--safe-string)
+(put 'my/remote-dir 'safe-local-variable #'my/remote--safe-string)
+(put 'my/remote-run-cmd 'safe-local-variable #'my/remote--safe-string)
+(put 'my/remote-setup-cmd 'safe-local-variable #'my/remote--safe-string)
+(put 'my/remote-test-cmd 'safe-local-variable #'my/remote--safe-string)
+(put 'my/remote-smoke-cmd 'safe-local-variable #'my/remote--safe-string)
+(put 'my/remote-sync-excludes
+     'safe-local-variable
+     (lambda (value) (and (listp value) (seq-every-p #'my/remote--safe-string value))))
+
 (defvar my/remote-default-sync-excludes
   '(".git/"
     ".direnv/"
