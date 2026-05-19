@@ -20,7 +20,10 @@
   "Optional remote command for a quick smoke/integration run.")
 
 (defvar-local my/remote-sync-excludes nil
-  "Extra rsync excludes for this project.  Entries are rsync pattern strings.")
+  "Rsync exclude patterns for this project.
+
+Entries are rsync pattern strings passed as --exclude PATTERN.
+Set this in .dir-locals.el.  Nil means no excludes.")
 
 ;; Directory-local values for these variables are expected in projects that use
 ;; the remote helpers.  Mark them safe by shape so Emacs does not repeatedly
@@ -40,24 +43,6 @@
      'safe-local-variable
      (lambda (value) (and (listp value) (seq-every-p #'my/remote--safe-string value))))
 
-(defvar my/remote-default-sync-excludes
-  '(".git/"
-    ".direnv/"
-    ".venv/"
-    "__pycache__/"
-    ".mypy_cache/"
-    ".pytest_cache/"
-    ".ruff_cache/"
-    ".cache/"
-    "wandb/"
-    "results/"
-    "outputs/"
-    "checkpoint-*/"
-    "*.pyc"
-    "*.pt"
-    "*.bin"
-    "*.safetensors")
-  "Default files/directories excluded when syncing a project to a remote host.")
 
 (defun my/project-root ()
   (or (when (fboundp 'projectile-project-root)
@@ -78,13 +63,11 @@
   "Join non-nil shell command PARTS with &&."
   (string-join (seq-filter #'identity parts) " && "))
 
-(defun my/remote--excludes ()
-  (append my/remote-default-sync-excludes my/remote-sync-excludes))
-
 (defun my/remote--exclude-args ()
+  "Return rsync --exclude arguments from `my/remote-sync-excludes'."
   (mapconcat (lambda (pattern)
                (format "--exclude %s" (shell-quote-argument pattern)))
-             (my/remote--excludes)
+             my/remote-sync-excludes
              " "))
 
 (defun my/remote--ssh-command (remote-command)
