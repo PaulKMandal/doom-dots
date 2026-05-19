@@ -46,9 +46,15 @@
 
 (map! :leader
       (:prefix ("r" . "remote")
-       :desc "Sync project to remote" "s" #'my/project-sync
-       :desc "Run project remotely"   "r" #'my/project-run-remote
-       :desc "Open vterm"             "t" #'my/project-remote-terminal))
+       :desc "Sync project to remote"       "s" #'my/project-sync
+       :desc "Setup/update remote env"      "u" #'my/project-remote-setup
+       :desc "Run remote tests"             "T" #'my/project-test-remote
+       :desc "Run remote smoke test"        "q" #'my/project-smoke-remote
+       :desc "Run project remotely"         "r" #'my/project-run-remote
+       :desc "Sync + setup remote env"      "U" #'my/project-sync-and-setup
+       :desc "Sync + smoke test remotely"   "Q" #'my/project-sync-and-smoke
+       :desc "Sync + run project remotely"  "R" #'my/project-sync-and-run
+       :desc "Open vterm"                   "t" #'my/project-remote-terminal))
 
 (set-popup-rule! "^\\*remote-vterm\\*$"
   :side 'bottom
