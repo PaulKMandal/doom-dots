@@ -114,6 +114,8 @@
   (define-key evil-treemacs-state-map [mouse-1] #'treemacs-leftclick-action)
   (define-key evil-treemacs-state-map [double-mouse-1] #'treemacs-doubleclick-action))
 
+(defconst my/project-create-choice "[Create new project]")
+
 (defun my/project-open-treemacs ()
   "Show the current project in Treemacs without prompting for a file."
   (interactive)
@@ -127,8 +129,72 @@
     (when (window-live-p project-window)
       (select-window project-window))))
 
+(defun my/project--read-directory ()
+  "Read the directory to use for a new project."
+  (let ((base (if (file-directory-p "~/Documents/")
+                  "~/Documents/"
+                "~/")))
+    (file-name-as-directory
+     (expand-file-name
+      (read-directory-name "Create/use project directory: " base nil nil)))))
+
+(defun my/project--known-projects ()
+  "Return Projectile's known projects as directory names."
+  (let ((projects (if (fboundp 'projectile-relevant-known-projects)
+                      (projectile-relevant-known-projects)
+                    projectile-known-projects))
+        result)
+    (dolist (project projects (nreverse result))
+      (when (and project (not (string= project "")))
+        (push (file-name-as-directory project) result)))))
+
+(defun my/project-create (&optional directory)
+  "Create DIRECTORY as a Projectile project and show it in Treemacs."
+  (interactive)
+  (require 'projectile)
+  (let* ((dir (file-name-as-directory
+               (expand-file-name
+                (or directory (my/project--read-directory)))))
+         (marker (expand-file-name ".projectile" dir)))
+    (make-directory dir t)
+    (unless (or (file-exists-p marker)
+                (file-directory-p (expand-file-name ".git" dir)))
+      (with-temp-file marker
+        (insert "# Projectile project marker.\n")))
+    (projectile-add-known-project dir)
+    (dired dir)
+    (my/project-open-treemacs)
+    (message "Projectile project ready: %s" (abbreviate-file-name dir))))
+
+(defun my/project-switch-or-create ()
+  "Switch Projectile projects, with a fallback to create/register one."
+  (interactive)
+  (require 'projectile)
+  (let ((projects (my/project--known-projects)))
+    (if projects
+        (let ((choice (completing-read
+                       "Project: "
+                       (cons my/project-create-choice projects)
+                       nil nil nil 'projectile-project-history)))
+          (cond
+           ((string= choice my/project-create-choice)
+            (my/project-create))
+           ((member choice projects)
+            (projectile-switch-project-by-name choice))
+           ((string= choice "")
+            (user-error "No project selected"))
+           ((y-or-n-p (format "Create/register project at %s? " choice))
+            (my/project-create choice))
+           (t
+            (user-error "No project selected"))))
+      (when (y-or-n-p "No known Projectile projects. Create one? ")
+        (my/project-create)))))
+
 (after! projectile
-  (setq projectile-switch-project-action #'my/project-open-treemacs))
+  (setq projectile-switch-project-action #'my/project-open-treemacs)
+  (map! :leader
+        :desc "Switch/create project" "p p" #'my/project-switch-or-create
+        :desc "Create project"        "p n" #'my/project-create))
 
 (map! "C-c t" #'treemacs-add-and-display-current-project-exclusively)
 
