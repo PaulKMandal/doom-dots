@@ -114,11 +114,21 @@
   (define-key evil-treemacs-state-map [mouse-1] #'treemacs-leftclick-action)
   (define-key evil-treemacs-state-map [double-mouse-1] #'treemacs-doubleclick-action))
 
+(defun my/project-open-treemacs ()
+  "Show the current project in Treemacs without prompting for a file."
+  (interactive)
+  (let ((project-window (selected-window))
+        (default-directory
+         (file-name-as-directory
+          (or (ignore-errors (projectile-project-root))
+              default-directory))))
+    (require 'treemacs)
+    (treemacs-add-and-display-current-project-exclusively)
+    (when (window-live-p project-window)
+      (select-window project-window))))
+
 (after! projectile
-  (setq projectile-switch-project-action
-        (lambda ()
-          (treemacs-add-and-display-current-project-exclusively)
-          (projectile-find-file))))
+  (setq projectile-switch-project-action #'my/project-open-treemacs))
 
 (map! "C-c t" #'treemacs-add-and-display-current-project-exclusively)
 
