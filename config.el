@@ -190,9 +190,18 @@
       (when (y-or-n-p "No known Projectile projects. Create one? ")
         (my/project-create)))))
 
+(defun my/project-find-file ()
+  "Find a file in the current Projectile project, then show Treemacs."
+  (interactive)
+  (require 'projectile)
+  (call-interactively #'projectile-find-file)
+  (when (buffer-file-name)
+    (my/project-open-treemacs)))
+
 (after! projectile
   (setq projectile-switch-project-action #'my/project-open-treemacs)
   (map! :leader
+        :desc "Find project file"     "p ." #'my/project-find-file
         :desc "Switch/create project" "p p" #'my/project-switch-or-create
         :desc "Create project"        "p n" #'my/project-create))
 
