@@ -3,6 +3,10 @@
 (after! tex
   (require 'compile)
 
+  (defconst my/latex--safe-latexmk-program
+    (expand-file-name "bin/latexmk-safe" doom-user-dir)
+    "Wrapper that cleans and retries failed latexmk builds once.")
+
   (setq TeX-save-query nil)
   (setq-default TeX-master t)
   (when (assoc "LaTeXMk" TeX-command-list)
@@ -131,10 +135,14 @@
             (message "LaTeX build failed; see %s" (buffer-name buffer)))))))
 
   (defun my/latex--latexmk-command (latexmk master)
-    "Return a shell command using LATEXMK to compile MASTER."
+    "Return a recoverable shell command using LATEXMK to compile MASTER."
+    (unless (file-executable-p my/latex--safe-latexmk-program)
+      (user-error "LaTeX build wrapper is not executable: %s"
+                  my/latex--safe-latexmk-program))
     (mapconcat
      #'shell-quote-argument
-     (list latexmk
+     (list my/latex--safe-latexmk-program
+           latexmk
            "-pdf"
            "-interaction=nonstopmode"
            "-file-line-error"
