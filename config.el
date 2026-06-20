@@ -64,30 +64,7 @@
   :select t
   :quit nil)
 
-(after! tex
-  (setq-default TeX-command-default "LatexMk")
-  (setq TeX-save-query nil)
-
-  (unless (assoc "LatexMk" TeX-command-list)
-    (add-to-list 'TeX-command-list
-                 '("LatexMk"
-                   "latexmk -pdf -interaction=nonstopmode -synctex=1 %s"
-                   TeX-run-TeX nil t
-                   :help "Run LatexMk")))
-
-  (defun my/latex-compile-and-view ()
-    "Save, compile, and view the current LaTeX document."
-    (interactive)
-    (TeX-save-document (TeX-master-file))
-    (TeX-command-run-all nil))
-
-  (map! :map latex-mode-map
-        :localleader
-        :desc "Compile and view" "c" #'my/latex-compile-and-view)
-  (map! :after latex
-        :map LaTeX-mode-map
-        :localleader
-        :desc "Compile and view" "c" #'my/latex-compile-and-view))
+(load! "lisp/latex-build")
 
 ;; Whenever you reconfigure a package, make sure to wrap your config in an
 ;; `with-eval-after-load' block, otherwise Doom's defaults may override your
