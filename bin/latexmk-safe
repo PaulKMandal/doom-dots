@@ -18,28 +18,28 @@ run_build() {
   "$latexmk" "$@"
 }
 
-clean_intermediates() {
-  # Reuse the build arguments so project-specific output-directory options are
-  # honored.  In cleanup mode latexmk retains final PDF/DVI/PS output.
-  "$latexmk" -c "$@"
+run_full_rebuild() {
+  # Recovery must not reuse artifacts from the failed incremental build.
+  # latexmk -gg performs a full clean (-C) and then a regular make
+  # from a clean initial state.
+  "$latexmk" -gg "$@"
 }
 
 on_signal() {
   signal=$1
   status=$2
-  shift 2
 
   trap - HUP INT TERM
-  printf '\nlatexmk-safe: interrupted by %s; cleaning intermediate files\n' \
-    "$signal" >&2
-  clean_intermediates "$@" >/dev/null 2>&1 || true
+  printf '\nlatexmk-safe: interrupted by %s\n' "$signal" >&2
   exit "$status"
 }
 
-trap 'on_signal HUP 129 "$@"' HUP
-trap 'on_signal INT 130 "$@"' INT
-trap 'on_signal TERM 143 "$@"' TERM
+trap 'on_signal HUP 129' HUP
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
 
+# Keep the common case incremental: latexmk itself checks the dependency graph
+# and does nothing when the existing artifacts are current.
 run_build "$@"
 status=$?
 if [ "$status" -eq 0 ]; then
@@ -48,22 +48,18 @@ fi
 
 # Do not turn an interrupted compilation into a second compilation.
 if [ "$status" -ge 128 ]; then
-  clean_intermediates "$@" || true
   exit "$status"
 fi
 
-printf '\nlatexmk-safe: build failed with status %d; cleaning intermediates and retrying once\n' \
+printf '\nlatexmk-safe: incremental build failed with status %d; forcing a clean, complete rebuild\n' \
   "$status" >&2
-if ! clean_intermediates "$@"; then
-  printf 'latexmk-safe: warning: cleanup reported an error; retrying anyway\n' >&2
-fi
-
-run_build "$@"
+run_full_rebuild "$@"
 status=$?
 if [ "$status" -ne 0 ]; then
-  printf '\nlatexmk-safe: retry failed with status %d; cleaning intermediates before exit\n' \
+  # Keep the final log, aux, and dependency files: they describe the clean
+  # attempt and are useful for diagnosing a real source/toolchain failure.
+  printf '\nlatexmk-safe: clean rebuild failed with status %d; preserving its diagnostics\n' \
     "$status" >&2
-  clean_intermediates "$@" || true
 fi
 
 exit "$status"

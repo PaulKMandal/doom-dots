@@ -5,7 +5,7 @@
 
   (defconst my/latex--safe-latexmk-program
     (expand-file-name "bin/latexmk-safe" doom-user-dir)
-    "Wrapper that cleans and retries failed latexmk builds once.")
+    "Wrapper that forces a clean rebuild after an incremental failure.")
 
   (setq TeX-save-query nil)
   (setq-default TeX-master t)
