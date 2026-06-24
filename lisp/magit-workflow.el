@@ -10,6 +10,29 @@
       :desc "Fetch all remotes and prune" "g A"
       #'magit-fetch-all-prune)
 
+(defun my/magit-set-current-branch-upstream ()
+  "Set the upstream branch of the current branch."
+  (interactive)
+  (require 'magit)
+  (let* ((branch (or (magit-get-current-branch)
+                     (user-error "No Git branch is checked out")))
+         (upstream (magit-read-upstream-branch
+                    branch
+                    (format "Set upstream of %s" branch))))
+    (magit-set-upstream-branch branch upstream)
+    (when (derived-mode-p 'magit-mode)
+      (magit-refresh))
+    (message "Set upstream of %s to %s" branch upstream)))
+
+(map! :leader
+      :desc "Set current branch upstream" "g u"
+      #'my/magit-set-current-branch-upstream)
+
+(after! magit-branch
+  (transient-append-suffix
+    'magit-branch "C"
+    '("U" "set upstream" my/magit-set-current-branch-upstream)))
+
 (defun my/magit-publish-current-branch (args)
   "Push the current branch to a same-named branch and set its upstream."
   (interactive
