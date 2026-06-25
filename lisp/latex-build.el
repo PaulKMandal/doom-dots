@@ -3,10 +3,6 @@
 (after! tex
   (require 'compile)
 
-  (defconst my/latex--safe-latexmk-program
-    (expand-file-name "bin/latexmk-safe" doom-user-dir)
-    "Wrapper that forces a clean rebuild after an incremental failure.")
-
   (setq TeX-save-query nil)
   (setq-default TeX-master t)
   (when (assoc "LaTeXMk" TeX-command-list)
@@ -134,21 +130,36 @@
                 (display-buffer buffer)))
             (message "LaTeX build failed; see %s" (buffer-name buffer)))))))
 
+  (defun my/latex--executable-path (latexmk)
+    "Return a PATH containing LATEXMK's directory and `exec-path'."
+    (let ((directories
+           (append (list (file-name-directory latexmk))
+                   exec-path
+                   (parse-colon-path (or (getenv "PATH") ""))))
+          result)
+      (dolist (directory directories)
+        (when (and (stringp directory)
+                   (not (string= directory "")))
+          (let ((directory
+                 (directory-file-name (expand-file-name directory))))
+            (unless (member directory result)
+              (push directory result)))))
+      (mapconcat #'identity (nreverse result)
+                 (char-to-string path-separator))))
+
   (defun my/latex--latexmk-command (latexmk master)
-    "Return a recoverable shell command using LATEXMK to compile MASTER."
-    (unless (file-executable-p my/latex--safe-latexmk-program)
-      (user-error "LaTeX build wrapper is not executable: %s"
-                  my/latex--safe-latexmk-program))
+    "Return the latexmk command that compiles MASTER, including its bibliography."
     (mapconcat
      #'shell-quote-argument
-     (list my/latex--safe-latexmk-program
-           latexmk
+     (list latexmk
            "-pdf"
+           "-bibtex"
            "-interaction=nonstopmode"
            "-file-line-error"
            "-synctex=1"
            "-halt-on-error"
-           (file-name-nondirectory master))
+           "-cd"
+           master)
      " "))
 
   (defun my/latex--compile-master (master)
@@ -169,6 +180,7 @@
       (my/latex--save-project-buffers project-root)
       (let* ((default-directory directory)
              (compilation-always-kill t)
+             (process-environment (copy-sequence process-environment))
              (command (my/latex--latexmk-command latexmk master))
              (compilation-start-hook
               (cons
@@ -179,6 +191,10 @@
                    (add-hook 'compilation-finish-functions
                              #'my/latex--compilation-finished-h nil t)))
                compilation-start-hook)))
+        ;; `executable-find' searches `exec-path', but latexmk's child
+        ;; processes search PATH.  Keep those two views of the TeX toolchain
+        ;; synchronized so BibTeX/Biber and the LaTeX engine are reachable.
+        (setenv "PATH" (my/latex--executable-path latexmk))
         (compilation-start
          command
          'compilation-mode
