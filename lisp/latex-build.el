@@ -144,8 +144,7 @@
                  (directory-file-name (expand-file-name directory))))
             (unless (member directory result)
               (push directory result)))))
-      (mapconcat #'identity (nreverse result)
-                 (char-to-string path-separator))))
+      (mapconcat #'identity (nreverse result) path-separator)))
 
   (defun my/latex--latexmk-command (latexmk master)
     "Return the latexmk command that compiles MASTER, including its bibliography."
