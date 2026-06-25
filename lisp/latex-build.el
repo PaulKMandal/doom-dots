@@ -148,9 +148,11 @@
 
   (defun my/latex--latexmk-command (latexmk master)
     "Return the latexmk command that compiles MASTER, including its bibliography."
+    ;; Retry the TeX engine even when latexmk cached a failed prior run.
     (mapconcat
      #'shell-quote-argument
      (list latexmk
+           "-gt"
            "-pdf"
            "-bibtex"
            "-interaction=nonstopmode"
