@@ -146,22 +146,41 @@
               (push directory result)))))
       (mapconcat #'identity (nreverse result) path-separator)))
 
+  (defun my/latex--latexmk-invocation (latexmk args)
+    "Return a shell-quoted LATEXMK invocation with ARGS."
+    (mapconcat #'shell-quote-argument (cons latexmk args) " "))
+
   (defun my/latex--latexmk-command (latexmk master)
-    "Return the latexmk command that compiles MASTER, including its bibliography."
-    ;; Retry the TeX engine even when latexmk cached a failed prior run.
-    (mapconcat
-     #'shell-quote-argument
-     (list latexmk
-           "-gt"
-           "-pdf"
-           "-bibtex"
-           "-interaction=nonstopmode"
-           "-file-line-error"
-           "-synctex=1"
-           "-halt-on-error"
-           "-cd"
-           master)
-     " "))
+    "Return a recoverable latexmk command that compiles MASTER."
+    (let* ((common-args
+            (list "-pdf"
+                  "-bibtex"
+                  "-interaction=nonstopmode"
+                  "-file-line-error"
+                  "-synctex=1"
+                  "-halt-on-error"
+                  "-cd"
+                  master))
+           ;; Retry the TeX engine even when latexmk cached a failed prior run.
+           (incremental-command
+            (my/latex--latexmk-invocation latexmk (cons "-gt" common-args)))
+           ;; If the incremental run fails, stale aux/output files are a
+           ;; common cause.  Rebuild from a clean state once before surfacing
+           ;; the error to the user.
+           (clean-command
+            (my/latex--latexmk-invocation latexmk (cons "-gg" common-args))))
+      (mapconcat
+       #'identity
+       (list incremental-command
+             "status=$?"
+             "if [ $status -eq 0 ]; then exit 0; fi"
+             "if [ $status -ge 128 ]; then exit $status; fi"
+             "printf '\nlatexmk: incremental build failed with status %d; forcing a clean, complete rebuild\n' $status >&2"
+             clean-command
+             "status=$?"
+             "if [ $status -ne 0 ]; then printf '\nlatexmk: clean rebuild failed with status %d; preserving diagnostics\n' $status >&2; fi"
+             "exit $status")
+       "; ")))
 
   (defun my/latex--compile-master (master)
     "Compile MASTER with latexmk and show its PDF on the right."
