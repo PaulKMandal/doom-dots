@@ -44,6 +44,9 @@
 
 (setq +latex-viewers '(pdf-tools))
 
+(load! "lisp/process-path")
+(my/process-path-setup)
+
 (load! "lisp/remote-dev")
 
 (map! :leader
