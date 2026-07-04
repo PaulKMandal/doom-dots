@@ -172,14 +172,14 @@
       (mapconcat
        #'identity
        (list incremental-command
-             "status=$?"
-             "if [ $status -eq 0 ]; then exit 0; fi"
-             "if [ $status -ge 128 ]; then exit $status; fi"
-             "printf '\nlatexmk: incremental build failed with status %d; forcing a clean, complete rebuild\n' $status >&2"
+             "latexmk_rc=$?"
+             "if [ \"$latexmk_rc\" -eq 0 ]; then exit 0; fi"
+             "if [ \"$latexmk_rc\" -ge 128 ]; then exit \"$latexmk_rc\"; fi"
+             "printf '\nlatexmk: incremental build failed with status %d; forcing a clean, complete rebuild\n' \"$latexmk_rc\" >&2"
              clean-command
-             "status=$?"
-             "if [ $status -ne 0 ]; then printf '\nlatexmk: clean rebuild failed with status %d; preserving diagnostics\n' $status >&2; fi"
-             "exit $status")
+             "latexmk_rc=$?"
+             "if [ \"$latexmk_rc\" -ne 0 ]; then printf '\nlatexmk: clean rebuild failed with status %d; preserving diagnostics\n' \"$latexmk_rc\" >&2; fi"
+             "exit \"$latexmk_rc\"")
        "; ")))
 
   (defun my/latex--compile-master (master)
