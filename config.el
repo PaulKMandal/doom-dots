@@ -48,6 +48,7 @@
 (my/process-path-setup)
 
 (load! "lisp/remote-dev")
+(load! "lisp/codex-remote")
 
 (map! :leader
       (:prefix ("r" . "remote")
@@ -59,13 +60,29 @@
        :desc "Sync + setup remote env"      "U" #'my/project-sync-and-setup
        :desc "Sync + smoke test remotely"   "Q" #'my/project-sync-and-smoke
        :desc "Sync + run project remotely"  "R" #'my/project-sync-and-run
-       :desc "Open vterm"                   "t" #'my/project-remote-terminal))
+       :desc "Open vterm"                   "t" #'my/project-remote-terminal
+       (:prefix ("c" . "codex")
+        :desc "Start remote Codex task"       "s" #'my/codex-remote-start
+        :desc "Check remote Codex setup"      "d" #'my/codex-remote-doctor
+        :desc "Show remote Codex status"      "t" #'my/codex-remote-status
+        :desc "Attach to Codex tmux"          "a" #'my/codex-remote-attach
+        :desc "Show remote Codex logs"        "l" #'my/codex-remote-logs
+        :desc "Fetch/apply Codex result"      "f" #'my/codex-remote-apply
+        :desc "Cancel active Codex task"      "x" #'my/codex-remote-cancel
+        :desc "Archive imported Codex task"   "c" #'my/codex-remote-clean
+        :desc "Discard remote Codex task"     "X" #'my/codex-remote-discard)))
 
 (set-popup-rule! "^\\*remote-vterm\\*$"
   :side 'bottom
   :size 0.3
   :select t
   :quit nil)
+(set-popup-rule! "^\\*codex-remote-\\(logs\\|status\\|tmux\\)"
+  :side 'bottom
+  :size 0.4
+  :select t
+  :quit nil)
+
 
 (load! "lisp/latex-build")
 (load! "lisp/magit-workflow")
