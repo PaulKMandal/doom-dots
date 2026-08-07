@@ -15,3 +15,7 @@ dist/
 
 # Undo-tree save-files
 *.~undo-tree
+
+# Python cache files
+__pycache__/
+*.py[cod]
