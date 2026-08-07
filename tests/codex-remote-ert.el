@@ -113,6 +113,46 @@
         "env" "TERM=xterm-256color"
         "tmux" "attach-session" "-r" "-t" "codex-session")))))
 
+(ert-deftest codex-remote-tmux-interactive-command-is-read-write-and-bounded ()
+  (let ((args
+         (my/codex-remote--tmux-interactive-args
+          '(:host "rhel-test" :timeout 5)
+          '((tmux_session . "codex-session")))))
+    (should
+     (equal
+      args
+      '("-tt"
+        "-o" "BatchMode=yes"
+        "-o" "ConnectTimeout=5"
+        "-o" "ConnectionAttempts=1"
+        "rhel-test"
+        "env" "TERM=xterm-256color"
+        "tmux" "attach-session" "-t" "codex-session")))
+    (should-not (member "-r" args))))
+
+(ert-deftest codex-remote-external-terminal-command-wraps-interactive-ssh ()
+  (let ((my/codex-remote-external-terminal-command
+         '("kitty" "--title" "Remote Codex")))
+    (cl-letf (((symbol-function 'my/codex-remote--external-terminal-executable)
+               (lambda () "/run/current-system/sw/bin/kitty"))
+              ((symbol-function 'my/codex-remote--ssh-executable)
+               (lambda () "/run/current-system/sw/bin/ssh")))
+      (should
+       (equal
+        (my/codex-remote--external-terminal-command
+         '(:host "rhel-test" :timeout 5)
+         '((tmux_session . "codex-session")))
+        '("/run/current-system/sw/bin/kitty"
+          "--title" "Remote Codex"
+          "/run/current-system/sw/bin/ssh"
+          "-tt"
+          "-o" "BatchMode=yes"
+          "-o" "ConnectTimeout=5"
+          "-o" "ConnectionAttempts=1"
+          "rhel-test"
+          "env" "TERM=xterm-256color"
+          "tmux" "attach-session" "-t" "codex-session"))))))
+
 (ert-deftest codex-remote-attach-refuses-dead-pane-before-opening-terminal ()
   (should-error
    (my/codex-remote--open-tmux

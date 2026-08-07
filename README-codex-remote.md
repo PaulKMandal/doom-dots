@@ -36,6 +36,7 @@ The new commands are under `SPC r c`:
 | `SPC r c s` | start a remote Codex task |
 | `SPC r c t` | show task and local orchestration status |
 | `SPC r c a` | monitor a live task in a read-only built-in Term buffer |
+| `SPC r c i` | open a read-write attachment in an external kitty window |
 | `SPC r c l` | show runner, Codex, test, and final-message logs |
 | `SPC r c f` | fetch, integrate, and apply the completed Codex delta locally |
 | `SPC r c x` | request cancellation while preserving the worktree |
@@ -52,6 +53,14 @@ native `vterm` module. The monitor is available only while the runner pane is
 live; after exit, use `SPC r c l` for preserved logs. Use `SPC r c x` to cancel
 an active task rather than sending input through the monitor.
 
+`SPC r c i` opens a separate kitty OS window and attaches read-write to the
+same server-side tmux session. Closing that window, detaching with `C-b d`, or
+losing the SSH connection does not stop the task; run `SPC r c i` again to
+reattach. This is an interactive terminal/tmux attachment to the durable
+`codex exec` run, not a separate conversational Codex TUI. Input can interrupt
+the runner, so use the read-only `SPC r c a` monitor when observation alone is
+intended.
+
 ## Requirements
 
 ### Laptop
@@ -59,6 +68,7 @@ an active task rather than sending input through the monitor.
 - Git
 - OpenSSH client
 - Python 3.10 or newer
+- kitty (the configured external terminal for `SPC r c i`)
 - the supplied Doom configuration
 
 The backend uses only the Python standard library. No Python virtual environment
@@ -139,6 +149,11 @@ The following optional variables specialize the isolated Codex worktree:
 - `my/codex-remote-max-untracked-bytes`: per-file transfer limit, default
   20 MiB.
 
+`my/codex-remote-external-terminal-command` is a global customization rather
+than a project-local setting. Its default value is
+`("kitty" "--title" "Remote Codex")`; the frontend appends the resolved SSH
+executable and tmux attachment arguments.
+
 Example `.dir-locals.el`:
 
 ```elisp
@@ -200,7 +215,8 @@ Place stable project instructions in a checked-in `AGENTS.md`, including:
 3. Run `SPC r c s` and provide the task prompt.
 4. Continue local work or disconnect/suspend the laptop. The server-side
    `tmux` process continues.
-5. Inspect `SPC r c t`, `SPC r c l`, or `SPC r c a` as needed.
+5. Inspect `SPC r c t` or `SPC r c l`, monitor read-only with `SPC r c a`, or
+   open the external read-write tmux attachment with `SPC r c i` as needed.
 6. When the state is importable, run `SPC r c f`.
 7. Review the resulting ordinary local changes in Emacs or Magit.
 8. Use `SPC r s` then `SPC r r`, or `SPC r R`, to run the reconciled local

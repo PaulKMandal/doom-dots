@@ -18,6 +18,16 @@
   "Path to the local codex-remote backend."
   :type 'file)
 
+(defcustom my/codex-remote-external-terminal-command
+  '("kitty" "--title" "Remote Codex")
+  "Command prefix used for an external interactive Codex terminal.
+
+The first element is the terminal executable.  The local SSH executable and
+the read-write tmux attachment arguments are appended to this list.  The
+default opens a separate kitty OS window, matching the configured Sway
+terminal."
+  :type '(repeat string))
+
 (defvar-local my/codex-remote-bootstrap-cmd nil
   "Optional command used to prepare a new Codex worktree.
 
@@ -482,23 +492,48 @@ open a multiline prompt buffer; otherwise read a short prompt in the minibuffer.
       (executable-find "ssh")
       (user-error "Could not find ssh in Emacs's process environment")))
 
+(defun my/codex-remote--external-terminal-executable ()
+  "Return the configured external terminal executable."
+  (let ((program (car my/codex-remote-external-terminal-command)))
+    (unless (and (stringp program) (not (string-empty-p program)))
+      (user-error
+       "Set my/codex-remote-external-terminal-command to a nonempty command"))
+    (or (and (file-name-absolute-p program)
+             (file-executable-p program)
+             program)
+        (and (fboundp 'my/process-path--find-executable)
+             (my/process-path--find-executable program))
+        (executable-find program)
+        (user-error "Could not find external terminal executable: %s" program))))
+
+(defun my/codex-remote--tmux-attach-args (context task &optional read-only)
+  "Return SSH arguments for TASK's tmux session.
+
+When READ-ONLY is non-nil, attach the tmux client without allowing input."
+  (append
+   (list "-tt"
+         "-o" "BatchMode=yes"
+         "-o" (format "ConnectTimeout=%s" (plist-get context :timeout))
+         "-o" "ConnectionAttempts=1"
+         (plist-get context :host)
+         "env" "TERM=xterm-256color"
+         "tmux" "attach-session")
+   (when read-only (list "-r"))
+   (list "-t" (my/codex-remote--get task 'tmux_session))))
+
 (defun my/codex-remote--tmux-monitor-args (context task)
   "Return SSH arguments for a read-only tmux monitor of TASK."
-  (list "-tt"
-        "-o" "BatchMode=yes"
-        "-o" (format "ConnectTimeout=%s" (plist-get context :timeout))
-        "-o" "ConnectionAttempts=1"
-        (plist-get context :host)
-        "env" "TERM=xterm-256color"
-        "tmux" "attach-session" "-r" "-t"
-        (my/codex-remote--get task 'tmux_session)))
+  (my/codex-remote--tmux-attach-args context task t))
 
-(defun my/codex-remote--open-tmux (context task)
-  "Monitor TASK's live tmux pane in Emacs's built-in terminal emulator."
+(defun my/codex-remote--tmux-interactive-args (context task)
+  "Return SSH arguments for a read-write tmux attachment to TASK."
+  (my/codex-remote--tmux-attach-args context task nil))
+
+(defun my/codex-remote--require-live-tmux (task)
+  "Return TASK's tmux session name, or signal a useful user error."
   (let* ((session (my/codex-remote--get task 'tmux_session))
          (state (my/codex-remote--get task 'state))
-         (tmux (my/codex-remote--get task 'tmux))
-         (task-id (my/codex-remote--get task 'task_id)))
+         (tmux (my/codex-remote--get task 'tmux)))
     (unless session
       (user-error "Task %s has no tmux session" state))
     (unless (my/codex-remote--get tmux 'exists)
@@ -510,6 +545,12 @@ open a multiline prompt buffer; otherwise read a short prompt in the minibuffer.
        (if-let ((status (my/codex-remote--get tmux 'pane_dead_status)))
            (format " with status %s" status)
          "")))
+    session))
+
+(defun my/codex-remote--open-tmux (context task)
+  "Monitor TASK's live tmux pane in Emacs's built-in terminal emulator."
+  (let* ((session (my/codex-remote--require-live-tmux task))
+         (task-id (my/codex-remote--get task 'task_id)))
     (require 'term)
     (let* ((name (format "codex-remote-tmux:%s" task-id))
            (buffer-name (format "*%s*" name))
@@ -530,6 +571,39 @@ open a multiline prompt buffer; otherwise read a short prompt in the minibuffer.
               (set-process-query-on-exit-flag process nil)))
           (pop-to-buffer buffer))))))
 
+(defun my/codex-remote--external-terminal-command (context task)
+  "Return the external-terminal command for TASK."
+  (append
+   (cons (my/codex-remote--external-terminal-executable)
+         (cdr my/codex-remote-external-terminal-command))
+   (list (my/codex-remote--ssh-executable))
+   (my/codex-remote--tmux-interactive-args context task)))
+
+(defun my/codex-remote--open-external-tmux (context task)
+  "Open TASK's live tmux pane in an external read-write terminal."
+  (my/codex-remote--require-live-tmux task)
+  (let* ((task-id (my/codex-remote--get task 'task_id))
+         (process
+          (make-process
+           :name (format "codex-remote-interactive-%s-%d"
+                         task-id
+                         (truncate (* 1000 (float-time))))
+           :buffer nil
+           :command (my/codex-remote--external-terminal-command context task)
+           :connection-type 'pipe
+           :noquery t
+           :sentinel
+           (lambda (proc _event)
+             (when (and (memq (process-status proc) '(exit signal))
+                        (not (= (process-exit-status proc) 0)))
+               (message
+                "Remote Codex external terminal exited with status %s"
+                (process-exit-status proc)))))))
+    (message
+     "Opened external Codex terminal for %s; closing it detaches while tmux continues"
+     task-id)
+    process))
+
 (defun my/codex-remote-attach ()
   "Open a read-only monitor for the current live remote Codex task."
   (interactive)
@@ -544,6 +618,24 @@ open a multiline prompt buffer; otherwise read a short prompt in the minibuffer.
          (when (equal (my/codex-remote--get task 'state) "NONE")
            (user-error "No remote Codex task exists for this project"))
          (my/codex-remote--open-tmux context task))))))
+
+(defun my/codex-remote-interactive ()
+  "Open the current live Codex tmux session in an external terminal.
+
+The attachment is read-write.  Closing the terminal or losing SSH detaches the
+client only; the server-side tmux session and Codex task continue running."
+  (interactive)
+  (let* ((context (my/codex-remote--context))
+         (command (my/codex-remote--common-args "status" context)))
+    (my/codex-remote--run
+     "interactive" command context
+     :on-success
+     (lambda (response buffer)
+       (kill-buffer buffer)
+       (let ((task (my/codex-remote--get response 'task)))
+         (when (equal (my/codex-remote--get task 'state) "NONE")
+           (user-error "No remote Codex task exists for this project"))
+         (my/codex-remote--open-external-tmux context task))))))
 
 (defun my/codex-remote--apply-error (response buffer)
   "Handle apply failure RESPONSE from BUFFER."
