@@ -284,6 +284,162 @@ class IntegrationTests(RepositoryTestCase):
         cr.remove_worktree(self.root, conflict_path)
 
 
+    def test_resolved_conflict_imports_when_apply_is_retried(self) -> None:
+        input_snapshot = cr.create_hidden_snapshot(
+            self.root, "refs/codex/test/input/resolved-conflict", "input"
+        )
+
+        def codex_changes(tree: Path) -> None:
+            (tree / "tracked.txt").write_text(
+                "one\nCODEX\nthree\nfour\n", encoding="utf-8"
+            )
+
+        result_sha = self.make_result(
+            input_snapshot["commit"], codex_changes, "resolved-conflict-result"
+        )
+        (self.root / "tracked.txt").write_text(
+            "one\nLOCAL\nthree\nfour\n", encoding="utf-8"
+        )
+        before = visible_state(self.root)
+        state_dir = self.base / "resolved-conflict-state"
+
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.integrate_result_into_worktree(
+                self.root,
+                "test-project",
+                "task-resolved-conflict",
+                input_snapshot["commit"],
+                result_sha,
+                state_dir=state_dir,
+            )
+        self.assertEqual(caught.exception.code, "INTEGRATION_CONFLICT")
+        conflict_path = Path(caught.exception.details["conflict_path"])
+        (conflict_path / "tracked.txt").write_text(
+            "one\nLOCAL+CODEX\nthree\nfour\n", encoding="utf-8"
+        )
+        git(conflict_path, "add", "tracked.txt")
+        git(conflict_path, "-c", "core.editor=true", "rebase", "--continue")
+
+        result = cr.integrate_result_into_worktree(
+            self.root,
+            "test-project",
+            "task-resolved-conflict",
+            input_snapshot["commit"],
+            result_sha,
+            state_dir=state_dir,
+        )
+
+        after = visible_state(self.root)
+        self.assertEqual(before["head"], after["head"])
+        self.assertEqual(before["branch"], after["branch"])
+        self.assertEqual(before["index"], after["index"])
+        self.assertEqual(
+            (self.root / "tracked.txt").read_text(encoding="utf-8"),
+            "one\nLOCAL+CODEX\nthree\nfour\n",
+        )
+        self.assertFalse(conflict_path.exists())
+        self.assertFalse((state_dir / "integration-conflict.json").exists())
+        self.assertEqual({item["path"] for item in result["changed_files"]}, {"tracked.txt"})
+
+    def test_local_backup_branch_preserves_later_work_and_restores_task_input(self) -> None:
+        tracked = self.root / "tracked.txt"
+        tracked.write_text("STAGED\ntwo\nthree\nfour\n", encoding="utf-8")
+        git(self.root, "add", "tracked.txt")
+        tracked.write_text("STAGED\nUNSTAGED\nthree\nfour\n", encoding="utf-8")
+        (self.root / "input-untracked.txt").write_text("input\n", encoding="utf-8")
+        input_snapshot = cr.create_hidden_snapshot(
+            self.root, "refs/codex/test/input/backup", "input"
+        )
+        task = {
+            "task_id": "task-backup",
+            "local_branch": "main",
+            "local_head": input_snapshot["head"],
+            "input_tree": input_snapshot["tree"],
+            "input_index_tree": input_snapshot["index_tree"],
+        }
+        local = dict(task)
+
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-m", "local commits after task start")
+        (self.root / "tracked.txt").write_text(
+            "LOCAL-COMMIT\nLOCAL-WIP\nthree\nfour\n", encoding="utf-8"
+        )
+        (self.root / "later-untracked.txt").write_text("later wip\n", encoding="utf-8")
+        before_head = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        before_tree = cr.snapshot_tree_only(self.root)
+        state_dir = self.base / "backup-state"
+
+        recovery = cr.preserve_local_state_on_branch(
+            self.root,
+            "test-project",
+            task,
+            local,
+            input_snapshot["commit"],
+            max_untracked_bytes=1024 * 1024,
+            state_dir=state_dir,
+        )
+
+        branch = recovery["backup_branch"]
+        self.assertRegex(branch, r"^main-local-\d{8}T\d{6}Z")
+        self.assertEqual(
+            git(self.root, "rev-parse", f"{branch}^{{tree}}").stdout.strip(),
+            before_tree,
+        )
+        self.assertEqual(
+            git(self.root, "rev-parse", f"{branch}^").stdout.strip(),
+            before_head,
+        )
+        self.assertEqual(
+            git(self.root, "show", f"{branch}:later-untracked.txt").stdout,
+            "later wip\n",
+        )
+        self.assertEqual(current := cr.current_head(self.root), input_snapshot["head"])
+        self.assertEqual(cr.index_tree(self.root), input_snapshot["index_tree"])
+        self.assertEqual(cr.snapshot_tree_only(self.root), input_snapshot["tree"])
+        self.assertEqual(current, task["local_head"])
+        self.assertTrue((state_dir / "local-backup.json").is_file())
+
+    def test_requested_backup_push_failure_leaves_canonical_checkout_unchanged(self) -> None:
+        input_snapshot = cr.create_hidden_snapshot(
+            self.root, "refs/codex/test/input/push-failure", "input"
+        )
+        task = {
+            "task_id": "task-push-failure",
+            "local_branch": "main",
+            "local_head": input_snapshot["head"],
+            "input_tree": input_snapshot["tree"],
+            "input_index_tree": input_snapshot["index_tree"],
+        }
+        (self.root / "tracked.txt").write_text(
+            "one\nLOCAL\nthree\nfour\n", encoding="utf-8"
+        )
+        before = visible_state(self.root)
+        state_dir = self.base / "push-failure-state"
+
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.preserve_local_state_on_branch(
+                self.root,
+                "test-project",
+                task,
+                task,
+                input_snapshot["commit"],
+                max_untracked_bytes=1024 * 1024,
+                push_backup=True,
+                backup_remote="missing-remote",
+                state_dir=state_dir,
+            )
+
+        self.assertEqual(caught.exception.code, "BACKUP_PUSH_FAILED")
+        self.assertEqual(before, visible_state(self.root))
+        branches = git(
+            self.root,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/main-local-*",
+        ).stdout.splitlines()
+        self.assertEqual(len(branches), 1)
+
+
 class ServerStartTests(RepositoryTestCase):
     def test_server_start_is_idempotent_and_freezes_the_runner_helper(self) -> None:
         home = self.base / "server-home"
@@ -347,6 +503,62 @@ class ServerStartTests(RepositoryTestCase):
             self.assertIn("bash -lc", task["runner_command"])
             self.assertIn("flock", task["runner_command"])
             self.assertEqual(task["state"], "STARTING")
+            self.assertEqual(task["execution_mode"], "exec")
+
+    def test_server_start_accepts_interactive_task_without_prompt(self) -> None:
+        home = self.base / "interactive-server-home"
+        home.mkdir()
+        fake_codex = home / "bin" / "codex"
+        fake_codex.parent.mkdir(parents=True)
+        fake_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_codex.chmod(0o755)
+        project_id = "interactive-project"
+        task_id = "task-interactive"
+
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            input_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+            input_ref = f"refs/codex/{project_id}/input/{task_id}"
+            git(self.root, "push", str(paths["broker"]), f"HEAD:{input_ref}")
+            payload = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "project_name": "interactive",
+                "task_id": task_id,
+                "execution_mode": "interactive",
+                "input_ref": input_ref,
+                "input_sha": input_sha,
+                "local_head": input_sha,
+                "local_branch": "main",
+                "normal_remote_dir": "/srv/normal-project",
+                "prompt": None,
+                "prompt_sha256": None,
+                "bootstrap_cmd": None,
+                "test_cmd": None,
+                "data_links": [],
+                "max_untracked_bytes": 1024 * 1024,
+                "model": None,
+                "profile": None,
+                "reasoning_effort": None,
+                "enable_search": False,
+                "lock_hashes": cr.file_hashes(self.root),
+                "created_at": cr.utc_now(),
+            }
+            tools = {
+                "bash": shutil.which("bash"),
+                "git": shutil.which("git"),
+                "tmux": shutil.which("true"),
+                "flock": shutil.which("flock"),
+                "codex": str(fake_codex),
+            }
+
+            with mock.patch.object(cr, "login_which", side_effect=lambda name: tools[name]):
+                started = cr.server_start(project_id, task_id, payload)
+
+            task = started["task"]
+            self.assertEqual(task["execution_mode"], "interactive")
+            self.assertIsNone(task["prompt_path"])
+            self.assertTrue(task["tmux_session"].startswith("codexi-"))
 
 
 class ServerCleanupTests(RepositoryTestCase):
@@ -428,6 +640,66 @@ class ServerCleanupTests(RepositoryTestCase):
         self.assertFalse(status["tmux"]["exists"])
         self.assertFalse(status["tmux"]["running"])
         self.assertFalse(status["worktree_exists"])
+
+
+    def test_orphaned_worktree_can_be_published_without_rerunning_codex(self) -> None:
+        home = self.base / "recover-home"
+        home.mkdir()
+        project_id = "recover-project"
+        task_id = "task-recover"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            input_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+            input_ref = f"refs/codex/{project_id}/input/{task_id}"
+            git(self.root, "push", str(paths["broker"]), f"HEAD:{input_ref}")
+            worktree = paths["worktrees"] / task_id
+            command(
+                "git",
+                "--git-dir",
+                paths["broker"],
+                "worktree",
+                "add",
+                "--detach",
+                worktree,
+                input_sha,
+            )
+            (worktree / "tracked.txt").write_text(
+                "one\nRECOVERED\nthree\nfour\n", encoding="utf-8"
+            )
+            task = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "project_name": "recover",
+                "task_id": task_id,
+                "state": "ORPHANED",
+                "execution_mode": "interactive",
+                "input_ref": input_ref,
+                "input_sha": input_sha,
+                "worktree": str(worktree),
+                "state_dir": str(paths["project_state"] / task_id),
+                "max_untracked_bytes": 1024 * 1024,
+                "tools": {"tmux": "/bin/false"},
+                "error": "runner disappeared",
+            }
+            cr.save_server_task(paths, task)
+            result = cr.server_recover(project_id)
+
+            recovered = result["task"]
+            self.assertEqual(recovered["state"], "READY_RECOVERED_UNVERIFIED")
+            self.assertTrue(recovered["has_changes"])
+            self.assertFalse(recovered["recovery"]["codex_rerun"])
+            self.assertFalse(recovered["recovery"]["tests_rerun"])
+            self.assertIsNone(recovered.get("error"))
+            self.assertEqual(
+                command(
+                    "git",
+                    "--git-dir",
+                    paths["broker"],
+                    "rev-parse",
+                    recovered["result_ref"],
+                ).stdout.strip(),
+                recovered["result_sha"],
+            )
 
 
 class ServerRunnerTests(RepositoryTestCase):
@@ -596,6 +868,41 @@ class ServerRunnerTests(RepositoryTestCase):
             f"{task['result_sha']}^",
         ).stdout.strip()
         self.assertEqual(parent, task["input_sha"])
+
+    def test_interactive_runner_inherits_terminal_and_finalizes_result(self) -> None:
+        home = self.base / "interactive-home"
+        home.mkdir()
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            project_id, task_id, paths = self.prepare_server_task(home)
+            task = cr.load_server_task(paths, task_id)
+            assert task is not None
+            task["execution_mode"] = "interactive"
+            task["prompt_path"] = None
+            task["test_cmd"] = "grep -q INTERACTIVE interactive.txt"
+            fake_codex = Path(task["tools"]["codex"])
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                "Path('interactive.txt').write_text('INTERACTIVE\\n')\n",
+                encoding="utf-8",
+            )
+            cr.save_server_task(paths, task)
+            try:
+                cr.server_run(project_id, task_id)
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+
+            finished = cr.load_server_task(paths, task_id)
+            assert finished is not None
+            self.assertEqual(finished["state"], "READY")
+            self.assertEqual(finished["execution_mode"], "interactive")
+            self.assertEqual(finished["codex_exit_code"], 0)
+            self.assertTrue(finished["has_changes"])
+            self.assertEqual(finished["tests"]["exit_code"], 0)
+            self.assertFalse((Path(finished["state_dir"]) / "codex.jsonl").exists())
 
     def test_lockfile_change_refreshes_environment_before_tests(self) -> None:
         task = self.run_server_task(lock_change=True)
@@ -786,6 +1093,182 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertEqual(value[value.index("--sandbox") + 1], "workspace-write")
         self.assertIn("model_reasoning_effort=high", value)
         self.assertEqual(value[-1], "-")
+
+    def test_interactive_codex_command_launches_normal_tui_with_approvals(self) -> None:
+        task = {
+            "tools": {"codex": "/opt/codex"},
+            "model": "gpt-test",
+            "profile": "server",
+            "reasoning_effort": "high",
+            "enable_search": True,
+        }
+        value = cr.interactive_codex_command(task)
+        self.assertEqual(value[0], "/opt/codex")
+        self.assertNotIn("exec", value)
+        self.assertEqual(value[value.index("--sandbox") + 1], "workspace-write")
+        self.assertEqual(value[value.index("--ask-for-approval") + 1], "on-request")
+        self.assertIn("--search", value)
+        self.assertIn("gpt-test", value)
+        self.assertIn("server", value)
+        self.assertIn("model_reasoning_effort=high", value)
+
+    def test_interactive_command_reuses_active_interactive_task(self) -> None:
+        args = argparse.Namespace(max_untracked_bytes=1024)
+        existing = {
+            "task_id": "task-1",
+            "state": "RUNNING",
+            "execution_mode": "interactive",
+            "tmux": {"exists": True, "running": True},
+        }
+        with (
+            mock.patch.object(
+                cr,
+                "common_local_args",
+                return_value=(self.root, "rhel-test", "/srv/repo", 5, "repo-test", "repo"),
+            ),
+            mock.patch.object(cr, "ensure_remote_helper", return_value={"helper": "/helper"}),
+            mock.patch.object(cr, "remote_invoke", return_value={"ok": True}),
+            mock.patch.object(cr, "remote_status", return_value={"ok": True, "task": existing}),
+            mock.patch.object(cr, "local_current_path", return_value=self.base / "current.json"),
+            mock.patch.object(cr, "read_json", return_value=None),
+            mock.patch.object(cr, "start_new_task") as start_new,
+        ):
+            result = cr.cmd_interactive(args)
+
+        self.assertTrue(result["reused"])
+        self.assertEqual(result["task"], existing)
+        start_new.assert_not_called()
+
+    def test_interactive_command_starts_managed_task_when_project_is_resolved(self) -> None:
+        args = argparse.Namespace(max_untracked_bytes=1024)
+        expected = {"ok": True, "task": {"state": "STARTING"}}
+        with (
+            mock.patch.object(
+                cr,
+                "common_local_args",
+                return_value=(self.root, "rhel-test", "/srv/repo", 5, "repo-test", "repo"),
+            ),
+            mock.patch.object(cr, "ensure_remote_helper", return_value={"helper": "/helper"}),
+            mock.patch.object(cr, "remote_invoke", return_value={"ok": True}),
+            mock.patch.object(
+                cr,
+                "remote_status",
+                return_value={"ok": True, "task": {"state": "NONE"}},
+            ),
+            mock.patch.object(cr, "start_new_task", return_value=expected) as start_new,
+        ):
+            result = cr.cmd_interactive(args)
+
+        self.assertEqual(result, expected)
+        start_new.assert_called_once_with(
+            args, execution_mode="interactive", prompt=None
+        )
+
+    def test_interactive_command_does_not_reattach_during_finalization(self) -> None:
+        args = argparse.Namespace(max_untracked_bytes=1024)
+        existing = {
+            "task_id": "task-finalizing",
+            "state": "FINALIZING",
+            "execution_mode": "interactive",
+        }
+        with (
+            mock.patch.object(
+                cr,
+                "common_local_args",
+                return_value=(self.root, "rhel-test", "/srv/repo", 5, "repo-test", "repo"),
+            ),
+            mock.patch.object(cr, "ensure_remote_helper", return_value={"helper": "/helper"}),
+            mock.patch.object(cr, "remote_invoke", return_value={"ok": True}),
+            mock.patch.object(cr, "remote_status", return_value={"ok": True, "task": existing}),
+        ):
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.cmd_interactive(args)
+
+        self.assertEqual(caught.exception.code, "OUTSTANDING_TASK")
+        self.assertIs(caught.exception.details, existing)
+
+    def test_interactive_command_blocks_active_noninteractive_task(self) -> None:
+        args = argparse.Namespace(max_untracked_bytes=1024)
+        existing = {
+            "task_id": "task-exec",
+            "state": "RUNNING",
+            "execution_mode": "exec",
+        }
+        with (
+            mock.patch.object(
+                cr,
+                "common_local_args",
+                return_value=(self.root, "rhel-test", "/srv/repo", 5, "repo-test", "repo"),
+            ),
+            mock.patch.object(cr, "ensure_remote_helper", return_value={"helper": "/helper"}),
+            mock.patch.object(cr, "remote_invoke", return_value={"ok": True}),
+            mock.patch.object(
+                cr,
+                "remote_status",
+                return_value={"ok": True, "task": existing},
+            ),
+        ):
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.cmd_interactive(args)
+
+        self.assertEqual(caught.exception.code, "OUTSTANDING_TASK")
+        self.assertIs(caught.exception.details, existing)
+
+
+    def test_apply_refuses_live_interactive_session(self) -> None:
+        args = argparse.Namespace(max_untracked_bytes=1024)
+        task = {
+            "task_id": "task-interactive",
+            "state": "RUNNING",
+            "execution_mode": "interactive",
+        }
+        with (
+            mock.patch.object(
+                cr,
+                "common_local_args",
+                return_value=(self.root, "rhel-test", "/srv/repo", 5, "repo-test", "repo"),
+            ),
+            mock.patch.object(cr, "ensure_remote_helper", return_value={"helper": "/helper"}),
+            mock.patch.object(cr, "remote_status", return_value={"task": task}),
+            mock.patch.object(cr, "local_current_path", return_value=self.base / "current.json"),
+            mock.patch.object(cr, "read_json", return_value=None),
+        ):
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.cmd_apply(args)
+
+        self.assertEqual(caught.exception.code, "INTERACTIVE_TASK_ACTIVE")
+        self.assertIn("/exit or /quit", str(caught.exception))
+
+    def test_project_configuration_is_persisted_for_terminal_frontend(self) -> None:
+        args = argparse.Namespace(
+            project_root=str(self.root),
+            host="rhel-test",
+            remote_dir="/srv/repo",
+            timeout=7,
+            max_untracked_bytes=4096,
+            bootstrap_cmd="nix develop --command uv sync --frozen",
+            test_cmd="nix develop --command pytest -q",
+            data_link=["/srv/data=data"],
+            model="gpt-test",
+            profile="server",
+            reasoning_effort="high",
+            enable_search=True,
+        )
+        root, host, remote_dir, timeout, _project_id, _project_name = cr.common_local_args(args)
+        self.assertEqual(root, self.root.resolve())
+        self.assertEqual(host, "rhel-test")
+        self.assertEqual(remote_dir, "/srv/repo")
+        self.assertEqual(timeout, 7)
+        path = cr.local_project_config_path(self.root)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(value["host"], "rhel-test")
+        self.assertEqual(value["remote_dir"], "/srv/repo")
+        self.assertEqual(value["bootstrap_cmd"], args.bootstrap_cmd)
+        self.assertEqual(value["test_cmd"], args.test_cmd)
+        self.assertEqual(value["data_links"], args.data_link)
+        self.assertEqual(value["reasoning_effort"], "high")
+        self.assertTrue(value["enable_search"])
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

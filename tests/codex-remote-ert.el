@@ -62,6 +62,55 @@
       (should (member "high" command))
       (should (member "--enable-search" command)))))
 
+(ert-deftest codex-remote-interactive-command-adds-project-options-without-prompt ()
+  (let ((my/codex-remote-backend "/tmp/codex-remote")
+        (context '(:root "/tmp/project/"
+                   :host "rhel-test"
+                   :remote-dir "/srv/project"
+                   :timeout 5
+                   :max-untracked 2048
+                   :bootstrap "nix develop --command true"
+                   :test "nix develop --command pytest"
+                   :data-links ("/srv/data=data")
+                   :model "gpt-test"
+                   :profile "server"
+                   :reasoning "high"
+                   :search t)))
+    (let ((command (my/codex-remote--interactive-command context)))
+      (should (equal (seq-take command 2)
+                     '("/tmp/codex-remote" "interactive")))
+      (should-not (member "--prompt-file" command))
+      (should (member "--bootstrap-cmd" command))
+      (should (member "--test-cmd" command))
+      (should (member "/srv/data=data" command))
+      (should (member "gpt-test" command))
+      (should (member "server" command))
+      (should (member "high" command))
+      (should (member "--enable-search" command)))))
+
+(ert-deftest codex-remote-interactive-action-starts-attaches-or-blocks ()
+  (should
+   (eq (my/codex-remote--interactive-action
+        '((state . "RUNNING") (execution_mode . "interactive")))
+       'attach))
+  (dolist (state '("NONE" "IMPORTED" "DISCARDED" "ARCHIVED"))
+    (should
+     (eq (my/codex-remote--interactive-action
+          `((state . ,state) (execution_mode . "interactive")))
+         'start)))
+  (should
+   (eq (my/codex-remote--interactive-action
+        '((state . "RUNNING") (execution_mode . "exec")))
+       'blocked))
+  (should
+   (eq (my/codex-remote--interactive-action
+        '((state . "READY") (execution_mode . "interactive")))
+       'blocked))
+  (should
+   (eq (my/codex-remote--interactive-action
+        '((state . "FINALIZING") (execution_mode . "interactive")))
+       'blocked)))
+
 (ert-deftest codex-remote-json-parsing-and-key-access ()
   (with-temp-buffer
     (insert "diagnostic before JSON\n")
@@ -153,6 +202,50 @@
           "env" "TERM=xterm-256color"
           "tmux" "attach-session" "-t" "codex-session"))))))
 
+
+(ert-deftest codex-remote-terminal-job-command-preserves-project-options ()
+  (let ((my/codex-remote-backend "/tmp/codex-remote")
+        (my/codex-remote-job-program "/tmp/codex-remote-job")
+        (my/codex-remote-job-terminal-command
+         '("kitty" "--title" "Remote Codex Job"))
+        (context '(:root "/tmp/project/"
+                   :host "rhel-test"
+                   :remote-dir "/srv/project"
+                   :timeout 5
+                   :max-untracked 2048
+                   :bootstrap "nix develop --command true"
+                   :test "pytest -q"
+                   :data-links ("/srv/data=data")
+                   :model "gpt-test"
+                   :profile "server"
+                   :reasoning "high"
+                   :search t)))
+    (cl-letf (((symbol-function 'my/codex-remote--job-terminal-executable)
+               (lambda () "/run/current-system/sw/bin/kitty"))
+              ((symbol-function 'my/codex-remote--job-executable)
+               (lambda () "/tmp/codex-remote-job")))
+      (should
+       (equal
+        (my/codex-remote--job-command context)
+        '("/run/current-system/sw/bin/kitty"
+          "--title" "Remote Codex Job"
+          "/tmp/codex-remote-job"
+          "--project-root" "/tmp/project/"
+          "--backend" "/tmp/codex-remote"
+          "--host" "rhel-test"
+          "--remote-dir" "/srv/project"
+          "--timeout" "5"
+          "--max-untracked-bytes" "2048"
+          "--bootstrap-cmd" "nix develop --command true"
+          "--test-cmd" "pytest -q"
+          "--data-link" "/srv/data=data"
+          "--model" "gpt-test"
+          "--profile" "server"
+          "--reasoning-effort" "high"
+          "--enable-search"
+          "--ignore-config"
+          "--pause-at-end"))))))
+
 (ert-deftest codex-remote-attach-refuses-dead-pane-before-opening-terminal ()
   (should-error
    (my/codex-remote--open-tmux
@@ -172,6 +265,7 @@
                  (tests . ((command . "pytest") (exit_code . 1)))))
          (text (string-join (my/codex-remote--task-lines task) "\n")))
     (should (string-match-p "READY_TESTS_FAILED" text))
+    (should (string-match-p "Mode[[:space:]]+exec" text))
     (should (string-match-p "task-1" text))
     (should (string-match-p "abc123" text))
     (should (string-match-p "pytest" text))))

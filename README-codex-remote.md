@@ -33,11 +33,13 @@ The new commands are under `SPC r c`:
 | Binding | Action |
 | --- | --- |
 | `SPC r c d` | check local/server prerequisites and Codex authentication |
-| `SPC r c s` | start a remote Codex task |
+| `SPC r c s` | start a managed noninteractive `codex exec` task |
 | `SPC r c t` | show task and local orchestration status |
 | `SPC r c a` | monitor a live task in a read-only built-in Term buffer |
-| `SPC r c i` | open a read-write attachment in an external kitty window |
-| `SPC r c l` | show runner, Codex, test, and final-message logs |
+| `SPC r c i` | start or reattach to a managed interactive Codex TUI in kitty |
+| `SPC r c j` | open a terminal prompt/watcher for the same one-shot job as `SPC r c s` |
+| `SPC r c l` | show the logs preserved for the current task |
+| `SPC r c r` | safely publish a preserved orphaned/failed worktree without rerunning Codex |
 | `SPC r c f` | fetch, integrate, and apply the completed Codex delta locally |
 | `SPC r c x` | request cancellation while preserving the worktree |
 | `SPC r c c` | archive an already-imported task and remove remote worktree/refs |
@@ -47,19 +49,45 @@ With a region active, `SPC r c s` sends the region as the prompt. With a prefix
 argument (`C-u SPC r c s`), it opens a multiline prompt buffer; submit with
 `C-c C-c` or cancel with `C-c C-k`.
 
-`SPC r c a` shows the durable noninteractive run through Emacs's built-in
-Term emulator and attaches to `tmux` read-only. It does not depend on the
-native `vterm` module. The monitor is available only while the runner pane is
-live; after exit, use `SPC r c l` for preserved logs. Use `SPC r c x` to cancel
-an active task rather than sending input through the monitor.
+`SPC r c s` is the one-shot mode: it sends a task prompt to noninteractive
+`codex exec`, then the runner finalizes and publishes the result automatically.
 
-`SPC r c i` opens a separate kitty OS window and attaches read-write to the
-same server-side tmux session. Closing that window, detaching with `C-b d`, or
-losing the SSH connection does not stop the task; run `SPC r c i` again to
-reattach. This is an interactive terminal/tmux attachment to the durable
-`codex exec` run, not a separate conversational Codex TUI. Input can interrupt
-the runner, so use the read-only `SPC r c a` monitor when observation alone is
-intended.
+`SPC r c j` starts that same one-shot mode from an external terminal. The
+terminal accepts a multiline prompt until `Ctrl-D`, submits it through the same
+`codex-remote start` backend, and watches the durable task's status and logs.
+Closing the watcher or pressing `Ctrl-C` after launch does not cancel the server
+job. The completed result is still imported with `SPC r c f`; this is not a
+second task type or a separate Git path.
+
+`SPC r c i` is the conversational mode. If the project has no outstanding task,
+it creates the same hidden local snapshot and isolated server worktree as
+`SPC r c s`, but launches the ordinary interactive Codex TUI in a durable
+server-side `tmux` session and opens it in a separate kitty window. Running
+`SPC r c i` again while that TUI is active reattaches to the same session; it
+does not create another snapshot or task. Closing kitty, detaching with
+`C-b d`, losing SSH, or suspending the laptop detaches only the client. Exit the
+Codex TUI with `/exit` or `/quit` when the coding session is complete; the
+runner then checks, finalizes, tests, and publishes the worktree so `SPC r c f`
+can import it. `SPC r c f` refuses while the interactive TUI remains active and
+tells you to reattach and exit first.
+
+`SPC r c a` is a read-only monitor for either task mode through Emacs's built-in
+Term emulator. It does not depend on the native `vterm` module. The monitor is
+available only while the runner pane is live; after exit, use `SPC r c l` for
+preserved runner and test logs. Use `SPC r c x` to request cancellation rather
+than sending control input through the read-only monitor.
+
+The `s`, `j`, and `i` entry points share the same
+one-outstanding-task-per-project rule. `s` and `j` are two frontends for the
+same noninteractive mode; `i` is conversational. An active or completed task
+in either execution mode must be imported, archived, or explicitly discarded
+before another task can start.
+
+For one-shot tasks, `SPC r c l` includes the structured Codex event stream,
+stderr, final message, runner log, and test logs. For interactive TUI tasks it
+preserves the runner, environment-refresh, and test logs, but not a complete
+terminal transcript; inspect the live TUI before exiting when that context is
+important.
 
 ## Requirements
 
@@ -68,7 +96,7 @@ intended.
 - Git
 - OpenSSH client
 - Python 3.10 or newer
-- kitty (the configured external terminal for `SPC r c i`)
+- kitty (the configured external terminal for `SPC r c i` and `SPC r c j`)
 - the supplied Doom configuration
 
 The backend uses only the Python standard library. No Python virtual environment
@@ -108,7 +136,7 @@ Apply the patch series from the root of the Doom configuration repository, then
 ensure the backend is executable and reload Doom:
 
 ```sh
-chmod +x bin/codex-remote
+chmod +x bin/codex-remote bin/codex-remote-job
 
 DOOM_BIN="${DOOM_BIN:-$HOME/.config/emacs/bin/doom}"
 "$DOOM_BIN" sync
@@ -153,6 +181,14 @@ The following optional variables specialize the isolated Codex worktree:
 than a project-local setting. Its default value is
 `("kitty" "--title" "Remote Codex")`; the frontend appends the resolved SSH
 executable and tmux attachment arguments.
+
+`my/codex-remote-job-program` defaults to `bin/codex-remote-job` in the Doom
+repository. `my/codex-remote-job-terminal-command` defaults to
+`("kitty" "--title" "Remote Codex Job")`. Doom passes the current project's
+resolved options explicitly to the terminal frontend. The same values are also
+stored with mode `0600` under the repository's private Git metadata at
+`git rev-parse --git-path codex-remote/config.json`, allowing the command to be
+run directly from a laptop terminal without parsing `.dir-locals.el`.
 
 Example `.dir-locals.el`:
 
@@ -207,7 +243,13 @@ Place stable project instructions in a checked-in `AGENTS.md`, including:
 - paths Codex must not modify;
 - whether large data is read-only and how it should be accessed.
 
-## Normal workflow
+## Normal workflows
+
+Both modes begin from an exact hidden snapshot of the canonical laptop checkout
+and use the same isolated server worktree, result publication, import, conflict,
+and cleanup machinery.
+
+### One-shot task
 
 1. Edit the local checkout normally. Staged, unstaged, and safe untracked source
    files may all be present.
@@ -215,13 +257,54 @@ Place stable project instructions in a checked-in `AGENTS.md`, including:
 3. Run `SPC r c s` and provide the task prompt.
 4. Continue local work or disconnect/suspend the laptop. The server-side
    `tmux` process continues.
-5. Inspect `SPC r c t` or `SPC r c l`, monitor read-only with `SPC r c a`, or
-   open the external read-write tmux attachment with `SPC r c i` as needed.
+5. Inspect `SPC r c t` or `SPC r c l`; use `SPC r c a` for a read-only live
+   monitor.
 6. When the state is importable, run `SPC r c f`.
-7. Review the resulting ordinary local changes in Emacs or Magit.
-8. Use `SPC r s` then `SPC r r`, or `SPC r R`, to run the reconciled local
+
+### Terminal one-shot job
+
+From Doom, run `SPC r c j`. Kitty opens, asks for a multiline prompt, and
+submits on `Ctrl-D`. It then follows state changes and runner/Codex/test logs.
+Closing the window or pressing `Ctrl-C` after launch detaches only the watcher;
+the tmux-backed server task continues.
+
+The same frontend can be run directly from a laptop terminal inside the local
+canonical repository:
+
+```sh
+~/.config/doom/bin/codex-remote-job
+```
+
+Resume watching the current one-shot task without submitting another prompt:
+
+```sh
+~/.config/doom/bin/codex-remote-job --watch
+```
+
+Use `--prompt-file task.txt` for a prepared prompt. The terminal frontend does
+not import results; after it reports `READY` or another importable state, return
+to Doom and run `SPC r c f`.
+
+### Interactive TUI session
+
+1. From the project, run `SPC r c i`.
+2. Doom saves project buffers, creates the managed hidden snapshot/worktree,
+   starts the ordinary Codex TUI under remote `tmux`, and opens kitty attached
+   read-write to that session.
+3. Use Codex normally. Closing kitty or detaching with `C-b d` leaves the TUI
+   running; run `SPC r c i` again to reattach to the same task.
+4. When the interactive coding session is complete, use `/exit` or `/quit`.
+   The enclosing runner resumes, finalizes the worktree, refreshes the
+   environment when required, runs configured tests, and publishes the result.
+5. Check `SPC r c t` or `SPC r c l`, then run `SPC r c f` when the state is
+   importable.
+
+### After either mode
+
+1. Review the resulting ordinary local changes in Emacs or Magit.
+2. Use `SPC r s` then `SPC r r`, or `SPC r R`, to run the reconciled local
    state in the normal experiment checkout.
-9. After a successful import, `SPC r c c` may archive the server worktree.
+3. After a successful import, `SPC r c c` may archive the server worktree.
    Archive/discard removes the retained `tmux` session, worktree, and hidden
    refs while keeping task metadata and logs. Starting the next task also
    archives the prior imported task automatically.
@@ -248,6 +331,8 @@ Important states include:
   nonignored repository files.
 - `READY_ENVIRONMENT_UNVERIFIED`: a lock file changed but no bootstrap command
   was configured to refresh the server environment.
+- `READY_RECOVERED_UNVERIFIED`: `SPC r c r` published an orphaned/failed
+  worktree without rerunning Codex, the environment refresh, or server tests.
 - `NOOP`: Codex made no changes; import acknowledges the task.
 - `CANCELLED_READY` / `CANCELLED_NOOP`: cancellation completed with or without
   changes.
@@ -261,7 +346,8 @@ Important states include:
   reverting to `NONE`.
 
 Failed tests or environment refreshes do not discard useful changes. `SPC r c f`
-can import the ready failure states so you can inspect or repair them locally.
+warns before importing a ready failure state so you can inspect or repair the
+result locally.
 
 When `uv.lock` or `flake.lock` changes, the runner re-executes the configured
 bootstrap command before testing. This lets a command such as `uv sync --frozen`
@@ -318,16 +404,31 @@ Expected behavior:
 - incompatible edits: conflict preserved in the temporary integration
   worktree; the canonical checkout remains unchanged.
 
-On a conflict, the error buffer reports the integration path and Doom opens it
-in Magit when available. Version 1 deliberately does not automate the final
-conflict resolution. Inspect the worktree, decide which edits should survive,
-then either apply the desired resolution manually to the canonical checkout and
-explicitly discard the task, or discard the preserved integration worktree,
-reconcile the local conflicting lines, and retry the import.
+On a conflict, Doom prompts for one of three actions:
+
+1. **Resolve in the isolated integration worktree.** The canonical checkout
+   remains untouched. Resolve the files in the Magit worktree, complete the
+   rebase, and rerun `SPC r c f`; the backend verifies the recorded local base
+   before importing the resolved result.
+2. **Preserve current local development on a timestamped branch and retry.**
+   The backend creates `<branch>-local-<UTC timestamp>` containing all local
+   commits plus a synthetic WIP commit for the exact current tree. Doom asks
+   whether to push that branch to `origin`; when push is requested, the
+   original branch is not reset unless the push succeeds. The original branch
+   is then restored to the exact task-start `HEAD`, index, and working-tree
+   snapshot before the normal Codex import runs.
+3. **Abort.** The canonical checkout and remote result remain unchanged.
+
+The local-backup strategy refuses when it cannot preserve the checkout safely,
+including a different current branch, a Git operation in progress, submodules,
+unsafe untracked files, or changed LFS paths. Recovery metadata is retained in
+`local-backup.json` under the local project state directory.
 
 The import is branch-aware. If the checked-out branch differs from the branch
-on which the task started, import stops. `C-u SPC r c f` deliberately overrides
-that check and applies the Codex delta to the current branch.
+on which the task started, Doom prompts before applying to the current branch;
+it never switches branches automatically. `C-u SPC r c f` deliberately skips
+that prompt. The timestamped-backup strategy is available only on the original
+task-start branch.
 
 ## Recovery
 
@@ -353,8 +454,12 @@ without applying the patch twice.
 ### Crash or reboot
 
 `SPC r c t` classifies a vanished active runner as `ORPHANED`; the worktree,
-logs, prompt, frozen helper, and refs are retained. Inspect with logs/status.
-Use explicit discard only after deciding the work is no longer needed.
+logs, task inputs, frozen helper, and refs are retained. Inspect with logs/status.
+Use `SPC r c r` to acquire the project lock, safety-check and publish the
+preserved worktree without rerunning Codex. The result becomes
+`READY_RECOVERED_UNVERIFIED`, and `SPC r c f` warns before importing because
+server tests were not rerun. Use explicit discard only after deciding the work
+is no longer needed.
 
 ### Cancellation
 
@@ -391,7 +496,11 @@ From the Doom repository root:
 PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s tests -v
 
-python3 -m py_compile bin/codex-remote tests/test_codex_remote.py
+python3 -m py_compile \
+  bin/codex-remote \
+  bin/codex-remote-job \
+  tests/test_codex_remote.py \
+  tests/test_codex_remote_job.py
 
 git diff --check
 ```
@@ -407,9 +516,13 @@ emacs --batch -Q \
 The Python tests cover hidden dirty snapshots, visible Git-state preservation,
 file modes and symlinks, unsafe-file filtering and template-name handling,
 intermediate committed-result inspection, nonoverlapping same-file integration,
-true-conflict isolation, result publication, cancellation during bootstrap,
-lock-file-triggered environment refresh, configured tests, and Codex command
-construction.
+true-conflict isolation and resolved-conflict continuation, timestamped local
+backup branches with exact task-input reconstruction, result publication,
+cancellation during bootstrap, lock-file-triggered environment refresh,
+configured tests, noninteractive and interactive Codex command construction,
+managed interactive task reuse/finalization, orphaned-worktree publication,
+terminal-job configuration and log following, and refusal to import a live
+interactive session.
 
 A real acceptance test still requires your actual SSH alias and authenticated
 server. Use a disposable project change first, verify the remote paths printed
@@ -421,6 +534,7 @@ by `SPC r c d`, disconnect while the task runs, and confirm that import leaves
 The feature is isolated to:
 
 - `bin/codex-remote`
+- `bin/codex-remote-job`
 - `lisp/codex-remote.el`
 - the `load!`, keybindings, and popup rule added to `config.el`
 - tests and this documentation
