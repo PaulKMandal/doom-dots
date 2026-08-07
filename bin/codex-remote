@@ -1105,11 +1105,37 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def reconcile_local_status(
+    project_id: str,
+    task: Mapping[str, Any],
+    local: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Refresh a matching local orchestration record from remote task state."""
+    if not local or task.get("state") == "NONE":
+        return local
+    if local.get("task_id") != task.get("task_id"):
+        return local
+    if local.get("state") == "APPLIED_PENDING_REMOTE_ACK":
+        return local
+
+    updated = dict(local)
+    updated["state"] = task.get("state")
+    updated["remote"] = dict(task)
+    updated["updated_at"] = utc_now()
+    atomic_write_json(local_current_path(project_id), updated)
+    return updated
+
+
 def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
     root, host, remote_dir, timeout, project_id, project_name = common_local_args(args)
     context = ensure_remote_helper(host, timeout)
     status = remote_status(context, project_id, timeout)
-    local = read_json(local_current_path(project_id))
+    task = status.get("task", {"state": "NONE"})
+    local = reconcile_local_status(
+        project_id,
+        task,
+        read_json(local_current_path(project_id)),
+    )
     return {
         "ok": True,
         "command": "status",
@@ -1118,7 +1144,7 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         "project_root": str(root),
         "remote_host": host,
         "normal_remote_dir": remote_dir,
-        "task": status.get("task", {"state": "NONE"}),
+        "task": task,
         "local_state": local,
     }
 
@@ -1730,11 +1756,42 @@ def validate_codex_configuration(payload: Mapping[str, Any]) -> None:
             raise CodexRemoteError(f"Invalid Codex {key}", code="INVALID_CODEX_CONFIG")
 
 
+def cleanup_tmux_session(task: Mapping[str, Any]) -> bool:
+    """Remove a retained tmux session for a terminal task.
+
+    Completed runners use ``remain-on-exit`` so their final screen can be
+    inspected.  Archive/discard is the boundary where that retained session
+    must be removed.  Treat an already-absent session as a successful no-op,
+    but fail cleanup if tmux still reports it after a kill request.
+    """
+    tmux = task.get("tools", {}).get("tmux") or login_which("tmux")
+    session = task.get("tmux_session")
+    if not tmux or not isinstance(session, str) or not session:
+        return False
+
+    present = run([tmux, "has-session", "-t", session], check=False)
+    if present.returncode != 0:
+        return False
+
+    killed = run([tmux, "kill-session", "-t", session], check=False)
+    remaining = run([tmux, "has-session", "-t", session], check=False)
+    if remaining.returncode == 0:
+        raise CommandError(
+            [tmux, "kill-session", "-t", session],
+            killed.returncode,
+            killed.stdout or "",
+            killed.stderr or "tmux session still exists after cleanup",
+        )
+    return True
+
+
 def cleanup_server_task_artifacts(
     paths: Mapping[str, Path], task: dict[str, Any], action: str
 ) -> dict[str, Any]:
     if action not in {"archive", "discard"}:
         raise CodexRemoteError(f"Unknown clean action: {action}", code="INVALID_ACTION")
+    if cleanup_tmux_session(task):
+        task["tmux_cleaned_at"] = utc_now()
     worktree_value = task.get("worktree")
     if worktree_value:
         worktree = Path(worktree_value)
@@ -1790,11 +1847,15 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
                 details=current,
             ) from exc
         current = load_server_task(paths)
-        if current and current.get("state") == "IMPORTED":
-            # An imported task is complete.  Archive its isolated worktree and
-            # hidden refs automatically when the next task starts, while
-            # retaining its logs and metadata under the old task id.
-            cleanup_server_task_artifacts(paths, current, "archive")
+        if current and current.get("state") in {"IMPORTED", "DISCARDED", "ARCHIVED"}:
+            # Resolved tasks retain logs and metadata, but no live tmux session,
+            # worktree, or hidden refs should survive into the next task.  This
+            # also repairs terminal tasks cleaned by older helper versions that
+            # forgot to remove their remain-on-exit tmux session.
+            cleanup_action = (
+                "discard" if current.get("state") == "DISCARDED" else "archive"
+            )
+            cleanup_server_task_artifacts(paths, current, cleanup_action)
             current = load_server_task(paths)
         if task_outstanding(current):
             raise CodexRemoteError(
@@ -2463,17 +2524,19 @@ def tmux_pane_state(task: Mapping[str, Any]) -> dict[str, Any]:
     tmux = task.get("tools", {}).get("tmux") or login_which("tmux")
     session = task.get("tmux_session")
     if not tmux or not session:
-        return {"exists": False, "pane_dead": None, "pane_dead_status": None}
+        return {"exists": False, "running": False, "pane_dead": None, "pane_dead_status": None}
     completed = run(
         [tmux, "list-panes", "-t", session, "-F", "#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}"],
         check=False,
     )
     if completed.returncode != 0:
-        return {"exists": False, "pane_dead": None, "pane_dead_status": None}
+        return {"exists": False, "running": False, "pane_dead": None, "pane_dead_status": None}
     first = completed.stdout.splitlines()[0].split("\t")
+    pane_dead = first[0] == "1" if first else None
     return {
         "exists": True,
-        "pane_dead": first[0] == "1" if first else None,
+        "running": pane_dead is False,
+        "pane_dead": pane_dead,
         "pane_dead_status": int(first[1]) if len(first) > 1 and first[1].isdigit() else None,
         "pane_pid": int(first[2]) if len(first) > 2 and first[2].isdigit() else None,
     }
@@ -2498,6 +2561,8 @@ def server_status(project_id: str) -> dict[str, Any]:
         return {"ok": True, "task": {"state": "NONE"}}
     pane = tmux_pane_state(task)
     task["tmux"] = pane
+    worktree = task.get("worktree")
+    task["worktree_exists"] = bool(worktree and Path(worktree).exists())
     task["lock_held"] = lock_is_held(paths["lock"])
     runner_missing = not pane.get("exists") and not task["lock_held"]
     if task.get("state") in ACTIVE_STATES and (pane.get("pane_dead") or runner_missing):

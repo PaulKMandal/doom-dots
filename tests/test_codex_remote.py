@@ -349,6 +349,87 @@ class ServerStartTests(RepositoryTestCase):
             self.assertEqual(task["state"], "STARTING")
 
 
+class ServerCleanupTests(RepositoryTestCase):
+    def test_discard_kills_retained_tmux_session(self) -> None:
+        home = self.base / "home"
+        home.mkdir()
+        session_exists = True
+        tmux_calls: list[list[str]] = []
+        original_run = cr.run
+
+        def fake_run(argv, **kwargs):
+            nonlocal session_exists
+            args = [os.fspath(item) for item in argv]
+            if args[0] == "/fake/tmux":
+                tmux_calls.append(args)
+                if args[1] == "has-session":
+                    return subprocess.CompletedProcess(
+                        args=args,
+                        returncode=0 if session_exists else 1,
+                        stdout="",
+                        stderr="",
+                    )
+                if args[1] == "kill-session":
+                    session_exists = False
+                    return subprocess.CompletedProcess(
+                        args=args,
+                        returncode=0,
+                        stdout="",
+                        stderr="",
+                    )
+                if args[1] == "list-panes":
+                    return subprocess.CompletedProcess(
+                        args=args,
+                        returncode=0 if session_exists else 1,
+                        stdout="0\t\t123\n" if session_exists else "",
+                        stderr="",
+                    )
+                raise AssertionError(f"unexpected fake tmux command: {args}")
+            return original_run(argv, **kwargs)
+
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout("cleanup-project")
+            task = cr.save_server_task(
+                paths,
+                {
+                    "schema_version": cr.SCHEMA_VERSION,
+                    "project_id": "cleanup-project",
+                    "project_name": "cleanup",
+                    "task_id": "task-cleanup",
+                    "state": "FAILED",
+                    "tmux_session": "codex-cleanup",
+                    "tools": {"tmux": "/fake/tmux"},
+                    "worktree": str(paths["worktrees"] / "task-cleanup"),
+                },
+            )
+            with mock.patch.object(cr, "run", side_effect=fake_run):
+                cleaned = cr.cleanup_server_task_artifacts(paths, task, "discard")
+                status = cr.server_status("cleanup-project")["task"]
+
+        self.assertEqual(cleaned["state"], "DISCARDED")
+        self.assertIn("tmux_cleaned_at", cleaned)
+        self.assertFalse(session_exists)
+        self.assertEqual(
+            tmux_calls,
+            [
+                ["/fake/tmux", "has-session", "-t", "codex-cleanup"],
+                ["/fake/tmux", "kill-session", "-t", "codex-cleanup"],
+                ["/fake/tmux", "has-session", "-t", "codex-cleanup"],
+                [
+                    "/fake/tmux",
+                    "list-panes",
+                    "-t",
+                    "codex-cleanup",
+                    "-F",
+                    "#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}",
+                ],
+            ],
+        )
+        self.assertFalse(status["tmux"]["exists"])
+        self.assertFalse(status["tmux"]["running"])
+        self.assertFalse(status["worktree_exists"])
+
+
 class ServerRunnerTests(RepositoryTestCase):
     def prepare_server_task(
         self,
@@ -650,6 +731,40 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertNotEqual(one, two)
         self.assertNotEqual(one, three)
         self.assertRegex(one, r"^repo-[0-9a-f]{12}$")
+
+    def test_status_reconciles_matching_local_task_state(self) -> None:
+        local = {"task_id": "task-1", "state": "STARTING", "local_branch": "main"}
+        task = {"task_id": "task-1", "state": "FAILED", "error": "codex failed"}
+        with mock.patch.object(cr, "atomic_write_json") as write:
+            updated = cr.reconcile_local_status("project-1", task, local)
+
+        assert updated is not None
+        self.assertEqual(updated["state"], "FAILED")
+        self.assertEqual(updated["remote"], task)
+        self.assertEqual(updated["local_branch"], "main")
+        write.assert_called_once()
+
+    def test_status_does_not_overwrite_pending_remote_ack(self) -> None:
+        local = {"task_id": "task-1", "state": "APPLIED_PENDING_REMOTE_ACK"}
+        task = {"task_id": "task-1", "state": "READY"}
+        with mock.patch.object(cr, "atomic_write_json") as write:
+            updated = cr.reconcile_local_status("project-1", task, local)
+
+        self.assertIs(updated, local)
+        write.assert_not_called()
+
+    def test_tmux_pane_state_distinguishes_dead_session_from_running_process(self) -> None:
+        dead = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="1\t2\t123\n", stderr=""
+        )
+        with mock.patch.object(cr, "run", return_value=dead):
+            state = cr.tmux_pane_state(
+                {"tools": {"tmux": "/fake/tmux"}, "tmux_session": "session"}
+            )
+        self.assertTrue(state["exists"])
+        self.assertFalse(state["running"])
+        self.assertTrue(state["pane_dead"])
+        self.assertEqual(state["pane_dead_status"], 2)
 
     def test_codex_command_uses_noninteractive_workspace_write_mode(self) -> None:
         task = {
