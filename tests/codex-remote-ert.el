@@ -80,6 +80,50 @@
      "(authenticated)")
     "Logged in using ChatGPT")))
 
+(ert-deftest codex-remote-tmux-status-distinguishes-session-from-process ()
+  (should
+   (equal
+    (my/codex-remote--tmux-status-label
+     '((exists . t) (running . nil) (pane_dead . t) (pane_dead_status . 2)))
+    "exited (status 2)"))
+  (should
+   (equal
+    (my/codex-remote--tmux-status-label
+     '((exists . t) (running . t) (pane_dead . nil)))
+    "running"))
+  (should
+   (equal
+    (my/codex-remote--tmux-status-label
+     '((exists . nil) (running . nil)))
+    "absent")))
+
+(ert-deftest codex-remote-tmux-monitor-command-is-read-only-and-bounded ()
+  (let ((args
+         (my/codex-remote--tmux-monitor-args
+          '(:host "rhel-test" :timeout 5)
+          '((tmux_session . "codex-session")))))
+    (should
+     (equal
+      args
+      '("-tt"
+        "-o" "BatchMode=yes"
+        "-o" "ConnectTimeout=5"
+        "-o" "ConnectionAttempts=1"
+        "rhel-test"
+        "env" "TERM=xterm-256color"
+        "tmux" "attach-session" "-r" "-t" "codex-session")))))
+
+(ert-deftest codex-remote-attach-refuses-dead-pane-before-opening-terminal ()
+  (should-error
+   (my/codex-remote--open-tmux
+    '(:host "rhel-test" :timeout 5)
+    '((state . "FAILED")
+      (task_id . "task-1")
+      (tmux_session . "codex-session")
+      (tmux . ((exists . t) (running . nil)
+               (pane_dead . t) (pane_dead_status . 2)))))
+   :type 'user-error))
+
 (ert-deftest codex-remote-status-lines-include-result-and-tests ()
   (let* ((task '((state . "READY_TESTS_FAILED")
                  (task_id . "task-1")

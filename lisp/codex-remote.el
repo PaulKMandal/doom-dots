@@ -5,6 +5,10 @@
 (require 'seq)
 (require 'subr-x)
 
+(declare-function make-term "term" (name program &optional startfile &rest switches))
+(declare-function term-char-mode "term" ())
+(declare-function term-check-proc "term" (buffer))
+
 (defgroup my/codex-remote nil
   "Run durable Codex tasks on a configured remote project host."
   :group 'tools)
@@ -209,7 +213,6 @@ ON-ERROR with the parsed JSON object and process buffer."
            (make-process
             :name process-name
             :buffer buffer
-            :stderr buffer
             :command command
             :connection-type 'pipe
             :noquery t
@@ -237,6 +240,18 @@ ON-ERROR with the parsed JSON object and process buffer."
         (message "Remote Codex %s started asynchronously" action))
       process)))
 
+(defun my/codex-remote--tmux-status-label (tmux)
+  "Return an accurate human-readable state for TMUX status metadata."
+  (cond
+   ((not (my/codex-remote--get tmux 'exists)) "absent")
+   ((my/codex-remote--get tmux 'pane_dead)
+    (format "exited%s"
+            (if-let ((status (my/codex-remote--get tmux 'pane_dead_status)))
+                (format " (status %s)" status)
+              "")))
+   ((my/codex-remote--get tmux 'running) "running")
+   (t "present (state unknown)")))
+
 (defun my/codex-remote--task-lines (task)
   "Return human-readable status lines for TASK."
   (if (or (null task)
@@ -252,9 +267,11 @@ ON-ERROR with the parsed JSON object and process buffer."
                                  (my/codex-remote--get task 'created_at)))
               ("Finished" . ,(my/codex-remote--get task 'finished_at))
               ("Server worktree" . ,(my/codex-remote--get task 'worktree))
+              ("Worktree exists" . ,(if (my/codex-remote--get task 'worktree_exists)
+                                          "yes"
+                                        "no"))
               ("tmux session" . ,(my/codex-remote--get task 'tmux_session))
-              ("tmux alive" . ,(and tmux
-                                     (my/codex-remote--get tmux 'exists)))
+              ("tmux process" . ,(my/codex-remote--tmux-status-label tmux))
               ("Lock held" . ,(my/codex-remote--get task 'lock_held))
               ("Codex thread" . ,(my/codex-remote--get task 'codex_thread_id))
               ("Codex exit" . ,(my/codex-remote--get task 'codex_exit_code))
@@ -458,30 +475,63 @@ open a multiline prompt buffer; otherwise read a short prompt in the minibuffer.
              (special-mode)))
          (display-buffer buffer))))))
 
+(defun my/codex-remote--ssh-executable ()
+  "Return the SSH executable visible to this Emacs process."
+  (or (and (fboundp 'my/process-path--find-executable)
+           (my/process-path--find-executable "ssh"))
+      (executable-find "ssh")
+      (user-error "Could not find ssh in Emacs's process environment")))
+
+(defun my/codex-remote--tmux-monitor-args (context task)
+  "Return SSH arguments for a read-only tmux monitor of TASK."
+  (list "-tt"
+        "-o" "BatchMode=yes"
+        "-o" (format "ConnectTimeout=%s" (plist-get context :timeout))
+        "-o" "ConnectionAttempts=1"
+        (plist-get context :host)
+        "env" "TERM=xterm-256color"
+        "tmux" "attach-session" "-r" "-t"
+        (my/codex-remote--get task 'tmux_session)))
+
 (defun my/codex-remote--open-tmux (context task)
-  "Attach a vterm to TASK's tmux session using CONTEXT."
-  (let ((session (my/codex-remote--get task 'tmux_session))
-        (state (my/codex-remote--get task 'state))
-        (host (plist-get context :host)))
+  "Monitor TASK's live tmux pane in Emacs's built-in terminal emulator."
+  (let* ((session (my/codex-remote--get task 'tmux_session))
+         (state (my/codex-remote--get task 'state))
+         (tmux (my/codex-remote--get task 'tmux))
+         (task-id (my/codex-remote--get task 'task_id)))
     (unless session
       (user-error "Task %s has no tmux session" state))
-    (when-let ((tmux (my/codex-remote--get task 'tmux)))
-      (unless (my/codex-remote--get tmux 'exists)
-        (user-error "Task %s no longer has a tmux session; use logs/status instead" state)))
-    (require 'vterm)
-    (let ((buffer-name (format "*codex-remote-tmux:%s*"
-                               (my/codex-remote--get task 'task_id))))
-      (vterm buffer-name)
-      (vterm-send-string
-       (format "ssh -t %s %s"
-               (shell-quote-argument host)
-               (shell-quote-argument
-                (format "tmux attach-session -t %s"
-                        (shell-quote-argument session)))))
-      (vterm-send-return))))
+    (unless (my/codex-remote--get tmux 'exists)
+      (user-error "Task %s has no tmux session; use SPC r c l for logs" state))
+    (when (my/codex-remote--get tmux 'pane_dead)
+      (user-error
+       "Task %s has already exited%s; use SPC r c l for logs"
+       state
+       (if-let ((status (my/codex-remote--get tmux 'pane_dead_status)))
+           (format " with status %s" status)
+         "")))
+    (require 'term)
+    (let* ((name (format "codex-remote-tmux:%s" task-id))
+           (buffer-name (format "*%s*" name))
+           (existing (get-buffer buffer-name)))
+      (if (and existing (term-check-proc existing))
+          (pop-to-buffer existing)
+        (when existing
+          (kill-buffer existing))
+        (let ((buffer
+               (apply #'make-term
+                      name
+                      (my/codex-remote--ssh-executable)
+                      nil
+                      (my/codex-remote--tmux-monitor-args context task))))
+          (with-current-buffer buffer
+            (term-char-mode)
+            (when-let ((process (get-buffer-process buffer)))
+              (set-process-query-on-exit-flag process nil)))
+          (pop-to-buffer buffer))))))
 
 (defun my/codex-remote-attach ()
-  "Attach to the current remote Codex tmux session."
+  "Open a read-only monitor for the current live remote Codex task."
   (interactive)
   (let* ((context (my/codex-remote--context))
          (command (my/codex-remote--common-args "status" context)))

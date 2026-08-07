@@ -65,7 +65,7 @@
         :desc "Start remote Codex task"       "s" #'my/codex-remote-start
         :desc "Check remote Codex setup"      "d" #'my/codex-remote-doctor
         :desc "Show remote Codex status"      "t" #'my/codex-remote-status
-        :desc "Attach to Codex tmux"          "a" #'my/codex-remote-attach
+        :desc "Monitor Codex tmux"            "a" #'my/codex-remote-attach
         :desc "Show remote Codex logs"        "l" #'my/codex-remote-logs
         :desc "Fetch/apply Codex result"      "f" #'my/codex-remote-apply
         :desc "Cancel active Codex task"      "x" #'my/codex-remote-cancel

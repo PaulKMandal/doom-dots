@@ -35,7 +35,7 @@ The new commands are under `SPC r c`:
 | `SPC r c d` | check local/server prerequisites and Codex authentication |
 | `SPC r c s` | start a remote Codex task |
 | `SPC r c t` | show task and local orchestration status |
-| `SPC r c a` | attach a vterm to the task's `tmux` pane |
+| `SPC r c a` | monitor a live task in a read-only built-in Term buffer |
 | `SPC r c l` | show runner, Codex, test, and final-message logs |
 | `SPC r c f` | fetch, integrate, and apply the completed Codex delta locally |
 | `SPC r c x` | request cancellation while preserving the worktree |
@@ -46,9 +46,11 @@ With a region active, `SPC r c s` sends the region as the prompt. With a prefix
 argument (`C-u SPC r c s`), it opens a multiline prompt buffer; submit with
 `C-c C-c` or cancel with `C-c C-k`.
 
-`SPC r c a` shows the durable noninteractive run. The implementation uses
-`codex exec`, not the interactive Codex TUI, so the pane is primarily for live
-observation and process-level interruption rather than conversational input.
+`SPC r c a` shows the durable noninteractive run through Emacs's built-in
+Term emulator and attaches to `tmux` read-only. It does not depend on the
+native `vterm` module. The monitor is available only while the runner pane is
+live; after exit, use `SPC r c l` for preserved logs. Use `SPC r c x` to cancel
+an active task rather than sending input through the monitor.
 
 ## Requirements
 
@@ -204,7 +206,9 @@ Place stable project instructions in a checked-in `AGENTS.md`, including:
 8. Use `SPC r s` then `SPC r r`, or `SPC r R`, to run the reconciled local
    state in the normal experiment checkout.
 9. After a successful import, `SPC r c c` may archive the server worktree.
-   Starting the next task also archives the prior imported task automatically.
+   Archive/discard removes the retained `tmux` session, worktree, and hidden
+   refs while keeping task metadata and logs. Starting the next task also
+   archives the prior imported task automatically.
 
 After ordinary `SPC r s`, a nonblocking status probe notifies you when a
 completed Codex result is still waiting to be imported. It does not change or
@@ -235,7 +239,10 @@ Important states include:
 - `ORPHANED`: an active task lost both its runner session and lock, or failed
   during startup. Its worktree and logs are preserved.
 - `IMPORTED`: the result was applied locally and acknowledged remotely.
-- `ARCHIVED` / `DISCARDED`: remote worktree and hidden task refs were removed.
+- `ARCHIVED` / `DISCARDED`: the remote worktree, hidden task refs, and retained
+  `tmux` session were removed. The terminal status record and logs remain for
+  provenance, so status intentionally reports the terminal state rather than
+  reverting to `NONE`.
 
 Failed tests or environment refreshes do not discard useful changes. `SPC r c f`
 can import the ready failure states so you can inspect or repair them locally.
