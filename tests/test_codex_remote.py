@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 from importlib.machinery import SourceFileLoader
+import io
 import json
 import os
 from pathlib import Path
@@ -529,6 +531,40 @@ class ServerRunnerTests(RepositoryTestCase):
         self.assertEqual(task["state"], "BLOCKED_UNSAFE_RESULT")
         self.assertEqual(task["error_code"], "UNSAFE_RESULT")
         self.assertIn(".env", task["error"])
+
+
+class PromptInputTests(RepositoryTestCase):
+    def test_subprocess_without_explicit_input_cannot_consume_parent_stdin(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["true"], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch.object(cr.subprocess, "run", return_value=completed) as run_mock:
+            cr.run(["true"])
+
+        self.assertIs(run_mock.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_start_captures_stdin_prompt_before_remote_preflight(self) -> None:
+        args = argparse.Namespace(prompt_file="-", max_untracked_bytes=1024)
+        observed_stdin = []
+
+        def stop_at_remote_probe(host: str, timeout: int):
+            observed_stdin.append(cr.sys.stdin.read())
+            raise RuntimeError("stop after prompt capture")
+
+        with (
+            mock.patch.object(cr.sys, "stdin", io.StringIO("remote prompt\n")),
+            mock.patch.object(
+                cr,
+                "common_local_args",
+                return_value=(self.root, "rhel-test", "/srv/repo", 5, "repo-test", "repo"),
+            ),
+            mock.patch.object(cr, "check_startable_local"),
+            mock.patch.object(cr, "ensure_remote_helper", side_effect=stop_at_remote_probe),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after prompt capture"):
+                cr.cmd_start(args)
+
+        self.assertEqual(observed_stdin, [""])
 
 
 class MiscellaneousTests(RepositoryTestCase):

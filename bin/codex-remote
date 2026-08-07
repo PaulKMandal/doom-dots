@@ -212,6 +212,7 @@ def run(
             cwd=os.fspath(cwd) if cwd is not None else None,
             env=dict(env) if env is not None else None,
             input=input_data,
+            stdin=subprocess.DEVNULL if input_data is None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
@@ -954,6 +955,18 @@ def remote_status(
 
 
 def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
+    # Capture stdin before any Git/SSH subprocess is launched.  In particular,
+    # OpenSSH reads its stdin even for noninteractive remote commands, so a
+    # prompt supplied with --prompt-file - would otherwise be consumed by the
+    # prerequisite probes before we reached the prompt read below.
+    prompt = (
+        sys.stdin.read()
+        if args.prompt_file == "-"
+        else Path(args.prompt_file).read_text(encoding="utf-8")
+    )
+    if not prompt.strip():
+        raise CodexRemoteError("The Codex prompt is empty", code="EMPTY_PROMPT")
+
     root, host, remote_dir, timeout, project_id, project_name = common_local_args(args)
     check_startable_local(root, args.max_untracked_bytes)
     context = ensure_remote_helper(host, timeout)
@@ -986,10 +999,6 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
             code="LOCAL_TASK_UNRESOLVED",
             details=local_before,
         )
-
-    prompt = sys.stdin.read() if args.prompt_file == "-" else Path(args.prompt_file).read_text(encoding="utf-8")
-    if not prompt.strip():
-        raise CodexRemoteError("The Codex prompt is empty", code="EMPTY_PROMPT")
 
     data_links = []
     for value in args.data_link:
