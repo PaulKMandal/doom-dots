@@ -66,8 +66,10 @@
         :desc "Check remote Codex setup"      "d" #'my/codex-remote-doctor
         :desc "Show remote Codex status"      "t" #'my/codex-remote-status
         :desc "Monitor Codex tmux"            "a" #'my/codex-remote-attach
-        :desc "Open interactive Codex terminal" "i" #'my/codex-remote-interactive
+        :desc "Start/reattach managed Codex TUI" "i" #'my/codex-remote-interactive
+        :desc "Start terminal Codex job"       "j" #'my/codex-remote-job
         :desc "Show remote Codex logs"        "l" #'my/codex-remote-logs
+        :desc "Recover orphaned Codex work"   "r" #'my/codex-remote-recover
         :desc "Fetch/apply Codex result"      "f" #'my/codex-remote-apply
         :desc "Cancel active Codex task"      "x" #'my/codex-remote-cancel
         :desc "Archive imported Codex task"   "c" #'my/codex-remote-clean

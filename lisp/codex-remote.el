@@ -28,6 +28,19 @@ default opens a separate kitty OS window, matching the configured Sway
 terminal."
   :type '(repeat string))
 
+(defcustom my/codex-remote-job-program
+  (expand-file-name "bin/codex-remote-job" doom-user-dir)
+  "Path to the terminal frontend for managed one-shot Codex jobs."
+  :type 'file)
+
+(defcustom my/codex-remote-job-terminal-command
+  '("kitty" "--title" "Remote Codex Job")
+  "Command prefix used for the external one-shot Codex job terminal.
+
+The `codex-remote-job' executable and the current project's resolved options
+are appended to this list."
+  :type '(repeat string))
+
 (defvar-local my/codex-remote-bootstrap-cmd nil
   "Optional command used to prepare a new Codex worktree.
 
@@ -82,6 +95,26 @@ verifies that Codex did not replace them.")
      (lambda (value) (and (integerp value) (> value 0))))
 
 (defvar-local my/codex-remote--prompt-context nil)
+
+(defconst my/codex-remote--active-states
+  '("SUBMITTING" "STARTING" "BOOTSTRAPPING" "RUNNING" "FINALIZING"
+    "REFRESHING_ENVIRONMENT" "TESTING" "CANCEL_REQUESTED")
+  "Remote states in which a task still owns the project runner.")
+
+(defconst my/codex-remote--new-task-states
+  '("NONE" "IMPORTED" "DISCARDED" "ARCHIVED")
+  "Remote states from which a new managed task may be started.")
+
+(defconst my/codex-remote--interactive-attach-states
+  '("STARTING" "BOOTSTRAPPING" "RUNNING")
+  "Interactive states in which the conversational TUI may be reattached.")
+
+(defconst my/codex-remote--warning-import-states
+  '("READY_TESTS_FAILED" "READY_CODEX_FAILED" "READY_TESTS_DIRTY"
+    "READY_ENVIRONMENT_FAILED" "READY_ENVIRONMENT_DIRTY"
+    "READY_ENVIRONMENT_UNVERIFIED" "READY_RECOVERED_UNVERIFIED"
+    "CANCELLED_READY")
+  "Importable states that require an explicit warning in the frontend.")
 
 (defun my/codex-remote--get (object key)
   "Read KEY from JSON alist OBJECT, accepting symbol or string keys."
@@ -271,6 +304,8 @@ ON-ERROR with the parsed JSON object and process buffer."
            (tmux (my/codex-remote--get task 'tmux))
            (fields
             `(("State" . ,(my/codex-remote--get task 'state))
+              ("Mode" . ,(or (my/codex-remote--get task 'execution_mode)
+                               "exec"))
               ("Task" . ,(my/codex-remote--get task 'task_id))
               ("Project" . ,(my/codex-remote--get task 'project_name))
               ("Started" . ,(or (my/codex-remote--get task 'codex_started_at)
@@ -356,7 +391,7 @@ ON-ERROR with the parsed JSON object and process buffer."
   "Verify the local repository and remote Codex prerequisites."
   (interactive)
   (let* ((context (my/codex-remote--context))
-         (command (my/codex-remote--common-args "doctor" context)))
+         (command (my/codex-remote--task-command "doctor" context)))
     (my/codex-remote--run
      "doctor" command context
      :on-success #'my/codex-remote--show-status-response)))
@@ -370,25 +405,38 @@ ON-ERROR with the parsed JSON object and process buffer."
      "status" command context
      :on-success #'my/codex-remote--show-status-response)))
 
-(defun my/codex-remote--start-command (context)
-  "Build the start command for CONTEXT."
-  (let ((command (my/codex-remote--common-args "start" context)))
-    (setq command (append command '("--prompt-file" "-")))
+(defun my/codex-remote--task-option-args (context)
+  "Return managed-task option arguments from CONTEXT."
+  (let (arguments)
     (when-let ((value (plist-get context :bootstrap)))
-      (setq command (append command (list "--bootstrap-cmd" value))))
+      (setq arguments (append arguments (list "--bootstrap-cmd" value))))
     (when-let ((value (plist-get context :test)))
-      (setq command (append command (list "--test-cmd" value))))
+      (setq arguments (append arguments (list "--test-cmd" value))))
     (dolist (link (plist-get context :data-links))
-      (setq command (append command (list "--data-link" link))))
+      (setq arguments (append arguments (list "--data-link" link))))
     (when-let ((value (plist-get context :model)))
-      (setq command (append command (list "--model" value))))
+      (setq arguments (append arguments (list "--model" value))))
     (when-let ((value (plist-get context :profile)))
-      (setq command (append command (list "--profile" value))))
+      (setq arguments (append arguments (list "--profile" value))))
     (when-let ((value (plist-get context :reasoning)))
-      (setq command (append command (list "--reasoning-effort" value))))
+      (setq arguments (append arguments (list "--reasoning-effort" value))))
     (when (plist-get context :search)
-      (setq command (append command '("--enable-search"))))
-    command))
+      (setq arguments (append arguments '("--enable-search"))))
+    arguments))
+
+(defun my/codex-remote--task-command (action context)
+  "Build a managed task command for ACTION and CONTEXT."
+  (append (my/codex-remote--common-args action context)
+          (my/codex-remote--task-option-args context)))
+
+(defun my/codex-remote--start-command (context)
+  "Build the noninteractive start command for CONTEXT."
+  (append (my/codex-remote--task-command "start" context)
+          '("--prompt-file" "-")))
+
+(defun my/codex-remote--interactive-command (context)
+  "Build the managed interactive-TUI command for CONTEXT."
+  (my/codex-remote--task-command "interactive" context))
 
 (defun my/codex-remote--submit-prompt (context prompt &optional prompt-buffer)
   "Submit PROMPT using captured project CONTEXT.
@@ -492,19 +540,35 @@ open a multiline prompt buffer; otherwise read a short prompt in the minibuffer.
       (executable-find "ssh")
       (user-error "Could not find ssh in Emacs's process environment")))
 
+(defun my/codex-remote--configured-executable (program description)
+  "Resolve configured PROGRAM or signal an error naming DESCRIPTION."
+  (unless (and (stringp program) (not (string-empty-p program)))
+    (user-error "Configure a nonempty %s executable" description))
+  (or (and (file-name-absolute-p program)
+           (file-executable-p program)
+           program)
+      (and (fboundp 'my/process-path--find-executable)
+           (my/process-path--find-executable program))
+      (executable-find program)
+      (user-error "Could not find %s executable: %s" description program)))
+
 (defun my/codex-remote--external-terminal-executable ()
-  "Return the configured external terminal executable."
-  (let ((program (car my/codex-remote-external-terminal-command)))
-    (unless (and (stringp program) (not (string-empty-p program)))
-      (user-error
-       "Set my/codex-remote-external-terminal-command to a nonempty command"))
-    (or (and (file-name-absolute-p program)
-             (file-executable-p program)
-             program)
-        (and (fboundp 'my/process-path--find-executable)
-             (my/process-path--find-executable program))
-        (executable-find program)
-        (user-error "Could not find external terminal executable: %s" program))))
+  "Return the configured interactive external terminal executable."
+  (my/codex-remote--configured-executable
+   (car my/codex-remote-external-terminal-command)
+   "external terminal"))
+
+(defun my/codex-remote--job-executable ()
+  "Return the executable terminal one-shot job frontend."
+  (my/codex-remote--configured-executable
+   my/codex-remote-job-program
+   "codex-remote-job"))
+
+(defun my/codex-remote--job-terminal-executable ()
+  "Return the configured one-shot job terminal executable."
+  (my/codex-remote--configured-executable
+   (car my/codex-remote-job-terminal-command)
+   "Codex job terminal"))
 
 (defun my/codex-remote--tmux-attach-args (context task &optional read-only)
   "Return SSH arguments for TASK's tmux session.
@@ -619,57 +683,250 @@ When READ-ONLY is non-nil, attach the tmux client without allowing input."
            (user-error "No remote Codex task exists for this project"))
          (my/codex-remote--open-tmux context task))))))
 
-(defun my/codex-remote-interactive ()
-  "Open the current live Codex tmux session in an external terminal.
+(defun my/codex-remote--task-execution-mode (task)
+  "Return TASK's execution mode, treating older tasks as noninteractive."
+  (or (my/codex-remote--get task 'execution_mode) "exec"))
 
-The attachment is read-write.  Closing the terminal or losing SSH detaches the
-client only; the server-side tmux session and Codex task continue running."
+(defun my/codex-remote--interactive-action (task)
+  "Return how `SPC r c i' should handle TASK."
+  (let ((state (or (my/codex-remote--get task 'state) "NONE"))
+        (mode (my/codex-remote--task-execution-mode task)))
+    (cond
+     ((and (member state my/codex-remote--interactive-attach-states)
+           (equal mode "interactive"))
+      'attach)
+     ((member state my/codex-remote--new-task-states)
+      'start)
+     (t 'blocked))))
+
+(defun my/codex-remote--start-interactive (context)
+  "Start a managed interactive Codex TUI using captured CONTEXT."
+  (my/codex-remote--save-project-buffers (plist-get context :root))
+  (my/codex-remote--run
+   "interactive-start"
+   (my/codex-remote--interactive-command context)
+   context
+   :on-success
+   (lambda (response buffer)
+     (kill-buffer buffer)
+     (let ((task (my/codex-remote--get response 'task)))
+       (condition-case err
+           (my/codex-remote--open-external-tmux context task)
+         (error
+          (message
+           "Managed Codex task %s started, but the external terminal could not open: %s"
+           (or (my/codex-remote--get task 'task_id) "-")
+           (error-message-string err))))))))
+
+(defun my/codex-remote-interactive ()
+  "Start or reattach to a managed interactive Codex TUI outside Emacs.
+
+A new session uses the same hidden local snapshot, isolated server worktree,
+result publication, and safe local import path as `my/codex-remote-start'.  If
+an interactive session is already active, this command simply reattaches to
+its existing tmux session without resnapshotting or saving local buffers."
   (interactive)
   (let* ((context (my/codex-remote--context))
          (command (my/codex-remote--common-args "status" context)))
     (my/codex-remote--run
-     "interactive" command context
+     "interactive-status" command context
      :on-success
      (lambda (response buffer)
-       (kill-buffer buffer)
-       (let ((task (my/codex-remote--get response 'task)))
-         (when (equal (my/codex-remote--get task 'state) "NONE")
-           (user-error "No remote Codex task exists for this project"))
-         (my/codex-remote--open-external-tmux context task))))))
+       (let* ((task (my/codex-remote--get response 'task))
+              (state (or (my/codex-remote--get task 'state) "NONE"))
+              (mode (my/codex-remote--task-execution-mode task)))
+         (pcase (my/codex-remote--interactive-action task)
+           ('attach
+            (kill-buffer buffer)
+            (my/codex-remote--open-external-tmux context task))
+           ('start
+            (kill-buffer buffer)
+            ;; Do not prompt to save buffers from inside a process sentinel.
+            (run-at-time 0 nil #'my/codex-remote--start-interactive context))
+           (_
+            (my/codex-remote--show-status-response response buffer)
+            (message
+             "Outstanding %s Codex task is %s; import, archive, or discard it before starting an interactive TUI"
+             mode state))))))))
 
-(defun my/codex-remote--apply-error (response buffer)
-  "Handle apply failure RESPONSE from BUFFER."
-  (if (equal (my/codex-remote--error-code response) "INTEGRATION_CONFLICT")
-      (let* ((details (my/codex-remote--get response 'details))
-             (path (my/codex-remote--get details 'conflict_path)))
-        (my/codex-remote--display-raw-error buffer response)
-        (when (and path (file-directory-p path))
-          (require 'magit)
-          (magit-status-setup-buffer path)))
-    (my/codex-remote--display-raw-error buffer response)))
+
+(defun my/codex-remote--job-command (context)
+  "Return the external terminal command for a one-shot job using CONTEXT."
+  (append
+   (cons (my/codex-remote--job-terminal-executable)
+         (cdr my/codex-remote-job-terminal-command))
+   (list (my/codex-remote--job-executable)
+         "--project-root" (plist-get context :root)
+         "--backend" my/codex-remote-backend
+         "--host" (plist-get context :host)
+         "--remote-dir" (plist-get context :remote-dir)
+         "--timeout" (number-to-string (plist-get context :timeout))
+         "--max-untracked-bytes"
+         (number-to-string (plist-get context :max-untracked)))
+   (my/codex-remote--task-option-args context)
+   (unless (plist-get context :search) '("--disable-search"))
+   '("--ignore-config" "--pause-at-end")))
+
+(defun my/codex-remote-job ()
+  "Open an external terminal to prompt for and watch a managed one-shot job.
+
+The resulting task is identical to `my/codex-remote-start' and remains
+importable through `my/codex-remote-apply'."
+  (interactive)
+  (let* ((context (my/codex-remote--context))
+         (root (plist-get context :root)))
+    (my/codex-remote--save-project-buffers root)
+    (let ((process
+           (make-process
+            :name (format "codex-remote-job-%d"
+                          (truncate (* 1000 (float-time))))
+            :buffer nil
+            :command (my/codex-remote--job-command context)
+            :connection-type 'pipe
+            :noquery t
+            :sentinel
+            (lambda (proc _event)
+              (when (and (memq (process-status proc) '(exit signal))
+                         (not (= (process-exit-status proc) 0)))
+                (message "Remote Codex job terminal exited with status %s"
+                         (process-exit-status proc)))))))
+      (message "Opened terminal prompt/watcher for a managed remote Codex job")
+      process)))
+
+
+(defun my/codex-remote--open-conflict-worktree (response)
+  "Open RESPONSE's preserved integration worktree in Magit."
+  (let* ((details (my/codex-remote--get response 'details))
+         (path (my/codex-remote--get details 'conflict_path)))
+    (unless (and path (file-directory-p path))
+      (user-error "The preserved integration worktree is unavailable"))
+    (require 'magit)
+    (magit-status-setup-buffer path)
+    (message
+     "Resolve the integration, complete its rebase, then rerun SPC r c f")))
+
+(defun my/codex-remote--apply-success (response buffer)
+  "Handle successful import RESPONSE from BUFFER."
+  (kill-buffer buffer)
+  (when (fboundp 'magit-refresh-all)
+    (magit-refresh-all))
+  (let ((source-state (my/codex-remote--get response 'source_state))
+        (message-text (or (my/codex-remote--get response 'message)
+                          "Remote Codex result imported")))
+    (message "%s%s"
+             message-text
+             (if (member source-state my/codex-remote--warning-import-states)
+                 (format " (imported from warning state %s)" source-state)
+               ""))))
+
+(defun my/codex-remote--run-apply (context &optional allow-branch-change
+                                           preserve-local push-backup)
+  "Run the backend import for CONTEXT with the requested recovery options."
+  (let ((command (my/codex-remote--common-args "apply" context)))
+    (when allow-branch-change
+      (setq command (append command '("--allow-branch-change"))))
+    (when preserve-local
+      (setq command (append command '("--preserve-local-branch"))))
+    (when push-backup
+      (setq command (append command '("--push-backup" "--backup-remote" "origin"))))
+    (my/codex-remote--run
+     "apply" command context
+     :on-success #'my/codex-remote--apply-success
+     :on-error
+     (lambda (response buffer)
+       (my/codex-remote--apply-error
+        context response buffer allow-branch-change)))))
+
+(defun my/codex-remote--preserve-local-and-retry (context allow-branch-change)
+  "Preserve local work on a backup branch, then retry import for CONTEXT."
+  (let ((push (yes-or-no-p
+               "Push the local backup branch to origin before resetting the original branch? ")))
+    (my/codex-remote--save-project-buffers (plist-get context :root))
+    (my/codex-remote--run-apply context allow-branch-change t push)))
+
+(defun my/codex-remote--prompt-conflict-action
+    (context response allow-branch-change)
+  "Prompt for a safe action after integration conflict RESPONSE."
+  (let ((choice
+         (read-char-choice
+          (concat
+           "Codex conflicts with current local work: "
+           "[r] resolve in isolated worktree, "
+           "[b] preserve local work on a timestamped branch and retry, "
+           "[a] abort: ")
+          '(?r ?b ?a))))
+    (pcase choice
+      (?r (my/codex-remote--open-conflict-worktree response))
+      (?b (my/codex-remote--preserve-local-and-retry
+           context allow-branch-change))
+      (?a (message "Codex import aborted; canonical checkout remains unchanged")))))
+
+(defun my/codex-remote--prompt-branch-change (context response)
+  "Ask whether RESPONSE should be applied to the currently checked-out branch."
+  (let* ((details (my/codex-remote--get response 'details))
+         (start (or (my/codex-remote--get details 'start_branch) "(detached)"))
+         (current (or (my/codex-remote--get details 'current_branch) "(detached)")))
+    (if (yes-or-no-p
+         (format "Task started on %s, but current branch is %s. Apply to current branch? "
+                 start current))
+        (my/codex-remote--run-apply context t)
+      (message "Codex import aborted; no branch was switched"))))
+
+(defun my/codex-remote--apply-error
+    (context response buffer allow-branch-change)
+  "Handle apply failure RESPONSE from BUFFER for CONTEXT."
+  (let ((code (my/codex-remote--error-code response)))
+    (my/codex-remote--display-raw-error buffer response)
+    (cond
+     ((equal code "BRANCH_CHANGED")
+      (run-at-time 0 nil #'my/codex-remote--prompt-branch-change
+                   context response))
+     ((member code '("INTEGRATION_CONFLICT"
+                     "INTEGRATION_CONFLICT_PENDING"
+                     "INTEGRATION_EXISTS"))
+      (run-at-time 0 nil #'my/codex-remote--prompt-conflict-action
+                   context response allow-branch-change)))))
+
+(defun my/codex-remote--confirm-import-state
+    (context allow-branch-change response buffer)
+  "Inspect status RESPONSE before importing a result for CONTEXT."
+  (let* ((task (my/codex-remote--get response 'task))
+         (state (or (my/codex-remote--get task 'state) "NONE"))
+         (mode (my/codex-remote--task-execution-mode task)))
+    (kill-buffer buffer)
+    (cond
+     ((and (equal mode "interactive")
+           (member state my/codex-remote--active-states))
+      (message
+       "Interactive Codex is still %s; reattach with SPC r c i and exit with /exit or /quit before SPC r c f"
+       state))
+     ((member state my/codex-remote--warning-import-states)
+      (run-at-time
+       0 nil
+       (lambda ()
+         (when (yes-or-no-p
+                (format "Remote Codex result is %s. Import it anyway? " state))
+           (my/codex-remote--run-apply context allow-branch-change)))))
+     (t
+      (my/codex-remote--run-apply context allow-branch-change)))))
 
 (defun my/codex-remote-apply (&optional allow-branch-change)
   "Fetch and apply a completed Codex delta as unstaged local changes.
 
 With prefix ALLOW-BRANCH-CHANGE, deliberately apply a task that started on a
-different branch to the currently checked-out branch."
+different branch to the currently checked-out branch.  Otherwise a branch
+change is presented as an explicit prompt."
   (interactive "P")
   (let* ((context (my/codex-remote--context))
          (root (plist-get context :root))
-         (command (my/codex-remote--common-args "apply" context)))
+         (command (my/codex-remote--common-args "status" context)))
     (my/codex-remote--save-project-buffers root)
-    (when allow-branch-change
-      (setq command (append command '("--allow-branch-change"))))
     (my/codex-remote--run
-     "apply" command context
+     "apply-preflight" command context
      :on-success
      (lambda (response buffer)
-       (kill-buffer buffer)
-       (when (fboundp 'magit-refresh-all)
-         (magit-refresh-all))
-       (message "%s" (or (my/codex-remote--get response 'message)
-                          "Remote Codex result imported")))
-     :on-error #'my/codex-remote--apply-error)))
+       (my/codex-remote--confirm-import-state
+        context allow-branch-change response buffer)))))
 
 (defun my/codex-remote-cancel ()
   "Request cancellation of the active task without discarding its worktree."
@@ -685,6 +942,21 @@ different branch to the currently checked-out branch."
          (message "Cancellation requested for %s"
                   (my/codex-remote--get
                    (my/codex-remote--get response 'task) 'task_id)))))))
+
+(defun my/codex-remote-recover ()
+  "Finalize a preserved orphaned/failed worktree without rerunning Codex."
+  (interactive)
+  (when (yes-or-no-p
+         "Recover the preserved worktree without rerunning Codex or server tests? ")
+    (let* ((context (my/codex-remote--context))
+           (command (my/codex-remote--common-args "recover" context)))
+      (my/codex-remote--run
+       "recover" command context
+       :on-success
+       (lambda (response buffer)
+         (message "%s" (or (my/codex-remote--get response 'message)
+                            "Remote Codex worktree recovered"))
+         (my/codex-remote--show-status-response response buffer))))))
 
 (defun my/codex-remote-clean ()
   "Archive the server worktree after a successful local import."
@@ -721,7 +993,8 @@ different branch to the currently checked-out branch."
   '("READY" "READY_TESTS_FAILED" "READY_CODEX_FAILED"
     "READY_TESTS_DIRTY" "READY_ENVIRONMENT_FAILED"
     "READY_ENVIRONMENT_DIRTY" "READY_ENVIRONMENT_UNVERIFIED"
-    "CANCELLED_READY" "NOOP" "CANCELLED_NOOP")
+    "READY_RECOVERED_UNVERIFIED" "CANCELLED_READY"
+    "NOOP" "CANCELLED_NOOP")
   "Remote states that have a result or acknowledged no-op ready for import.")
 
 (defun my/codex-remote--notify-after-sync (&rest _)
