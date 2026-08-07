@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""Start or watch a managed one-shot remote Codex job from a terminal.
+
+The command is a terminal frontend for ``bin/codex-remote start``.  It creates
+exactly the same hidden local snapshot, server worktree, task metadata, and
+importable result as ``SPC r c s``.  It does not import the result; use
+``SPC r c f`` in Doom after the watcher reports an importable state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+from typing import Any, Mapping, Sequence
+
+ACTIVE_STATES = {
+    "SUBMITTING",
+    "STARTING",
+    "BOOTSTRAPPING",
+    "RUNNING",
+    "FINALIZING",
+    "REFRESHING_ENVIRONMENT",
+    "TESTING",
+    "CANCEL_REQUESTED",
+}
+IMPORTABLE_STATES = {
+    "READY",
+    "READY_TESTS_FAILED",
+    "READY_CODEX_FAILED",
+    "READY_TESTS_DIRTY",
+    "READY_ENVIRONMENT_FAILED",
+    "READY_ENVIRONMENT_DIRTY",
+    "READY_ENVIRONMENT_UNVERIFIED",
+    "CANCELLED_READY",
+    "READY_RECOVERED_UNVERIFIED",
+    "NOOP",
+    "CANCELLED_NOOP",
+}
+
+
+class JobError(RuntimeError):
+    pass
+
+
+def run(
+    argv: Sequence[str | os.PathLike[str]],
+    *,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        [os.fspath(value) for value in argv],
+        cwd=cwd,
+        input=input_text,
+        stdin=subprocess.DEVNULL if input_text is None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        response = parse_backend_output(completed.stdout)
+        message = response.get("error") if response else None
+        detail = message or completed.stderr.strip() or completed.stdout.strip()
+        raise JobError(detail or f"Command failed with status {completed.returncode}")
+    return completed
+
+
+def repository_root(value: str | os.PathLike[str]) -> Path:
+    candidate = Path(value).expanduser().resolve()
+    result = run(["git", "-C", candidate, "rev-parse", "--show-toplevel"])
+    return Path(result.stdout.strip()).resolve()
+
+
+def config_path(root: Path) -> Path:
+    result = run(
+        ["git", "-C", root, "rev-parse", "--git-path", "codex-remote/config.json"]
+    )
+    value = Path(result.stdout.strip())
+    return value if value.is_absolute() else (root / value).resolve()
+
+
+def read_config(root: Path) -> dict[str, Any]:
+    path = config_path(root)
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise JobError(f"Could not read {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise JobError(f"Project configuration is not a JSON object: {path}")
+    return value
+
+
+def parse_backend_output(output: str) -> dict[str, Any]:
+    for line in reversed(output.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "ok" in value:
+            return value
+    return {}
+
+
+def invoke_backend(
+    backend: Path,
+    args: Sequence[str],
+    *,
+    root: Path,
+    prompt: str | None = None,
+) -> dict[str, Any]:
+    completed = run([backend, *args], cwd=root, input_text=prompt, check=False)
+    response = parse_backend_output(completed.stdout)
+    if completed.returncode != 0 or not response.get("ok"):
+        message = response.get("error") if response else None
+        detail = message or completed.stderr.strip() or completed.stdout.strip()
+        code = response.get("error_code") if response else None
+        suffix = f" [{code}]" if code else ""
+        raise JobError((detail or "codex-remote backend failed") + suffix)
+    return response
+
+
+def resolved_options(args: argparse.Namespace, config: Mapping[str, Any]) -> dict[str, Any]:
+    def choose(name: str, default: Any = None) -> Any:
+        value = getattr(args, name)
+        return config.get(name, default) if value is None else value
+
+    values = {
+        "host": choose("host"),
+        "remote_dir": choose("remote_dir"),
+        "timeout": int(choose("timeout", 5)),
+        "max_untracked_bytes": int(choose("max_untracked_bytes", 20 * 1024 * 1024)),
+        "bootstrap_cmd": choose("bootstrap_cmd", "") or "",
+        "test_cmd": choose("test_cmd", "") or "",
+        "data_links": list(args.data_link if args.data_link is not None else config.get("data_links", [])),
+        "model": choose("model", "") or "",
+        "profile": choose("profile", "") or "",
+        "reasoning_effort": choose("reasoning_effort", "") or "",
+        "enable_search": bool(choose("enable_search", False)),
+    }
+    if not values["host"] or not values["remote_dir"]:
+        raise JobError(
+            "Remote project configuration is missing. Run SPC r c d in Doom once, "
+            "or pass --host and --remote-dir."
+        )
+    return values
+
+
+def common_backend_args(root: Path, values: Mapping[str, Any], command: str) -> list[str]:
+    return [
+        command,
+        "--project-root",
+        str(root),
+        "--host",
+        str(values["host"]),
+        "--remote-dir",
+        str(values["remote_dir"]),
+        "--timeout",
+        str(values["timeout"]),
+        "--max-untracked-bytes",
+        str(values["max_untracked_bytes"]),
+    ]
+
+
+def task_backend_args(root: Path, values: Mapping[str, Any], command: str) -> list[str]:
+    result = common_backend_args(root, values, command)
+    if values.get("bootstrap_cmd"):
+        result.extend(["--bootstrap-cmd", str(values["bootstrap_cmd"])])
+    if values.get("test_cmd"):
+        result.extend(["--test-cmd", str(values["test_cmd"])])
+    for link in values.get("data_links", []):
+        result.extend(["--data-link", str(link)])
+    if values.get("model"):
+        result.extend(["--model", str(values["model"])])
+    if values.get("profile"):
+        result.extend(["--profile", str(values["profile"])])
+    if values.get("reasoning_effort"):
+        result.extend(["--reasoning-effort", str(values["reasoning_effort"])])
+    if values.get("enable_search"):
+        result.append("--enable-search")
+    return result
+
+
+def read_prompt(path: str | None) -> str:
+    if path:
+        if path == "-":
+            prompt = sys.stdin.read()
+        else:
+            prompt = Path(path).expanduser().read_text(encoding="utf-8")
+    else:
+        if sys.stdin.isatty():
+            print("Enter the Codex prompt below.", file=sys.stderr)
+            print("Press Ctrl-D on a new line to submit; Ctrl-C cancels before launch.", file=sys.stderr)
+        prompt = sys.stdin.read()
+    if not prompt.strip():
+        raise JobError("The Codex prompt is empty")
+    return prompt
+
+
+def incremental_text(previous: str, current: str) -> tuple[str, str]:
+    """Return newly observed text and the new baseline.
+
+    Logs are normally append-only.  When a tail window truncates the beginning,
+    find the longest suffix/prefix overlap so the watcher avoids reprinting the
+    entire buffer.
+    """
+    if not previous:
+        return current, current
+    if current.startswith(previous):
+        return current[len(previous) :], current
+    limit = min(len(previous), len(current), 65536)
+    for size in range(limit, 0, -1):
+        if previous[-size:] == current[:size]:
+            return current[size:], current
+    return current, current
+
+
+def task_state(response: Mapping[str, Any]) -> str:
+    task = response.get("task")
+    return str(task.get("state", "NONE")) if isinstance(task, dict) else "NONE"
+
+
+def watch_task(
+    backend: Path,
+    root: Path,
+    values: Mapping[str, Any],
+    *,
+    poll_interval: float,
+    tail: int,
+) -> str:
+    previous_log = ""
+    previous_state = ""
+    print("Watching the managed remote Codex job. Ctrl-C detaches this watcher only.")
+    while True:
+        logs = invoke_backend(
+            backend,
+            [*common_backend_args(root, values, "logs"), "--tail", str(tail)],
+            root=root,
+        )
+        state = task_state(logs)
+        if state != previous_state:
+            print(f"\n[remote Codex state: {state}]", flush=True)
+            previous_state = state
+        current_log = str(logs.get("log") or "")
+        addition, previous_log = incremental_text(previous_log, current_log)
+        if addition:
+            if addition[0] == "\n":
+                addition = addition[1:]
+            print(addition, end="" if addition.endswith("\n") else "\n", flush=True)
+        if state not in ACTIVE_STATES:
+            if state in IMPORTABLE_STATES:
+                print(f"\nTask {state}. Use SPC r c f in Doom to import the result.")
+            else:
+                print(f"\nTask finished in state {state}. Inspect SPC r c t and SPC r c l in Doom.")
+            return state
+        time.sleep(poll_interval)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-root", default=".")
+    parser.add_argument("--backend")
+    parser.add_argument("--host")
+    parser.add_argument("--remote-dir", dest="remote_dir")
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument("--max-untracked-bytes", type=int, dest="max_untracked_bytes")
+    parser.add_argument("--bootstrap-cmd", dest="bootstrap_cmd")
+    parser.add_argument("--test-cmd", dest="test_cmd")
+    parser.add_argument("--data-link", action="append", default=None)
+    parser.add_argument("--model")
+    parser.add_argument("--profile")
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+        dest="reasoning_effort",
+    )
+    search = parser.add_mutually_exclusive_group()
+    search.add_argument("--enable-search", action="store_true", dest="enable_search")
+    search.add_argument("--disable-search", action="store_false", dest="enable_search")
+    parser.set_defaults(enable_search=None)
+    parser.add_argument(
+        "--ignore-config",
+        action="store_true",
+        help="ignore persisted project options (used by the Doom launcher)",
+    )
+    parser.add_argument("--prompt-file")
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--poll-interval", type=float, default=2.0)
+    parser.add_argument("--tail", type=int, default=800)
+    parser.add_argument("--pause-at-end", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        root = repository_root(args.project_root)
+        backend = (
+            Path(args.backend).expanduser().resolve()
+            if args.backend
+            else Path(__file__).resolve().with_name("codex-remote")
+        )
+        if not backend.is_file() or not os.access(backend, os.X_OK):
+            raise JobError(f"codex-remote backend is missing or not executable: {backend}")
+        values = resolved_options(args, {} if args.ignore_config else read_config(root))
+        if not args.watch:
+            prompt = read_prompt(args.prompt_file)
+            response = invoke_backend(
+                backend,
+                [*task_backend_args(root, values, "start"), "--prompt-file", "-"],
+                root=root,
+                prompt=prompt,
+            )
+            task = response.get("task") or {}
+            print(
+                f"Started remote Codex task {task.get('task_id', '-')} on {values['host']}",
+                flush=True,
+            )
+        try:
+            watch_task(
+                backend,
+                root,
+                values,
+                poll_interval=max(args.poll_interval, 0.1),
+                tail=max(args.tail, 50),
+            )
+        except KeyboardInterrupt:
+            print("\nWatcher detached. The remote job continues; rerun with --watch.")
+        if args.pause_at_end and sys.stdin.isatty():
+            try:
+                input("Press Enter to close this terminal...")
+            except EOFError:
+                pass
+        return 0
+    except KeyboardInterrupt:
+        print(
+            "\nInterrupted before launch acknowledgement. Check SPC r c t before retrying.",
+            file=sys.stderr,
+        )
+        return 130
+    except (JobError, OSError) as exc:
+        print(f"codex-remote-job: {exc}", file=sys.stderr)
+        if args.pause_at_end and sys.stdin.isatty():
+            try:
+                input("Press Enter to close this terminal...")
+            except EOFError:
+                pass
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
