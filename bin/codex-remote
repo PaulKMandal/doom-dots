@@ -36,6 +36,7 @@ REMOTE_HELPER_RELATIVE = Path(".local/libexec/codex-remote")
 REMOTE_SHARE_RELATIVE = Path(".local/share/codex-remote")
 REMOTE_STATE_RELATIVE = Path(".local/state/codex-remote")
 LOCAL_STATE_ROOT = Path.home() / ".local/state/codex-remote"
+PROJECT_CONFIG_RELATIVE = "codex-remote/config.json"
 
 ACTIVE_STATES = {
     "SUBMITTING",
@@ -56,6 +57,7 @@ RESULT_READY_STATES = {
     "READY_ENVIRONMENT_DIRTY",
     "READY_ENVIRONMENT_UNVERIFIED",
     "CANCELLED_READY",
+    "READY_RECOVERED_UNVERIFIED",
 }
 ALLOW_NEW_TASK_STATES = {"NONE", "IMPORTED", "DISCARDED", "ARCHIVED"}
 LOCAL_RESOLVED_STATES = {"IMPORTED", "DISCARDED", "ARCHIVED"}
@@ -63,6 +65,8 @@ LOCAL_RESOLVED_STATES = {"IMPORTED", "DISCARDED", "ARCHIVED"}
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,254}$")
 SAFE_REASONING = {"minimal", "low", "medium", "high", "xhigh"}
+EXECUTION_MODES = {"exec", "interactive"}
+INTERACTIVE_ATTACH_STATES = {"STARTING", "BOOTSTRAPPING", "RUNNING"}
 
 SECRET_BASENAMES = {
     ".env",
@@ -896,6 +900,61 @@ def local_current_path(project_id: str) -> Path:
     return local_project_state_dir(project_id) / "current.json"
 
 
+def local_project_config_path(root: Path) -> Path:
+    """Return the repository-local, untracked configuration path.
+
+    ``git rev-parse --git-path`` keeps this correct for ordinary repositories
+    and linked worktrees without committing machine-specific SSH paths.
+    """
+    value = git(root, "rev-parse", "--git-path", PROJECT_CONFIG_RELATIVE).stdout.strip()
+    path = Path(value)
+    return path if path.is_absolute() else (root / path).resolve()
+
+
+def task_option_values(args: argparse.Namespace) -> dict[str, Any]:
+    """Return normalized task options that are present on ARGS."""
+    values: dict[str, Any] = {}
+    if hasattr(args, "bootstrap_cmd"):
+        values.update(
+            {
+                "bootstrap_cmd": args.bootstrap_cmd or "",
+                "test_cmd": args.test_cmd or "",
+                "data_links": list(args.data_link or []),
+                "model": args.model or "",
+                "profile": args.profile or "",
+                "reasoning_effort": args.reasoning_effort or "",
+                "enable_search": bool(args.enable_search),
+            }
+        )
+    return values
+
+
+def persist_project_config(root: Path, args: argparse.Namespace) -> Path:
+    """Persist the resolved project settings for terminal frontends.
+
+    Doom remains the authority for directory-local variables.  The terminal
+    ``codex-remote-job`` frontend reads this private Git-metadata file so it can
+    launch the exact same backend operation without parsing Emacs Lisp.
+    """
+    path = local_project_config_path(root)
+    existing = read_json(path) or {}
+    value: dict[str, Any] = dict(existing)
+    value.update(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "project_root": str(root),
+            "host": validate_remote_host(args.host),
+            "remote_dir": validate_remote_dir(args.remote_dir),
+            "timeout": int(args.timeout),
+            "max_untracked_bytes": int(args.max_untracked_bytes),
+            "updated_at": utc_now(),
+        }
+    )
+    value.update(task_option_values(args))
+    atomic_write_json(path, value)
+    return path
+
+
 def task_id() -> str:
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     entropy = os.urandom(4).hex()
@@ -914,6 +973,7 @@ def common_local_args(args: argparse.Namespace) -> tuple[Path, str, str, int, st
             "Maximum untracked-file size must be positive", code="INVALID_FILE_SIZE_LIMIT"
         )
     project_id, project_name = project_identity(root, host, remote_dir)
+    persist_project_config(root, args)
     return root, host, remote_dir, timeout, project_id, project_name
 
 
@@ -954,18 +1014,49 @@ def remote_status(
     return remote_invoke(context, ["_server-status", "--project-id", project_id], timeout=timeout)
 
 
-def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
-    # Capture stdin before any Git/SSH subprocess is launched.  In particular,
-    # OpenSSH reads its stdin even for noninteractive remote commands, so a
-    # prompt supplied with --prompt-file - would otherwise be consumed by the
-    # prerequisite probes before we reached the prompt read below.
-    prompt = (
-        sys.stdin.read()
-        if args.prompt_file == "-"
-        else Path(args.prompt_file).read_text(encoding="utf-8")
-    )
-    if not prompt.strip():
+def task_execution_mode(task: Mapping[str, Any]) -> str:
+    """Return TASK's execution mode, treating legacy tasks as noninteractive."""
+    value = task.get("execution_mode")
+    return value if value in EXECUTION_MODES else "exec"
+
+
+def submitted_data_links(args: argparse.Namespace) -> list[dict[str, str]]:
+    """Validate and normalize command-line data-link specifications."""
+    result: list[dict[str, str]] = []
+    for value in args.data_link:
+        if "=" not in value:
+            raise CodexRemoteError(
+                f"Data link must have REMOTE_SOURCE=WORKTREE_RELATIVE form: {value}",
+                code="INVALID_DATA_LINK",
+            )
+        source, target = value.split("=", 1)
+        if not source or not target:
+            raise CodexRemoteError(
+                f"Data link must have nonempty source and target: {value}",
+                code="INVALID_DATA_LINK",
+            )
+        result.append({"source": source, "target": target})
+    return result
+
+
+def start_new_task(
+    args: argparse.Namespace,
+    *,
+    execution_mode: str,
+    prompt: str | None,
+) -> dict[str, Any]:
+    """Create and submit one managed remote task from the current local state."""
+    if execution_mode not in EXECUTION_MODES:
+        raise CodexRemoteError(
+            f"Unsupported execution mode: {execution_mode}", code="INVALID_EXECUTION_MODE"
+        )
+    if execution_mode == "exec" and (not isinstance(prompt, str) or not prompt.strip()):
         raise CodexRemoteError("The Codex prompt is empty", code="EMPTY_PROMPT")
+    if execution_mode == "interactive" and prompt is not None:
+        raise CodexRemoteError(
+            "Interactive Codex tasks do not accept a startup prompt",
+            code="INVALID_EXECUTION_MODE",
+        )
 
     root, host, remote_dir, timeout, project_id, project_name = common_local_args(args)
     check_startable_local(root, args.max_untracked_bytes)
@@ -1000,43 +1091,38 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
             details=local_before,
         )
 
-    data_links = []
-    for value in args.data_link:
-        if "=" not in value:
-            raise CodexRemoteError(
-                f"Data link must have REMOTE_SOURCE=WORKTREE_RELATIVE form: {value}",
-                code="INVALID_DATA_LINK",
-            )
-        source, target = value.split("=", 1)
-        if not source or not target:
-            raise CodexRemoteError(
-                f"Data link must have nonempty source and target: {value}", code="INVALID_DATA_LINK"
-            )
-        data_links.append({"source": source, "target": target})
-
+    data_links = submitted_data_links(args)
     identifier = task_id()
     input_ref = f"refs/codex/{project_id}/input/{identifier}"
     snapshot = create_hidden_snapshot(
         root,
         input_ref,
-        f"Codex remote input snapshot {project_id}/{identifier}",
+        f"Codex remote {execution_mode} input snapshot {project_id}/{identifier}",
     )
     local_branch = current_branch(root)
+    prompt_sha256 = (
+        hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if isinstance(prompt, str)
+        else None
+    )
     local_state = {
         "schema_version": SCHEMA_VERSION,
         "project_id": project_id,
         "project_name": project_name,
         "task_id": identifier,
         "state": "SUBMITTING",
+        "execution_mode": execution_mode,
         "project_root": str(root),
         "host": host,
         "normal_remote_dir": remote_dir,
         "input_ref": input_ref,
         "input_sha": snapshot["commit"],
+        "input_tree": snapshot["tree"],
+        "input_index_tree": snapshot["index_tree"],
         "local_head": snapshot["head"],
         "local_branch": local_branch,
         "created_at": utc_now(),
-        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "prompt_sha256": prompt_sha256,
     }
     atomic_write_json(local_current_path(project_id), local_state)
 
@@ -1056,13 +1142,16 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
         "project_id": project_id,
         "project_name": project_name,
         "task_id": identifier,
+        "execution_mode": execution_mode,
         "input_ref": input_ref,
         "input_sha": snapshot["commit"],
+        "input_tree": snapshot["tree"],
+        "input_index_tree": snapshot["index_tree"],
         "local_head": snapshot["head"],
         "local_branch": local_branch,
         "normal_remote_dir": remote_dir,
         "prompt": prompt,
-        "prompt_sha256": local_state["prompt_sha256"],
+        "prompt_sha256": prompt_sha256,
         "bootstrap_cmd": args.bootstrap_cmd or None,
         "test_cmd": args.test_cmd or None,
         "data_links": data_links,
@@ -1080,10 +1169,16 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
         timeout=timeout + 20,
         payload=payload,
     )
+    started_task = started["task"]
+    if execution_mode == "interactive":
+        refreshed = remote_status(context, project_id, timeout)
+        candidate = refreshed.get("task", {})
+        if candidate.get("task_id") == identifier:
+            started_task = candidate
     local_state.update(
         {
-            "state": started["task"]["state"],
-            "remote": started["task"],
+            "state": started_task["state"],
+            "remote": started_task,
             "push_output": push.stdout.strip(),
             "updated_at": utc_now(),
         }
@@ -1093,16 +1188,70 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
         previous_id = validate_safe_id(previous_imported["task_id"], "task id")
         cleanup_local_integration(root, project_id, previous_id)
         cleanup_local_refs(root, project_id, previous_id, previous_imported)
+    label = "interactive Codex TUI" if execution_mode == "interactive" else "remote Codex task"
     return {
         "ok": True,
-        "command": "start",
+        "command": "interactive" if execution_mode == "interactive" else "start",
         "project_id": project_id,
-        "task": started["task"],
+        "task": started_task,
+        "reused": False,
         "message": (
-            f"Started remote Codex task {identifier} on {host}; "
-            f"worktree {started['task'].get('worktree')}"
+            f"Started {label} {identifier} on {host}; "
+            f"worktree {started_task.get('worktree')}"
         ),
     }
+
+
+def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
+    # Capture stdin before any Git/SSH subprocess is launched.  In particular,
+    # OpenSSH reads its stdin even for noninteractive remote commands, so a
+    # prompt supplied with --prompt-file - would otherwise be consumed by the
+    # prerequisite probes before we reached the prompt read below.
+    prompt = (
+        sys.stdin.read()
+        if args.prompt_file == "-"
+        else Path(args.prompt_file).read_text(encoding="utf-8")
+    )
+    return start_new_task(args, execution_mode="exec", prompt=prompt)
+
+
+def cmd_interactive(args: argparse.Namespace) -> dict[str, Any]:
+    """Start or reattach to a managed interactive Codex TUI for this project."""
+    root, host, remote_dir, timeout, project_id, project_name = common_local_args(args)
+    context = ensure_remote_helper(host, timeout)
+    remote_invoke(context, ["_server-init", "--project-id", project_id], timeout=timeout)
+    status = remote_status(context, project_id, timeout)
+    existing = status.get("task", {"state": "NONE"})
+    state = existing.get("state", "NONE")
+    if state in INTERACTIVE_ATTACH_STATES and task_execution_mode(existing) == "interactive":
+        local = reconcile_local_status(
+            project_id,
+            existing,
+            read_json(local_current_path(project_id)),
+        )
+        return {
+            "ok": True,
+            "command": "interactive",
+            "project_id": project_id,
+            "project_name": project_name,
+            "project_root": str(root),
+            "remote_host": host,
+            "normal_remote_dir": remote_dir,
+            "task": existing,
+            "local_state": local,
+            "reused": True,
+            "message": f"Reattaching to interactive Codex task {existing.get('task_id')}",
+        }
+    if state not in ALLOW_NEW_TASK_STATES:
+        mode = task_execution_mode(existing)
+        raise CodexRemoteError(
+            f"Project already has an outstanding {mode} Codex task "
+            f"{existing.get('task_id', '?')} in state {state}. Import, archive, or "
+            "explicitly discard it before starting an interactive TUI.",
+            code="OUTSTANDING_TASK",
+            details=existing,
+        )
+    return start_new_task(args, execution_mode="interactive", prompt=None)
 
 
 def reconcile_local_status(
@@ -1175,6 +1324,28 @@ def cmd_cancel(args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, "command": "cancel", "project_id": project_id, "task": value["task"]}
 
 
+def cmd_recover(args: argparse.Namespace) -> dict[str, Any]:
+    """Finalize a preserved orphaned/failed worktree without rerunning Codex."""
+    _root, host, _remote_dir, timeout, project_id, _project_name = common_local_args(args)
+    context = ensure_remote_helper(host, timeout)
+    value = remote_invoke(
+        context,
+        ["_server-recover", "--project-id", project_id],
+        timeout=max(timeout + 60, 120),
+    )
+    task = value["task"]
+    reconcile_local_status(
+        project_id, task, read_json(local_current_path(project_id))
+    )
+    return {
+        "ok": True,
+        "command": "recover",
+        "project_id": project_id,
+        "task": task,
+        "message": value.get("message") or "Recovered the preserved Codex worktree.",
+    }
+
+
 def changed_file_summary(root: Path, old: str, new: str) -> list[dict[str, str]]:
     completed = git(root, "diff", "--name-status", "-z", old, new, "--")
     fields = nul_paths(completed.stdout)
@@ -1211,6 +1382,186 @@ def integration_worktree_path(project_id: str, task_id_value: str, state_dir: Pa
     return base / "integration" / task_id_value
 
 
+def integration_state_path(project_id: str, state_dir: Path | None = None) -> Path:
+    base = state_dir if state_dir is not None else local_project_state_dir(project_id)
+    return base / "integration-conflict.json"
+
+
+def rebase_in_progress(root: Path) -> bool:
+    return any(
+        git_dir_path(root, marker).exists()
+        for marker in ("rebase-merge", "rebase-apply")
+    )
+
+
+def apply_integrated_snapshot(
+    root: Path,
+    project_id: str,
+    identifier: str,
+    current: Mapping[str, str],
+    merged: str,
+    fingerprint: Mapping[str, str],
+    integration: Path,
+    state_root: Path,
+) -> dict[str, Any]:
+    """Apply CURRENT..MERGED to the canonical checkout after verification."""
+    verify_fingerprint(root, fingerprint)
+    patch = git(
+        root,
+        "diff",
+        "--binary",
+        "--full-index",
+        current["commit"],
+        merged,
+        "--",
+        text=False,
+    ).stdout
+    changed = changed_file_summary(root, current["commit"], merged)
+    if patch:
+        git(root, "apply", "--check", "--binary", "-", input_data=patch, text=False)
+        git(root, "apply", "--binary", "-", input_data=patch, text=False)
+        try:
+            post_tree = snapshot_tree_only(root)
+            merged_tree = git(root, "rev-parse", f"{merged}^{{tree}}").stdout.strip()
+            if post_tree != merged_tree or index_tree(root) != fingerprint["index_tree"]:
+                raise CodexRemoteError(
+                    "Post-apply verification failed; attempting to restore the pre-import working tree.",
+                    code="POST_APPLY_VERIFY_FAILED",
+                )
+        except Exception as verification_error:
+            reverse = git(
+                root,
+                "apply",
+                "--reverse",
+                "--binary",
+                "-",
+                input_data=patch,
+                text=False,
+                check=False,
+            )
+            if reverse.returncode != 0:
+                failure_state = {
+                    "schema_version": SCHEMA_VERSION,
+                    "project_id": project_id,
+                    "task_id": identifier,
+                    "state": "ROLLBACK_FAILED",
+                    "conflict_path": str(integration),
+                    "current_snapshot": current["commit"],
+                    "merged_snapshot": merged,
+                    "created_at": utc_now(),
+                    "reverse_stdout": reverse.stdout.decode(errors="replace")
+                    if isinstance(reverse.stdout, bytes)
+                    else reverse.stdout,
+                    "reverse_stderr": reverse.stderr.decode(errors="replace")
+                    if isinstance(reverse.stderr, bytes)
+                    else reverse.stderr,
+                }
+                atomic_write_json(state_root / "integration-failure.json", failure_state)
+                raise CodexRemoteError(
+                    "Post-apply verification failed and automatic rollback also failed. "
+                    "The integration worktree was preserved; inspect the canonical checkout immediately.",
+                    code="ROLLBACK_FAILED",
+                    details=failure_state,
+                ) from verification_error
+            raise
+
+    with contextlib.suppress(FileNotFoundError):
+        integration_state_path(project_id, state_root).unlink()
+    with contextlib.suppress(FileNotFoundError):
+        (state_root / "integration-failure.json").unlink()
+    return {
+        "current": dict(current),
+        "merged": merged,
+        "changed_files": changed,
+        "integration_path": str(integration),
+    }
+
+
+def resume_preserved_integration(
+    root: Path,
+    project_id: str,
+    task_id_value: str,
+    input_sha: str,
+    result_sha: str,
+    *,
+    state_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    """Finish a conflict that the user resolved in the isolated worktree."""
+    state_root = state_dir if state_dir is not None else local_project_state_dir(project_id)
+    path = integration_state_path(project_id, state_root)
+    conflict = read_json(path)
+    if not conflict:
+        return None
+    identifier = validate_safe_id(task_id_value, "task id")
+    if (
+        conflict.get("project_id") != project_id
+        or conflict.get("task_id") != identifier
+        or conflict.get("input_sha") != input_sha
+        or conflict.get("result_sha") != result_sha
+    ):
+        raise CodexRemoteError(
+            "The preserved integration state does not match the current task.",
+            code="INTEGRATION_STATE_MISMATCH",
+            details=conflict,
+        )
+    integration = Path(str(conflict.get("conflict_path") or ""))
+    if not integration.is_dir():
+        raise CodexRemoteError(
+            "The preserved integration worktree is missing; discard the conflict state or use the local-backup option.",
+            code="INTEGRATION_WORKTREE_MISSING",
+            details=conflict,
+        )
+    unmerged = git(integration, "ls-files", "-u").stdout.strip()
+    if unmerged or rebase_in_progress(integration):
+        raise CodexRemoteError(
+            "The isolated integration is still unresolved. Resolve all files and complete the rebase, then run the fetch/apply command again.",
+            code="INTEGRATION_CONFLICT_PENDING",
+            details=conflict,
+        )
+    merged = git(integration, "rev-parse", "HEAD").stdout.strip()
+    current_snapshot = str(conflict.get("current_snapshot") or "")
+    if not current_snapshot or git(
+        integration,
+        "merge-base",
+        "--is-ancestor",
+        current_snapshot,
+        merged,
+        check=False,
+    ).returncode != 0:
+        raise CodexRemoteError(
+            "The preserved integration no longer contains the recorded local base. Do not import it; restart conflict handling or use the local-backup option.",
+            code="INVALID_RESOLVED_INTEGRATION",
+            details=conflict,
+        )
+    fingerprint = conflict.get("fingerprint")
+    if not isinstance(fingerprint, dict) or not all(
+        isinstance(fingerprint.get(key), str) for key in ("head", "index_tree", "tree")
+    ):
+        raise CodexRemoteError(
+            "The preserved conflict lacks a complete canonical-checkout fingerprint.",
+            code="INTEGRATION_STATE_MISMATCH",
+            details=conflict,
+        )
+    current = {
+        "commit": current_snapshot,
+        "head": fingerprint["head"],
+        "index_tree": fingerprint["index_tree"],
+        "tree": fingerprint["tree"],
+    }
+    result = apply_integrated_snapshot(
+        root,
+        project_id,
+        identifier,
+        current,
+        merged,
+        fingerprint,
+        integration,
+        state_root,
+    )
+    remove_worktree(root, integration)
+    return result
+
+
 def integrate_result_into_worktree(
     root: Path,
     project_id: str,
@@ -1224,7 +1575,8 @@ def integrate_result_into_worktree(
 
     All three-way work happens in a temporary linked worktree.  A true conflict
     is preserved there, while the canonical checkout is touched only after a
-    clean rebase and a fresh fingerprint check.
+    clean rebase and a fresh fingerprint check.  Re-running the operation after
+    completing that rebase imports the resolved result.
     """
     validate_safe_id(project_id, "project id")
     identifier = validate_safe_id(task_id_value, "task id")
@@ -1232,6 +1584,17 @@ def integrate_result_into_worktree(
         raise CodexRemoteError(
             "Remote result is not a descendant of its input", code="INVALID_RESULT_HISTORY"
         )
+
+    resumed = resume_preserved_integration(
+        root,
+        project_id,
+        identifier,
+        input_sha,
+        result_sha,
+        state_dir=state_dir,
+    )
+    if resumed is not None:
+        return resumed
 
     current_ref = f"refs/codex/{project_id}/current/{identifier}"
     current = create_hidden_snapshot(
@@ -1249,8 +1612,7 @@ def integrate_result_into_worktree(
     integration.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if integration.exists():
         raise CodexRemoteError(
-            f"A preserved integration worktree already exists at {integration}. "
-            "Resolve or discard it before retrying.",
+            f"A preserved integration worktree already exists at {integration}. Resolve or discard it before retrying.",
             code="INTEGRATION_EXISTS",
             details={"conflict_path": str(integration)},
         )
@@ -1284,96 +1646,38 @@ def integrate_result_into_worktree(
                 "state": "CONFLICT",
                 "conflict_path": str(integration),
                 "current_snapshot": current["commit"],
+                "fingerprint": fingerprint,
                 "input_sha": input_sha,
                 "result_sha": result_sha,
                 "created_at": utc_now(),
                 "rebase_stdout": rebase.stdout,
                 "rebase_stderr": rebase.stderr,
             }
-            atomic_write_json(state_root / "integration-conflict.json", conflict_state)
+            atomic_write_json(integration_state_path(project_id, state_root), conflict_state)
             raise CodexRemoteError(
-                "Codex changes conflict with the current local state. The canonical checkout was not modified. "
-                f"Inspect the preserved integration worktree at {integration}.",
+                "Codex changes conflict with the current local state. The canonical checkout was not modified.",
                 code="INTEGRATION_CONFLICT",
                 details=conflict_state,
             )
 
         merged = git(integration, "rev-parse", "HEAD").stdout.strip()
-        verify_fingerprint(root, fingerprint)
-        patch = git(
+        return apply_integrated_snapshot(
             root,
-            "diff",
-            "--binary",
-            "--full-index",
-            current["commit"],
+            project_id,
+            identifier,
+            current,
             merged,
-            "--",
-            text=False,
-        ).stdout
-        changed = changed_file_summary(root, current["commit"], merged)
-        if patch:
-            git(root, "apply", "--check", "--binary", "-", input_data=patch, text=False)
-            git(root, "apply", "--binary", "-", input_data=patch, text=False)
-            try:
-                post_tree = snapshot_tree_only(root)
-                merged_tree = git(root, "rev-parse", f"{merged}^{{tree}}").stdout.strip()
-                if post_tree != merged_tree or index_tree(root) != fingerprint["index_tree"]:
-                    raise CodexRemoteError(
-                        "Post-apply verification failed; attempting to restore the pre-import working tree.",
-                        code="POST_APPLY_VERIFY_FAILED",
-                    )
-            except Exception as verification_error:
-                reverse = git(
-                    root,
-                    "apply",
-                    "--reverse",
-                    "--binary",
-                    "-",
-                    input_data=patch,
-                    text=False,
-                    check=False,
-                )
-                if reverse.returncode != 0:
-                    preserve = True
-                    failure_state = {
-                        "schema_version": SCHEMA_VERSION,
-                        "project_id": project_id,
-                        "task_id": identifier,
-                        "state": "ROLLBACK_FAILED",
-                        "conflict_path": str(integration),
-                        "current_snapshot": current["commit"],
-                        "merged_snapshot": merged,
-                        "created_at": utc_now(),
-                        "reverse_stdout": reverse.stdout.decode(errors="replace")
-                        if isinstance(reverse.stdout, bytes)
-                        else reverse.stdout,
-                        "reverse_stderr": reverse.stderr.decode(errors="replace")
-                        if isinstance(reverse.stderr, bytes)
-                        else reverse.stderr,
-                    }
-                    atomic_write_json(state_root / "integration-failure.json", failure_state)
-                    raise CodexRemoteError(
-                        "Post-apply verification failed and automatic rollback also failed. "
-                        "The integration worktree was preserved; inspect the canonical checkout immediately.",
-                        code="ROLLBACK_FAILED",
-                        details=failure_state,
-                    ) from verification_error
-                raise
-
-        with contextlib.suppress(FileNotFoundError):
-            (state_root / "integration-conflict.json").unlink()
-        with contextlib.suppress(FileNotFoundError):
-            (state_root / "integration-failure.json").unlink()
-        return {
-            "current": current,
-            "merged": merged,
-            "changed_files": changed,
-            "integration_path": str(integration),
-        }
+            fingerprint,
+            integration,
+            state_root,
+        )
+    except CodexRemoteError as exc:
+        if exc.code == "ROLLBACK_FAILED":
+            preserve = True
+        raise
     finally:
         if created and not preserve:
             remove_worktree(root, integration)
-
 
 def cleanup_local_refs(root: Path, project_id: str, task_id_value: str, task: Mapping[str, Any] | None) -> None:
     refs = {
@@ -1387,14 +1691,239 @@ def cleanup_local_refs(root: Path, project_id: str, task_id_value: str, task: Ma
         git(root, "update-ref", "-d", ref, check=False)
 
 
-def cleanup_local_integration(root: Path, project_id: str, task_id_value: str) -> None:
-    path = integration_worktree_path(project_id, task_id_value)
+def cleanup_local_integration(
+    root: Path,
+    project_id: str,
+    task_id_value: str,
+    *,
+    state_dir: Path | None = None,
+) -> None:
+    state_root = state_dir if state_dir is not None else local_project_state_dir(project_id)
+    path = integration_worktree_path(project_id, task_id_value, state_root)
     if path.exists():
         remove_worktree(root, path)
-    state_dir = local_project_state_dir(project_id)
     for name in ("integration-conflict.json", "integration-failure.json"):
         with contextlib.suppress(FileNotFoundError):
-            (state_dir / name).unlink()
+            (state_root / name).unlink()
+
+
+
+def unique_local_backup_branch(root: Path, branch: str) -> str:
+    """Return a collision-free ``<branch>-local-<UTC timestamp>`` name."""
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = f"{branch}-local-{timestamp}"
+    candidates = [base, *[f"{base}-{index}" for index in range(2, 100)]]
+    for candidate in candidates:
+        checked = git(root, "check-ref-format", "--branch", candidate, check=False)
+        if checked.returncode != 0:
+            continue
+        exists = git(
+            root,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{candidate}",
+            check=False,
+        )
+        if exists.returncode != 0:
+            return candidate
+    raise CodexRemoteError(
+        f"Could not allocate a local backup branch derived from {branch!r}",
+        code="BACKUP_BRANCH_FAILED",
+    )
+
+
+def reconstruct_task_input_state(
+    root: Path,
+    task: Mapping[str, Any],
+    local: Mapping[str, Any],
+    input_sha: str,
+) -> dict[str, str]:
+    """Restore the exact visible state that was sent to Codex.
+
+    HEAD returns to the task's recorded starting commit, the index returns to the
+    recorded index tree, and the remaining input-snapshot delta is applied only
+    to the worktree.  This recreates the original staged/unstaged/untracked
+    organization rather than merely checking out the snapshot tree.
+    """
+    local_head = task.get("local_head") or local.get("local_head")
+    input_tree = task.get("input_tree") or local.get("input_tree")
+    input_index_tree = task.get("input_index_tree") or local.get("input_index_tree")
+    if not isinstance(local_head, str) or not local_head:
+        raise CodexRemoteError(
+            "Task metadata does not contain the original local HEAD",
+            code="TASK_INPUT_METADATA_MISSING",
+        )
+    if not isinstance(input_tree, str) or not input_tree:
+        input_tree = git(root, "rev-parse", f"{input_sha}^{{tree}}").stdout.strip()
+    if not isinstance(input_index_tree, str) or not input_index_tree:
+        # Older task metadata cannot reconstruct the precise staged/unstaged
+        # split, so refuse this destructive recovery option rather than guess.
+        raise CodexRemoteError(
+            "This task predates exact index-state recording; use the isolated conflict worktree instead.",
+            code="TASK_INPUT_METADATA_MISSING",
+        )
+
+    git(root, "reset", "--hard", local_head)
+    git(root, "clean", "-fd", "--")
+    git(root, "read-tree", "--reset", "-u", input_index_tree)
+    patch = git(
+        root,
+        "diff",
+        "--binary",
+        "--full-index",
+        input_index_tree,
+        input_sha,
+        "--",
+        text=False,
+    ).stdout
+    if patch:
+        git(root, "apply", "--check", "--binary", "-", input_data=patch, text=False)
+        git(root, "apply", "--binary", "-", input_data=patch, text=False)
+
+    actual = {
+        "head": current_head(root),
+        "index_tree": index_tree(root),
+        "tree": snapshot_tree_only(root),
+    }
+    expected = {
+        "head": local_head,
+        "index_tree": input_index_tree,
+        "tree": input_tree,
+    }
+    if actual != expected:
+        raise CodexRemoteError(
+            "Could not reconstruct the exact task input after preserving local work. "
+            "The backup branch remains available; stop and inspect the checkout.",
+            code="TASK_INPUT_RECONSTRUCTION_FAILED",
+            details={"expected": expected, "actual": actual},
+        )
+    return actual
+
+
+def preserve_local_state_on_branch(
+    root: Path,
+    project_id: str,
+    task: Mapping[str, Any],
+    local: Mapping[str, Any],
+    input_sha: str,
+    *,
+    max_untracked_bytes: int,
+    push_backup: bool = False,
+    backup_remote: str = "origin",
+    state_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Preserve the exact current checkout, then restore the task input state."""
+    ensure_git_idle(root)
+    ensure_no_submodules(root)
+    ensure_safe_untracked(root, max_untracked_bytes)
+    ensure_no_changed_lfs_paths(root)
+
+    start_branch = task.get("local_branch") or local.get("local_branch")
+    now_branch = current_branch(root)
+    if not isinstance(start_branch, str) or not start_branch:
+        raise CodexRemoteError(
+            "The local-backup strategy requires a named task-start branch",
+            code="BACKUP_REQUIRES_BRANCH",
+        )
+    if now_branch != start_branch:
+        raise CodexRemoteError(
+            f"The local-backup strategy is available only on the original branch {start_branch}; "
+            f"the checkout is currently on {now_branch or '(detached)' }.",
+            code="BACKUP_WRONG_BRANCH",
+            details={"start_branch": start_branch, "current_branch": now_branch},
+        )
+
+    before = {
+        "head": current_head(root),
+        "index_tree": index_tree(root),
+        "tree": snapshot_tree_only(root),
+    }
+    backup_ref_name = unique_local_backup_branch(root, start_branch)
+    snapshot_ref = f"refs/codex/{project_id}/local-backup/{validate_safe_id(task['task_id'], 'task id')}"
+    snapshot = create_hidden_snapshot(
+        root,
+        snapshot_ref,
+        f"Preserve local state before Codex import {project_id}/{task['task_id']}",
+    )
+    backup_ref = f"refs/heads/{backup_ref_name}"
+    try:
+        git(root, "update-ref", backup_ref, snapshot["commit"])
+    finally:
+        git(root, "update-ref", "-d", snapshot_ref, check=False)
+
+    backup_tree = git(root, "rev-parse", f"{backup_ref}^{{tree}}").stdout.strip()
+    backup_parent = git(root, "rev-parse", f"{backup_ref}^").stdout.strip()
+    if backup_tree != before["tree"] or backup_parent != before["head"]:
+        git(root, "update-ref", "-d", backup_ref, check=False)
+        raise CodexRemoteError(
+            "The local backup branch did not reproduce the current checkout exactly",
+            code="BACKUP_VERIFY_FAILED",
+            details={
+                "branch": backup_ref_name,
+                "expected_tree": before["tree"],
+                "actual_tree": backup_tree,
+                "expected_parent": before["head"],
+                "actual_parent": backup_parent,
+            },
+        )
+
+    pushed = False
+    if push_backup:
+        remote_check = git(root, "remote", "get-url", backup_remote, check=False)
+        if remote_check.returncode != 0:
+            raise CodexRemoteError(
+                f"Backup branch {backup_ref_name} was created locally, but remote {backup_remote!r} does not exist. "
+                "The canonical checkout was not changed.",
+                code="BACKUP_PUSH_FAILED",
+                details={"branch": backup_ref_name, "remote": backup_remote},
+            )
+        push = git(
+            root,
+            "push",
+            "--porcelain",
+            backup_remote,
+            f"{backup_ref}:{backup_ref}",
+            check=False,
+        )
+        if push.returncode != 0:
+            raise CodexRemoteError(
+                f"Backup branch {backup_ref_name} was created locally, but pushing it to {backup_remote} failed. "
+                "The canonical checkout was not changed.",
+                code="BACKUP_PUSH_FAILED",
+                details={
+                    "branch": backup_ref_name,
+                    "remote": backup_remote,
+                    "stdout": push.stdout,
+                    "stderr": push.stderr,
+                },
+            )
+        pushed = True
+
+    state_root = state_dir if state_dir is not None else local_project_state_dir(project_id)
+    recovery = {
+        "schema_version": SCHEMA_VERSION,
+        "project_id": project_id,
+        "task_id": task.get("task_id"),
+        "state": "LOCAL_STATE_PRESERVED",
+        "backup_branch": backup_ref_name,
+        "backup_commit": snapshot["commit"],
+        "backup_remote": backup_remote if pushed else None,
+        "pushed": pushed,
+        "original_branch": start_branch,
+        "pre_reconstruction": before,
+        "created_at": utc_now(),
+    }
+    atomic_write_json(state_root / "local-backup.json", recovery)
+
+    cleanup_local_integration(
+        root, project_id, str(task["task_id"]), state_dir=state_root
+    )
+    reconstructed = reconstruct_task_input_state(root, task, local, input_sha)
+    recovery["reconstructed_input"] = reconstructed
+    recovery["reconstructed_at"] = utc_now()
+    atomic_write_json(state_root / "local-backup.json", recovery)
+    return recovery
 
 
 def mark_local_imported(project_id: str, task: Mapping[str, Any], changed: list[dict[str, str]]) -> None:
@@ -1436,10 +1965,19 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
             "command": "apply",
             "project_id": project_id,
             "task": marked["task"],
+            "source_state": state,
             "changed_files": changed,
             "tests": task.get("tests"),
             "message": "Recovered the prior local import and acknowledged it on the server.",
         }
+
+    if state in ACTIVE_STATES and task_execution_mode(task) == "interactive":
+        raise CodexRemoteError(
+            "The managed interactive Codex session is still running. Reattach with SPC r c i, "
+            "then exit Codex with /exit or /quit before importing.",
+            code="INTERACTIVE_TASK_ACTIVE",
+            details=task,
+        )
 
     if state in {"NOOP", "CANCELLED_NOOP"}:
         marked = remote_invoke(
@@ -1453,6 +1991,7 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
             "command": "apply",
             "project_id": project_id,
             "task": marked["task"],
+            "source_state": state,
             "changed_files": [],
             "message": "Codex produced no changes; task marked imported.",
         }
@@ -1514,6 +2053,19 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
     if result_sha != result_expected_sha:
         raise CodexRemoteError("Fetched result ref does not match task metadata", code="REF_MISMATCH")
 
+    backup = None
+    if args.preserve_local_branch:
+        backup = preserve_local_state_on_branch(
+            root,
+            project_id,
+            task,
+            local,
+            input_sha,
+            max_untracked_bytes=args.max_untracked_bytes,
+            push_backup=args.push_backup,
+            backup_remote=args.backup_remote,
+        )
+
     integrated = integrate_result_into_worktree(
         root,
         project_id,
@@ -1532,6 +2084,7 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
             "applied_at": utc_now(),
             "changed_files": changed,
             "merged_snapshot": integrated["merged"],
+            "local_backup": backup,
         }
     )
     atomic_write_json(local_current_path(project_id), pending)
@@ -1542,14 +2095,17 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
         timeout=timeout,
     )
     mark_local_imported(project_id, marked["task"], changed)
+    prefix = "Preserved current local work on branch " + backup["backup_branch"] + ". " if backup else ""
     return {
         "ok": True,
         "command": "apply",
         "project_id": project_id,
         "task": marked["task"],
+        "source_state": state,
+        "local_backup": backup,
         "changed_files": changed,
         "tests": task.get("tests"),
-        "message": f"Imported {len(changed)} Codex-changed path(s) as ordinary local working-tree changes.",
+        "message": prefix + f"Imported {len(changed)} Codex-changed path(s) as ordinary local working-tree changes.",
     }
 
 def cmd_clean(args: argparse.Namespace) -> dict[str, Any]:
@@ -1747,6 +2303,12 @@ def data_link_specs(payload: Mapping[str, Any]) -> list[dict[str, str]]:
 
 
 def validate_codex_configuration(payload: Mapping[str, Any]) -> None:
+    execution_mode = payload.get("execution_mode", "exec")
+    if execution_mode not in EXECUTION_MODES:
+        raise CodexRemoteError(
+            f"Invalid Codex execution mode: {execution_mode}",
+            code="INVALID_EXECUTION_MODE",
+        )
     effort = payload.get("reasoning_effort")
     if effort and effort not in SAFE_REASONING:
         raise CodexRemoteError(f"Invalid reasoning effort: {effort}", code="INVALID_CODEX_CONFIG")
@@ -1824,12 +2386,21 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
         raise CodexRemoteError("Task identity mismatch", code="TASK_ID_MISMATCH")
     validate_codex_configuration(payload)
     links = data_link_specs(payload)
+    execution_mode = payload.get("execution_mode", "exec")
     prompt = payload.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise CodexRemoteError("Submitted prompt is empty or invalid", code="EMPTY_PROMPT")
-    expected_prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    if payload.get("prompt_sha256") != expected_prompt_hash:
-        raise CodexRemoteError("Prompt hash does not match submitted prompt", code="PAYLOAD_HASH_MISMATCH")
+    if execution_mode == "exec":
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise CodexRemoteError("Submitted prompt is empty or invalid", code="EMPTY_PROMPT")
+        expected_prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if payload.get("prompt_sha256") != expected_prompt_hash:
+            raise CodexRemoteError(
+                "Prompt hash does not match submitted prompt", code="PAYLOAD_HASH_MISMATCH"
+            )
+    elif prompt is not None or payload.get("prompt_sha256") is not None:
+        raise CodexRemoteError(
+            "Interactive tasks must not include a startup prompt",
+            code="INVALID_EXECUTION_MODE",
+        )
     paths = ensure_server_layout(project_id)
     existing_same = load_server_task(paths, task_id_value)
     if existing_same:
@@ -1895,32 +2466,38 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
 
         state_dir = paths["project_state"] / task_id_value
         state_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
-        prompt_path = state_dir / "prompt.txt"
-        prompt_path.write_text(prompt, encoding="utf-8")
-        prompt_path.chmod(0o600)
+        prompt_path: Path | None = None
+        if execution_mode == "exec":
+            prompt_path = state_dir / "prompt.txt"
+            prompt_path.write_text(prompt, encoding="utf-8")
+            prompt_path.chmod(0o600)
         runner_helper = state_dir / "codex-remote-runner.py"
         runner_helper.write_bytes(Path(__file__).resolve().read_bytes())
         runner_helper.chmod(0o700)
         worktree = paths["worktrees"] / task_id_value
         worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        session = f"codex-{project_id[-12:]}-{task_id_value[-8:]}"
+        session_prefix = "codexi" if execution_mode == "interactive" else "codex"
+        session = f"{session_prefix}-{project_id[-12:]}-{task_id_value[-8:]}"
         task = {
             "schema_version": SCHEMA_VERSION,
             "project_id": project_id,
             "project_name": payload.get("project_name"),
             "task_id": task_id_value,
             "state": "STARTING",
+            "execution_mode": execution_mode,
             "created_at": payload.get("created_at") or utc_now(),
             "input_ref": input_ref,
             "input_sha": input_sha,
+            "input_tree": payload.get("input_tree"),
+            "input_index_tree": payload.get("input_index_tree"),
             "local_head": payload.get("local_head"),
             "local_branch": payload.get("local_branch"),
             "normal_remote_dir": payload.get("normal_remote_dir"),
             "broker": str(paths["broker"]),
             "worktree": str(worktree),
             "state_dir": str(state_dir),
-            "prompt_path": str(prompt_path),
+            "prompt_path": str(prompt_path) if prompt_path else None,
             "prompt_sha256": payload.get("prompt_sha256"),
             "runner_helper": str(runner_helper),
             "runner_helper_sha256": sha256_file(runner_helper),
@@ -2069,15 +2646,60 @@ def git_status_porcelain(root: Path) -> str:
     return git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout
 
 
-def terminate_child_process(process: subprocess.Popen[Any]) -> None:
-    """Terminate a child and its command process group when possible."""
+def terminate_child_process(
+    process: subprocess.Popen[Any], *, process_group: bool = True
+) -> None:
+    """Terminate PROCESS, including its process group when one was created."""
     if process.poll() is not None:
         return
+    if process_group:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            return
+        except (OSError, ProcessLookupError):
+            pass
+    with contextlib.suppress(ProcessLookupError):
+        process.terminate()
+
+
+@contextlib.contextmanager
+def foreground_child_process_group(process: subprocess.Popen[Any]):
+    """Give PROCESS's group the tmux pane while preserving the runner parent.
+
+    An interactive Codex TUI must receive terminal signals such as Ctrl-C
+    without also signalling the Python finalizer.  The child is launched in a
+    separate process group, then made foreground for the duration of the TUI.
+    Non-TTY test and recovery environments safely skip the handoff.
+    """
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        with contextlib.suppress(ProcessLookupError):
-            process.terminate()
+        terminal_fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        yield
+        return
+    if not os.isatty(terminal_fd):
+        yield
+        return
+
+    runner_group = os.tcgetpgrp(terminal_fd)
+    previous_ttou = signal.getsignal(signal.SIGTTOU)
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    handed_off = False
+    try:
+        try:
+            os.tcsetpgrp(terminal_fd, process.pid)
+            handed_off = True
+        except OSError:
+            # A CLI argument/startup error may terminate the child before the
+            # runner can hand over the pane.  In that case there is nothing
+            # left to foreground; otherwise surface the terminal failure.
+            if process.poll() is None:
+                raise
+        yield
+    finally:
+        if handed_off:
+            with contextlib.suppress(OSError):
+                os.tcsetpgrp(terminal_fd, runner_group)
+        signal.signal(signal.SIGTTOU, previous_ttou)
 
 
 def run_shell_logged(
@@ -2095,6 +2717,7 @@ def run_shell_logged(
             start_new_session=True,
         )
         active["process"] = process
+        active["process_group"] = True
         assert process.stdout is not None
         for line in process.stdout:
             log.write(line)
@@ -2214,6 +2837,26 @@ def codex_command(task: Mapping[str, Any]) -> list[str]:
     return command
 
 
+def interactive_codex_command(task: Mapping[str, Any]) -> list[str]:
+    """Build the ordinary interactive Codex TUI invocation for TASK."""
+    command = [
+        task["tools"]["codex"],
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+    ]
+    if task.get("enable_search"):
+        command.append("--search")
+    if task.get("model"):
+        command.extend(["--model", task["model"]])
+    if task.get("profile"):
+        command.extend(["--profile", task["profile"]])
+    if task.get("reasoning_effort"):
+        command.extend(["--config", f"model_reasoning_effort={task['reasoning_effort']}"])
+    return command
+
+
 def parse_codex_event(task: dict[str, Any], line: str, paths: Mapping[str, Path]) -> None:
     try:
         event = json.loads(line)
@@ -2251,13 +2894,20 @@ def server_run(project_id: str, task_id_value: str) -> int:
         raise CodexRemoteError("Task state not found", code="TASK_NOT_FOUND")
     state_dir = Path(task["state_dir"])
     runner_log = state_dir / "runner.log"
-    active: dict[str, Any] = {"process": None, "cancelled": False}
+    active: dict[str, Any] = {
+        "process": None,
+        "process_group": False,
+        "cancelled": False,
+    }
 
     def handle_signal(signum: int, _frame: Any) -> None:
         active["cancelled"] = True
         process = active.get("process")
         if process is not None and process.poll() is None:
-            terminate_child_process(process)
+            terminate_child_process(
+                process,
+                process_group=bool(active.get("process_group")),
+            )
         task["cancel_requested"] = True
         task["state"] = "CANCEL_REQUESTED"
         save_server_task(paths, task)
@@ -2335,50 +2985,72 @@ def server_run(project_id: str, task_id_value: str) -> int:
         task["state"] = "RUNNING"
         task["codex_started_at"] = utc_now()
         save_server_task(paths, task)
-        prompt = Path(task["prompt_path"]).read_text(encoding="utf-8")
-        command = codex_command(task)
-        note("launching: " + shlex.join(command[:-1]) + " < prompt.txt")
-        jsonl_path = state_dir / "codex.jsonl"
-        stderr_path = state_dir / "codex.stderr.log"
-        with jsonl_path.open("a", encoding="utf-8") as jsonl, stderr_path.open("a", encoding="utf-8") as errlog:
-            process = subprocess.Popen(
-                command,
-                cwd=worktree,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                start_new_session=True,
-            )
+        execution_mode = task_execution_mode(task)
+        if execution_mode == "interactive":
+            command = interactive_codex_command(task)
+            note("launching interactive Codex TUI: " + shlex.join(command))
+            process = subprocess.Popen(command, cwd=worktree, preexec_fn=os.setpgrp)
             active["process"] = process
+            active["process_group"] = True
             task["codex_pid"] = process.pid
             save_server_task(paths, task)
             if active["cancelled"] or task.get("cancel_requested"):
-                terminate_child_process(process)
-            assert process.stdin is not None and process.stdout is not None and process.stderr is not None
-            stderr_thread = threading.Thread(
-                target=tee_stream, args=(process.stderr, errlog, "[codex stderr] "), daemon=True
-            )
-            stderr_thread.start()
-            try:
-                if not (active["cancelled"] or task.get("cancel_requested")):
-                    process.stdin.write(prompt)
-            except BrokenPipeError:
-                if not (active["cancelled"] or task.get("cancel_requested")):
-                    raise
-            finally:
-                with contextlib.suppress(BrokenPipeError):
-                    process.stdin.close()
-            for line in process.stdout:
-                jsonl.write(line)
-                jsonl.flush()
-                print(line, end="", flush=True)
-                parse_codex_event(task, line, paths)
-            process.stdout.close()
-            codex_rc = process.wait()
-            stderr_thread.join()
+                terminate_child_process(process, process_group=True)
+            with foreground_child_process_group(process):
+                codex_rc = process.wait()
+        else:
+            prompt_path = task.get("prompt_path")
+            if not isinstance(prompt_path, str) or not prompt_path:
+                raise CodexRemoteError(
+                    "Noninteractive task is missing its prompt",
+                    code="EMPTY_PROMPT",
+                )
+            prompt = Path(prompt_path).read_text(encoding="utf-8")
+            command = codex_command(task)
+            note("launching: " + shlex.join(command[:-1]) + " < prompt.txt")
+            jsonl_path = state_dir / "codex.jsonl"
+            stderr_path = state_dir / "codex.stderr.log"
+            with jsonl_path.open("a", encoding="utf-8") as jsonl, stderr_path.open("a", encoding="utf-8") as errlog:
+                process = subprocess.Popen(
+                    command,
+                    cwd=worktree,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,
+                )
+                active["process"] = process
+                active["process_group"] = True
+                task["codex_pid"] = process.pid
+                save_server_task(paths, task)
+                if active["cancelled"] or task.get("cancel_requested"):
+                    terminate_child_process(process, process_group=True)
+                assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+                stderr_thread = threading.Thread(
+                    target=tee_stream, args=(process.stderr, errlog, "[codex stderr] "), daemon=True
+                )
+                stderr_thread.start()
+                try:
+                    if not (active["cancelled"] or task.get("cancel_requested")):
+                        process.stdin.write(prompt)
+                except BrokenPipeError:
+                    if not (active["cancelled"] or task.get("cancel_requested")):
+                        raise
+                finally:
+                    with contextlib.suppress(BrokenPipeError):
+                        process.stdin.close()
+                for line in process.stdout:
+                    jsonl.write(line)
+                    jsonl.flush()
+                    print(line, end="", flush=True)
+                    parse_codex_event(task, line, paths)
+                process.stdout.close()
+                codex_rc = process.wait()
+                stderr_thread.join()
         active["process"] = None
+        active["process_group"] = False
         task.pop("codex_pid", None)
         task["codex_exit_code"] = codex_rc
         task["codex_finished_at"] = utc_now()
@@ -2590,6 +3262,101 @@ def tail_file(path: Path, lines: int) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
+def server_recover(project_id: str) -> dict[str, Any]:
+    """Publish a preserved worktree after its original runner disappeared.
+
+    Recovery never reruns Codex.  It performs the normal result safety checks
+    and publishes the current worktree, but deliberately marks the result
+    unverified because the interrupted server environment/tests are not rerun.
+    """
+    paths = ensure_server_layout(project_id)
+    task = load_server_task(paths)
+    if not task:
+        raise CodexRemoteError("No task exists", code="TASK_NOT_FOUND")
+    if task.get("state") not in {"ORPHANED", "FAILED"}:
+        raise CodexRemoteError(
+            f"Task is not recoverable; current state is {task.get('state')}",
+            code="TASK_NOT_RECOVERABLE",
+            details=task,
+        )
+    pane = tmux_pane_state(task)
+    if pane.get("running") or lock_is_held(paths["lock"]):
+        raise CodexRemoteError(
+            "The original runner still appears active; refusing recovery",
+            code="TASK_STILL_ACTIVE",
+            details={"task": task, "tmux": pane},
+        )
+    worktree_value = task.get("worktree")
+    if not isinstance(worktree_value, str) or not Path(worktree_value).is_dir():
+        raise CodexRemoteError(
+            "The preserved server worktree is missing",
+            code="RECOVERY_WORKTREE_MISSING",
+            details=task,
+        )
+
+    paths["lock"].parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_handle = paths["lock"].open("a+")
+    try:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CodexRemoteError(
+                "Another writer acquired the project lock before recovery",
+                code="TASK_STILL_ACTIVE",
+            ) from exc
+        cleanup_tmux_session(task)
+        previous = {
+            "state": task.get("state"),
+            "error": task.get("error"),
+            "error_code": task.get("error_code"),
+        }
+        task["state"] = "FINALIZING"
+        task["recovery"] = {
+            "started_at": utc_now(),
+            "previous": previous,
+            "codex_rerun": False,
+            "tests_rerun": False,
+        }
+        save_server_task(paths, task)
+        remove_data_links(task)
+        result_sha, has_changes = commit_dirty_result(task, paths)
+        task["result_sha"] = result_sha
+        task["has_changes"] = has_changes
+        task["recovery"]["finished_at"] = utc_now()
+        task["recovery"]["result_sha"] = result_sha
+        task.pop("error", None)
+        task.pop("error_code", None)
+        task.pop("error_details", None)
+        if has_changes:
+            task["state"] = "READY_RECOVERED_UNVERIFIED"
+            message = (
+                "Recovered and published the preserved worktree without rerunning "
+                "Codex or server tests. SPC r c f will warn before import."
+            )
+        else:
+            task["state"] = "NOOP"
+            message = "The preserved worktree contained no changes; task is a no-op."
+        task["finished_at"] = utc_now()
+        task = save_server_task(paths, task)
+        return {"ok": True, "task": task, "message": message}
+    except CodexRemoteError as exc:
+        task["state"] = "BLOCKED_UNSAFE_RESULT" if exc.code in {
+            "UNSAFE_UNTRACKED",
+            "UNSAFE_RESULT",
+            "RESULT_DIFF_CHECK_FAILED",
+            "DATA_LINK_TAMPERED",
+        } else "FAILED"
+        task["error"] = str(exc)
+        task["error_code"] = exc.code
+        task["error_details"] = exc.details
+        save_server_task(paths, task)
+        raise
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
 def server_logs(project_id: str, lines: int) -> dict[str, Any]:
     paths = ensure_server_layout(project_id)
     task = load_server_task(paths)
@@ -2753,19 +3520,30 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
         command.add_argument("--max-untracked-bytes", type=int, default=DEFAULT_MAX_UNTRACKED_BYTES)
 
+    def add_task_options(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--bootstrap-cmd", default="")
+        command.add_argument("--test-cmd", default="")
+        command.add_argument("--data-link", action="append", default=[])
+        command.add_argument("--model", default="")
+        command.add_argument("--profile", default="")
+        command.add_argument("--reasoning-effort", choices=sorted(SAFE_REASONING), default="")
+        command.add_argument("--enable-search", action="store_true")
+
     doctor = sub.add_parser("doctor", help="verify local and remote prerequisites")
     add_common(doctor)
+    add_task_options(doctor)
 
     start = sub.add_parser("start", help="start a durable remote Codex task")
     add_common(start)
     start.add_argument("--prompt-file", default="-")
-    start.add_argument("--bootstrap-cmd", default="")
-    start.add_argument("--test-cmd", default="")
-    start.add_argument("--data-link", action="append", default=[])
-    start.add_argument("--model", default="")
-    start.add_argument("--profile", default="")
-    start.add_argument("--reasoning-effort", choices=sorted(SAFE_REASONING), default="")
-    start.add_argument("--enable-search", action="store_true")
+    add_task_options(start)
+
+    interactive = sub.add_parser(
+        "interactive",
+        help="start or reattach to a managed interactive Codex TUI",
+    )
+    add_common(interactive)
+    add_task_options(interactive)
 
     status = sub.add_parser("status", help="show the current project task")
     add_common(status)
@@ -2777,9 +3555,15 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser = sub.add_parser("apply", help="integrate and apply a completed result")
     add_common(apply_parser)
     apply_parser.add_argument("--allow-branch-change", action="store_true")
+    apply_parser.add_argument("--preserve-local-branch", action="store_true")
+    apply_parser.add_argument("--push-backup", action="store_true")
+    apply_parser.add_argument("--backup-remote", default="origin")
 
     cancel = sub.add_parser("cancel", help="request cancellation while preserving work")
     add_common(cancel)
+
+    recover = sub.add_parser("recover", help="finalize a preserved orphaned worktree")
+    add_common(recover)
 
     clean = sub.add_parser("clean", help="archive an imported task or explicitly discard it")
     add_common(clean)
@@ -2795,6 +3579,7 @@ def build_parser() -> argparse.ArgumentParser:
     server_run_parser = sub.add_parser("_server-run", parents=[internal_parser()])
     server_run_parser.add_argument("--task-id", required=True)
     server_cancel_parser = sub.add_parser("_server-cancel", parents=[internal_parser()])
+    server_recover_parser = sub.add_parser("_server-recover", parents=[internal_parser()])
     server_imported_parser = sub.add_parser("_server-mark-imported", parents=[internal_parser()])
     server_imported_parser.add_argument("--task-id", required=True)
     server_clean_parser = sub.add_parser("_server-clean", parents=[internal_parser()])
@@ -2809,6 +3594,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
         return cmd_doctor(args)
     if args.command == "start":
         return cmd_start(args)
+    if args.command == "interactive":
+        return cmd_interactive(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "logs":
@@ -2817,6 +3604,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
         return cmd_apply(args)
     if args.command == "cancel":
         return cmd_cancel(args)
+    if args.command == "recover":
+        return cmd_recover(args)
     if args.command == "clean":
         return cmd_clean(args)
     if args.command == "_server-init":
@@ -2833,6 +3622,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
         return server_run(args.project_id, args.task_id)
     if args.command == "_server-cancel":
         return server_cancel(args.project_id)
+    if args.command == "_server-recover":
+        return server_recover(args.project_id)
     if args.command == "_server-mark-imported":
         return server_mark_imported(args.project_id, args.task_id)
     if args.command == "_server-clean":
