@@ -167,6 +167,16 @@ otherwise valid machine-readable response."
   "Return error code from backend RESPONSE."
   (my/codex-remote--get response 'error_code))
 
+(defun my/codex-remote--command-output (result &optional fallback)
+  "Return the first nonempty stdout/stderr string from RESULT.
+
+Use FALLBACK when the command succeeded without emitting status text."
+  (let ((stdout (my/codex-remote--get result 'stdout))
+        (stderr (my/codex-remote--get result 'stderr)))
+    (cond ((and (stringp stdout) (not (string-empty-p stdout))) stdout)
+          ((and (stringp stderr) (not (string-empty-p stderr))) stderr)
+          (t fallback))))
+
 (defun my/codex-remote--display-raw-error (buffer response)
   "Display BUFFER and summarize backend RESPONSE."
   (with-current-buffer buffer
@@ -300,8 +310,8 @@ ON-ERROR with the parsed JSON object and process buffer."
                               (my/codex-remote--get version 'stdout))))
             (when-let ((auth (my/codex-remote--get remote 'codex_auth)))
               (insert (format "Auth: %s\n"
-                              (or (my/codex-remote--get auth 'stdout)
-                                  (my/codex-remote--get auth 'stderr)))))))
+                              (my/codex-remote--command-output
+                               auth "(authenticated)"))))))
         (when local-state
           (insert "\nLocal orchestration state\n")
           (insert (make-string 72 ?-) "\n")

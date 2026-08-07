@@ -72,6 +72,14 @@
       (should (my/codex-remote--get response 'ok))
       (should (equal (my/codex-remote--get task 'state) "READY")))))
 
+(ert-deftest codex-remote-command-output-falls-back-from-empty-stdout ()
+  (should
+   (equal
+    (my/codex-remote--command-output
+     '((stdout . "") (stderr . "Logged in using ChatGPT"))
+     "(authenticated)")
+    "Logged in using ChatGPT")))
+
 (ert-deftest codex-remote-status-lines-include-result-and-tests ()
   (let* ((task '((state . "READY_TESTS_FAILED")
                  (task_id . "task-1")
