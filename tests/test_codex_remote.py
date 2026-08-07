@@ -661,10 +661,14 @@ class MiscellaneousTests(RepositoryTestCase):
             "enable_search": True,
         }
         value = cr.codex_command(task)
-        self.assertEqual(value[:2], ["/opt/codex", "exec"])
+        self.assertEqual(
+            value[:5],
+            ["/opt/codex", "--ask-for-approval", "never", "--search", "exec"],
+        )
+        self.assertLess(value.index("--ask-for-approval"), value.index("exec"))
+        self.assertLess(value.index("--search"), value.index("exec"))
         self.assertIn("--json", value)
         self.assertEqual(value[value.index("--sandbox") + 1], "workspace-write")
-        self.assertEqual(value[value.index("--ask-for-approval") + 1], "never")
         self.assertIn("model_reasoning_effort=high", value)
         self.assertEqual(value[-1], "-")
 

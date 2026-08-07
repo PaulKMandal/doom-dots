@@ -2124,25 +2124,31 @@ def commit_dirty_result(task: dict[str, Any], paths: Mapping[str, Path]) -> tupl
 def codex_command(task: Mapping[str, Any]) -> list[str]:
     codex = task["tools"]["codex"]
     final_message = str(Path(task["state_dir"]) / "final-message.txt")
+    # In Codex CLI 0.147+, --ask-for-approval is a global option.  Placing it
+    # after the `exec` subcommand causes clap to reject the invocation before
+    # Codex starts.  Keep global options before `exec`; exec-specific options
+    # follow the subcommand.
     command = [
         codex,
+        "--ask-for-approval",
+        "never",
+    ]
+    if task.get("enable_search"):
+        command.append("--search")
+    command.extend([
         "exec",
         "--json",
         "--sandbox",
         "workspace-write",
-        "--ask-for-approval",
-        "never",
         "--output-last-message",
         final_message,
-    ]
+    ])
     if task.get("model"):
         command.extend(["--model", task["model"]])
     if task.get("profile"):
         command.extend(["--profile", task["profile"]])
     if task.get("reasoning_effort"):
         command.extend(["--config", f"model_reasoning_effort={task['reasoning_effort']}"])
-    if task.get("enable_search"):
-        command.append("--search")
     command.append("-")
     return command
 
