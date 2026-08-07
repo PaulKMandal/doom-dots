@@ -265,7 +265,7 @@
                  (tests . ((command . "pytest") (exit_code . 1)))))
          (text (string-join (my/codex-remote--task-lines task) "\n")))
     (should (string-match-p "READY_TESTS_FAILED" text))
-    (should (string-match-p "Mode[[:space:]]+exec" text))
+    (should (string-match-p "Mode:[[:space:]]+exec" text))
     (should (string-match-p "task-1" text))
     (should (string-match-p "abc123" text))
     (should (string-match-p "pytest" text))))
