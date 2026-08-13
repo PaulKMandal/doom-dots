@@ -17,10 +17,12 @@ import json
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
+import platform
 import re
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -37,6 +39,11 @@ REMOTE_SHARE_RELATIVE = Path(".local/share/codex-remote")
 REMOTE_STATE_RELATIVE = Path(".local/state/codex-remote")
 LOCAL_STATE_ROOT = Path.home() / ".local/state/codex-remote"
 PROJECT_CONFIG_RELATIVE = "codex-remote/config.json"
+JOB_REQUEST_RELATIVE = ".codex-job-request.json"
+JOB_POLICIES = {"deny", "prepare", "launch"}
+JOB_ACTIVE_STATES = {"STARTING", "BOOTSTRAPPING", "RUNNING", "STOP_REQUESTED"}
+GLOBAL_AGENTS_BEGIN = "<!-- BEGIN CODEX-REMOTE MANAGED INSTRUCTIONS -->"
+GLOBAL_AGENTS_END = "<!-- END CODEX-REMOTE MANAGED INSTRUCTIONS -->"
 
 ACTIVE_STATES = {
     "SUBMITTING",
@@ -58,6 +65,8 @@ RESULT_READY_STATES = {
     "READY_ENVIRONMENT_UNVERIFIED",
     "CANCELLED_READY",
     "READY_RECOVERED_UNVERIFIED",
+    "READY_JOB_NOT_LAUNCHED",
+    "READY_JOB_PREPARED",
 }
 ALLOW_NEW_TASK_STATES = {"NONE", "IMPORTED", "DISCARDED", "ARCHIVED"}
 LOCAL_RESOLVED_STATES = {"IMPORTED", "DISCARDED", "ARCHIVED"}
@@ -166,6 +175,22 @@ def atomic_write_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(value, handle, sort_keys=True, indent=2, ensure_ascii=False)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def atomic_write_text(path: Path, value: str, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
@@ -924,6 +949,7 @@ def task_option_values(args: argparse.Namespace) -> dict[str, Any]:
                 "profile": args.profile or "",
                 "reasoning_effort": args.reasoning_effort or "",
                 "enable_search": bool(args.enable_search),
+                "job_policy": getattr(args, "job_policy", "deny") or "deny",
             }
         )
     return values
@@ -1160,6 +1186,7 @@ def start_new_task(
         "profile": args.profile or None,
         "reasoning_effort": args.reasoning_effort or None,
         "enable_search": bool(args.enable_search),
+        "job_policy": getattr(args, "job_policy", "deny") or "deny",
         "lock_hashes": file_hashes(root),
         "created_at": local_state["created_at"],
     }
@@ -2147,6 +2174,129 @@ def cmd_clean(args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, "command": "clean", "project_id": project_id, "task": value["task"]}
 
 
+def job_remote_context(
+    args: argparse.Namespace,
+) -> tuple[Path, str, int, str, str, dict[str, str]]:
+    root, host, _remote_dir, timeout, project_id, project_name = common_local_args(args)
+    context = ensure_remote_helper(host, timeout)
+    remote_invoke(context, ["_server-init", "--project-id", project_id], timeout=timeout)
+    return root, host, timeout, project_id, project_name, context
+
+
+def cmd_jobs(args: argparse.Namespace) -> dict[str, Any]:
+    root, host, timeout, project_id, project_name, context = job_remote_context(args)
+    value = remote_invoke(
+        context, ["_server-jobs", "--project-id", project_id], timeout=timeout
+    )
+    value.update(
+        {
+            "command": "jobs",
+            "project_id": project_id,
+            "project_name": project_name,
+            "project_root": str(root),
+            "remote_host": host,
+        }
+    )
+    return value
+
+
+def cmd_job_status(args: argparse.Namespace) -> dict[str, Any]:
+    _root, _host, timeout, project_id, _project_name, context = job_remote_context(args)
+    value = remote_invoke(
+        context,
+        ["_server-job-status", "--project-id", project_id, "--run-id", args.run_id],
+        timeout=timeout,
+    )
+    value.update({"command": "job-status", "project_id": project_id})
+    return value
+
+
+def cmd_job_logs(args: argparse.Namespace) -> dict[str, Any]:
+    _root, _host, timeout, project_id, _project_name, context = job_remote_context(args)
+    value = remote_invoke(
+        context,
+        [
+            "_server-job-logs",
+            "--project-id",
+            project_id,
+            "--run-id",
+            args.run_id,
+            "--tail",
+            str(args.tail),
+        ],
+        timeout=timeout,
+    )
+    value.update({"command": "job-logs", "project_id": project_id})
+    return value
+
+
+def cmd_job_stop(args: argparse.Namespace) -> dict[str, Any]:
+    _root, _host, timeout, project_id, _project_name, context = job_remote_context(args)
+    value = remote_invoke(
+        context,
+        ["_server-job-stop", "--project-id", project_id, "--run-id", args.run_id],
+        timeout=timeout,
+    )
+    value.update({"command": "job-stop", "project_id": project_id})
+    return value
+
+
+def cmd_job_summarize(args: argparse.Namespace) -> dict[str, Any]:
+    _root, _host, timeout, project_id, _project_name, context = job_remote_context(args)
+    value = remote_invoke(
+        context,
+        ["_server-job-summarize", "--project-id", project_id, "--run-id", args.run_id],
+        timeout=timeout + 10,
+    )
+    value.update({"command": "job-summarize", "project_id": project_id})
+    return value
+
+
+def cmd_job_analysis(args: argparse.Namespace) -> dict[str, Any]:
+    _root, _host, timeout, project_id, _project_name, context = job_remote_context(args)
+    value = remote_invoke(
+        context,
+        ["_server-job-analysis", "--project-id", project_id, "--run-id", args.run_id],
+        timeout=timeout,
+    )
+    value.update({"command": "job-analysis", "project_id": project_id})
+    return value
+
+
+def global_agents_template_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "templates" / "codex" / "global-AGENTS.md"
+
+
+def cmd_install_agents(args: argparse.Namespace) -> dict[str, Any]:
+    root, host, _remote_dir, timeout, project_id, project_name = common_local_args(args)
+    template = global_agents_template_path()
+    if not template.is_file():
+        raise CodexRemoteError(
+            f"Global AGENTS template is missing: {template}", code="TEMPLATE_MISSING"
+        )
+    content = template.read_text(encoding="utf-8").strip() + "\n"
+    context = ensure_remote_helper(host, timeout)
+    value = remote_invoke(
+        context,
+        ["_server-install-agents", "--project-id", project_id],
+        timeout=timeout,
+        payload={
+            "content": content,
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        },
+    )
+    value.update(
+        {
+            "command": "install-agents",
+            "project_id": project_id,
+            "project_name": project_name,
+            "project_root": str(root),
+            "remote_host": host,
+        }
+    )
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Server-side implementation
 # ---------------------------------------------------------------------------
@@ -2163,7 +2313,9 @@ def server_paths(project_id: str) -> dict[str, Path]:
         "state_root": state_root,
         "broker": share / "repos" / f"{project_id}.git",
         "worktrees": share / "worktrees" / project_id,
+        "job_worktrees": share / "job-worktrees" / project_id,
         "project_state": state_root / project_id,
+        "jobs_state": state_root / "jobs" / project_id,
         "current": state_root / project_id / "current.json",
         "lock": state_root / "locks" / f"{project_id}.lock",
     }
@@ -2171,7 +2323,14 @@ def server_paths(project_id: str) -> dict[str, Path]:
 
 def ensure_server_layout(project_id: str) -> dict[str, Path]:
     paths = server_paths(project_id)
-    for key in ("share", "state_root", "worktrees", "project_state"):
+    for key in (
+        "share",
+        "state_root",
+        "worktrees",
+        "job_worktrees",
+        "project_state",
+        "jobs_state",
+    ):
         paths[key].mkdir(parents=True, exist_ok=True, mode=0o700)
     paths["broker"].parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     paths["lock"].parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2226,7 +2385,9 @@ def server_remote_description(paths: Mapping[str, Path]) -> dict[str, Any]:
     return {
         "broker": str(paths["broker"]),
         "worktrees": str(paths["worktrees"]),
+        "job_worktrees": str(paths["job_worktrees"]),
         "state_root": str(paths["state_root"]),
+        "jobs_state": str(paths["jobs_state"]),
         "lock": str(paths["lock"]),
     }
 
@@ -2234,6 +2395,49 @@ def server_remote_description(paths: Mapping[str, Path]) -> dict[str, Any]:
 def server_init(project_id: str) -> dict[str, Any]:
     paths = ensure_server_layout(project_id)
     return {"ok": True, "remote": server_remote_description(paths)}
+
+
+def server_install_agents(project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    paths = ensure_server_layout(project_id)
+    content = payload.get("content")
+    expected_hash = payload.get("sha256")
+    if not isinstance(content, str) or not content.strip() or len(content.encode("utf-8")) > 64 * 1024:
+        raise CodexRemoteError("Invalid global AGENTS content", code="INVALID_AGENTS_CONTENT")
+    actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if expected_hash != actual_hash:
+        raise CodexRemoteError("Global AGENTS content hash mismatch", code="PAYLOAD_HASH_MISMATCH")
+    target = paths["home"] / ".codex" / "AGENTS.md"
+    existing = target.read_text(encoding="utf-8") if target.is_file() else ""
+    begin_count = existing.count(GLOBAL_AGENTS_BEGIN)
+    end_count = existing.count(GLOBAL_AGENTS_END)
+    if (begin_count, end_count) not in {(0, 0), (1, 1)}:
+        raise CodexRemoteError(
+            f"Managed markers are malformed in {target}; repair them manually before retrying",
+            code="MALFORMED_MANAGED_BLOCK",
+        )
+    if begin_count:
+        start = existing.index(GLOBAL_AGENTS_BEGIN)
+        end_start = existing.find(GLOBAL_AGENTS_END, start)
+        if end_start < 0:
+            raise CodexRemoteError(
+                f"Managed markers are out of order in {target}; repair them manually before retrying",
+                code="MALFORMED_MANAGED_BLOCK",
+            )
+        end = end_start + len(GLOBAL_AGENTS_END)
+        prefix = existing[:start].rstrip()
+        suffix = existing[end:].lstrip()
+        outside = "\n\n".join(part for part in (prefix, suffix) if part)
+    else:
+        outside = existing.strip()
+    block = f"{GLOBAL_AGENTS_BEGIN}\n{content.strip()}\n{GLOBAL_AGENTS_END}"
+    updated = (outside + "\n\n" + block if outside else block) + "\n"
+    atomic_write_text(target, updated)
+    return {
+        "ok": True,
+        "path": str(target),
+        "sha256": hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+        "managed_content_sha256": actual_hash,
+    }
 
 
 def server_doctor(project_id: str) -> dict[str, Any]:
@@ -2316,6 +2520,219 @@ def validate_codex_configuration(payload: Mapping[str, Any]) -> None:
         value = payload.get(key)
         if value is not None and (not isinstance(value, str) or "\n" in value or "\r" in value):
             raise CodexRemoteError(f"Invalid Codex {key}", code="INVALID_CODEX_CONFIG")
+    job_policy = payload.get("job_policy", "deny")
+    if job_policy not in JOB_POLICIES:
+        raise CodexRemoteError(
+            f"Invalid job policy: {job_policy}", code="INVALID_JOB_POLICY"
+        )
+
+
+def normalized_job_request(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and normalize one frozen experiment launch request."""
+    name = value.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 96:
+        raise CodexRemoteError(
+            "A job request needs a nonempty name of at most 96 characters",
+            code="INVALID_JOB_REQUEST",
+        )
+    if any(ord(char) < 32 for char in name):
+        raise CodexRemoteError("Job name contains control characters", code="INVALID_JOB_REQUEST")
+
+    command = value.get("command")
+    if not isinstance(command, list) or not command:
+        raise CodexRemoteError(
+            "A job request needs a nonempty argv command",
+            code="INVALID_JOB_REQUEST",
+        )
+    normalized_command: list[str] = []
+    for argument in command:
+        if not isinstance(argument, str) or not argument or "\x00" in argument:
+            raise CodexRemoteError(
+                "Job command arguments must be nonempty strings without NUL bytes",
+                code="INVALID_JOB_REQUEST",
+            )
+        if len(argument) > 8192:
+            raise CodexRemoteError("Job command argument is too long", code="INVALID_JOB_REQUEST")
+        normalized_command.append(argument)
+    if len(normalized_command) > 256:
+        raise CodexRemoteError("Job command has too many arguments", code="INVALID_JOB_REQUEST")
+
+    gpus = value.get("gpus") or ""
+    if not isinstance(gpus, str) or (gpus and not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", gpus)):
+        raise CodexRemoteError(
+            "GPU selection must be a comma-separated list such as 0,1",
+            code="INVALID_JOB_REQUEST",
+        )
+
+    completion_marker = value.get("completion_marker") or ""
+    if not isinstance(completion_marker, str):
+        raise CodexRemoteError("Invalid completion marker", code="INVALID_JOB_REQUEST")
+    if completion_marker:
+        marker = PurePosixPath(completion_marker)
+        if marker.is_absolute() or ".." in marker.parts or not marker.parts:
+            raise CodexRemoteError(
+                "Completion marker must be relative to the frozen job worktree",
+                code="INVALID_JOB_REQUEST",
+            )
+        completion_marker = marker.as_posix()
+
+    resume_command = value.get("resume_command") or ""
+    if not isinstance(resume_command, str) or "\x00" in resume_command or len(resume_command) > 16384:
+        raise CodexRemoteError("Invalid resume command", code="INVALID_JOB_REQUEST")
+
+    metadata = value.get("metadata") or {}
+    if not isinstance(metadata, dict) or len(metadata) > 64:
+        raise CodexRemoteError("Invalid job metadata", code="INVALID_JOB_REQUEST")
+    normalized_metadata: dict[str, str] = {}
+    for key, item in metadata.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", key):
+            raise CodexRemoteError(f"Invalid job metadata key: {key!r}", code="INVALID_JOB_REQUEST")
+        if not isinstance(item, str) or "\x00" in item or len(item) > 4096:
+            raise CodexRemoteError(f"Invalid value for job metadata key {key}", code="INVALID_JOB_REQUEST")
+        normalized_metadata[key] = item
+
+    requested_at = value.get("requested_at") or utc_now()
+    if not isinstance(requested_at, str) or len(requested_at) > 128 or "\x00" in requested_at:
+        raise CodexRemoteError("Invalid job request timestamp", code="INVALID_JOB_REQUEST")
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "name": name.strip(),
+        "command": normalized_command,
+        "gpus": gpus,
+        "completion_marker": completion_marker,
+        "resume_command": resume_command,
+        "metadata": normalized_metadata,
+        "requested_at": requested_at,
+    }
+
+
+def request_job_file(
+    request_file: Path,
+    *,
+    name: str,
+    command: Sequence[str],
+    gpus: str = "",
+    completion_marker: str = "",
+    resume_command: str = "",
+    metadata_values: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Write the single job request consumed by the trusted runner."""
+    if request_file.name != JOB_REQUEST_RELATIVE:
+        raise CodexRemoteError("Unexpected job request path", code="INVALID_JOB_REQUEST")
+    expected_path = os.environ.get("CODEX_JOB_REQUEST_PATH")
+    if expected_path and request_file.resolve(strict=False) != Path(expected_path).resolve(strict=False):
+        raise CodexRemoteError(
+            "Job request path does not match the runner-authorized worktree",
+            code="INVALID_JOB_REQUEST",
+        )
+    metadata: dict[str, str] = {}
+    for value in metadata_values:
+        if "=" not in value:
+            raise CodexRemoteError(
+                f"Job metadata must have KEY=VALUE form: {value}",
+                code="INVALID_JOB_REQUEST",
+            )
+        key, item = value.split("=", 1)
+        if key in metadata:
+            raise CodexRemoteError(f"Duplicate job metadata key: {key}", code="INVALID_JOB_REQUEST")
+        metadata[key] = item
+    request = normalized_job_request(
+        {
+            "name": name,
+            "command": list(command),
+            "gpus": gpus,
+            "completion_marker": completion_marker,
+            "resume_command": resume_command,
+            "metadata": metadata,
+        }
+    )
+    if request_file.exists() or request_file.is_symlink():
+        raise CodexRemoteError(
+            "A job request already exists for this Codex task",
+            code="JOB_REQUEST_EXISTS",
+        )
+    atomic_write_json(request_file, request)
+    return {"ok": True, "request": request, "request_file": str(request_file)}
+
+
+def consume_job_request(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Remove and validate Codex's request before result publication."""
+    request_path = Path(task["worktree"]) / JOB_REQUEST_RELATIVE
+    if not request_path.exists() and not request_path.is_symlink():
+        return None
+    if request_path.is_symlink() or not request_path.is_file():
+        raise CodexRemoteError(
+            "The job request is not a regular file", code="INVALID_JOB_REQUEST"
+        )
+    if request_path.stat().st_size > 256 * 1024:
+        with contextlib.suppress(FileNotFoundError):
+            request_path.unlink()
+        raise CodexRemoteError("The job request is too large", code="INVALID_JOB_REQUEST")
+    try:
+        value = read_json(request_path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            request_path.unlink()
+    if not isinstance(value, dict):
+        raise CodexRemoteError("The job request is invalid JSON", code="INVALID_JOB_REQUEST")
+    request = normalized_job_request(value)
+    policy = task.get("job_policy", "deny")
+    if policy == "deny":
+        raise CodexRemoteError(
+            "Codex attempted to request a detached job without explicit authorization",
+            code="JOB_NOT_AUTHORIZED",
+            details=request,
+        )
+    state_dir = Path(task["state_dir"])
+    atomic_write_json(state_dir / "job-request.json", request)
+    return request
+
+
+def codex_job_instructions(task: Mapping[str, Any]) -> str:
+    """Return per-task launch rules injected as Codex developer instructions."""
+    policy = task.get("job_policy", "deny")
+    base = (
+        "This repository is managed by codex-remote. Do not commit, push, merge, "
+        "rebase, switch branches, edit outside the assigned worktree, or delete existing "
+        "result directories. Do not inspect unrelated repositories, SSH keys, credentials, "
+        "tokens, or secret files. Run bounded foreground tests normally."
+    )
+    if policy == "launch":
+        return base + (
+            " One frozen long-running experiment launch is explicitly authorized, but you "
+            "must not start it directly with tmux, nohup, systemd, a scheduler, shell "
+            "backgrounding, or another detached mechanism. Finish the implementation and "
+            "smoke validation, then create exactly one request using: "
+            "\"$CODEX_JOBCTL\" request --name NAME [--gpus 0,1] "
+            "[--completion-marker RELATIVE_PATH] [--resume-command TEXT] "
+            "[--metadata KEY=VALUE] -- COMMAND ARG... . The trusted runner validates the "
+            "request, reruns the configured test command, freezes the result revision, and "
+            "launches the independent job only after you exit successfully."
+        )
+    if policy == "prepare":
+        return base + (
+            " You may prepare exactly one frozen job request with \"$CODEX_JOBCTL\" request, "
+            "but it will be recorded rather than launched. Do not start detached work directly."
+        )
+    return base + (
+        " No detached, long-running, scheduled, or background job is authorized for this task. "
+        "Do not invoke \"$CODEX_JOBCTL\" or start such work by any other mechanism."
+    )
+
+
+def codex_process_environment(task: Mapping[str, Any]) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "CODEX_JOB_POLICY": str(task.get("job_policy", "deny")),
+            "CODEX_JOBCTL": str(task.get("jobctl_path") or ""),
+            "CODEX_JOB_REQUEST_PATH": str(
+                Path(task["worktree"]) / JOB_REQUEST_RELATIVE
+            ),
+        }
+    )
+    return env
 
 
 def cleanup_tmux_session(task: Mapping[str, Any]) -> bool:
@@ -2476,6 +2893,22 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
         runner_helper.chmod(0o700)
         worktree = paths["worktrees"] / task_id_value
         worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        jobctl_path = state_dir / "codex-jobctl"
+        request_path = worktree / JOB_REQUEST_RELATIVE
+        jobctl_path.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "if [ \"${1:-}\" != request ]; then\n"
+            "  echo 'usage: codex-jobctl request --name NAME [options] -- COMMAND ARG...' >&2\n"
+            "  exit 2\n"
+            "fi\n"
+            "shift\n"
+            f"exec {shlex.quote(str(Path(sys.executable).resolve()))} "
+            f"{shlex.quote(str(runner_helper))} _job-request "
+            f"--request-file {shlex.quote(str(request_path))} \"$@\"\n",
+            encoding="utf-8",
+        )
+        jobctl_path.chmod(0o700)
 
         session_prefix = "codexi" if execution_mode == "interactive" else "codex"
         session = f"{session_prefix}-{project_id[-12:]}-{task_id_value[-8:]}"
@@ -2501,6 +2934,7 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
             "prompt_sha256": payload.get("prompt_sha256"),
             "runner_helper": str(runner_helper),
             "runner_helper_sha256": sha256_file(runner_helper),
+            "jobctl_path": str(jobctl_path),
             "tmux_session": session,
             "lock_path": str(paths["lock"]),
             "bootstrap_cmd": payload.get("bootstrap_cmd"),
@@ -2511,6 +2945,7 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
             "profile": payload.get("profile"),
             "reasoning_effort": payload.get("reasoning_effort"),
             "enable_search": bool(payload.get("enable_search")),
+            "job_policy": payload.get("job_policy", "deny"),
             "lock_hashes": payload.get("lock_hashes") or {},
             "tools": tools,
         }
@@ -2599,17 +3034,35 @@ def data_link_target_path(
 def create_data_links(task: Mapping[str, Any]) -> list[Path]:
     worktree = Path(task["worktree"])
     created: list[Path] = []
-    for item in task.get("data_links") or []:
-        source = Path(item["source"])
-        target = data_link_target_path(
-            worktree,
-            item["target"],
-            create_parents=True,
-        )
-        if target.exists() or target.is_symlink():
-            raise CodexRemoteError(f"Data-link target already exists: {target}", code="DATA_LINK_COLLISION")
-        target.symlink_to(source, target_is_directory=source.is_dir())
-        created.append(target)
+    try:
+        for item in task.get("data_links") or []:
+            source = Path(item["source"])
+            target = data_link_target_path(
+                worktree,
+                item["target"],
+                create_parents=True,
+            )
+            if target.exists() or target.is_symlink():
+                raise CodexRemoteError(
+                    f"Data-link target already exists: {target}",
+                    code="DATA_LINK_COLLISION",
+                )
+            target.symlink_to(source, target_is_directory=source.is_dir())
+            created.append(target)
+    except Exception:
+        # Link creation is all-or-nothing.  A later collision must not leave
+        # earlier datasets exposed in a worktree whose task never started.
+        for target in reversed(created):
+            with contextlib.suppress(OSError):
+                target.unlink()
+            parent = target.parent
+            while parent != worktree:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+        raise
     return created
 
 
@@ -2833,6 +3286,12 @@ def codex_command(task: Mapping[str, Any]) -> list[str]:
         command.extend(["--profile", task["profile"]])
     if task.get("reasoning_effort"):
         command.extend(["--config", f"model_reasoning_effort={task['reasoning_effort']}"])
+    command.extend(
+        [
+            "--config",
+            "developer_instructions=" + json.dumps(codex_job_instructions(task)),
+        ]
+    )
     command.append("-")
     return command
 
@@ -2854,6 +3313,12 @@ def interactive_codex_command(task: Mapping[str, Any]) -> list[str]:
         command.extend(["--profile", task["profile"]])
     if task.get("reasoning_effort"):
         command.extend(["--config", f"model_reasoning_effort={task['reasoning_effort']}"])
+    command.extend(
+        [
+            "--config",
+            "developer_instructions=" + json.dumps(codex_job_instructions(task)),
+        ]
+    )
     return command
 
 
@@ -2989,7 +3454,12 @@ def server_run(project_id: str, task_id_value: str) -> int:
         if execution_mode == "interactive":
             command = interactive_codex_command(task)
             note("launching interactive Codex TUI: " + shlex.join(command))
-            process = subprocess.Popen(command, cwd=worktree, preexec_fn=os.setpgrp)
+            process = subprocess.Popen(
+                command,
+                cwd=worktree,
+                env=codex_process_environment(task),
+                preexec_fn=os.setpgrp,
+            )
             active["process"] = process
             active["process_group"] = True
             task["codex_pid"] = process.pid
@@ -3014,6 +3484,7 @@ def server_run(project_id: str, task_id_value: str) -> int:
                 process = subprocess.Popen(
                     command,
                     cwd=worktree,
+                    env=codex_process_environment(task),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -3059,6 +3530,8 @@ def server_run(project_id: str, task_id_value: str) -> int:
         note(f"Codex exited {codex_rc}; finalizing result")
 
         remove_data_links(task)
+        job_request = consume_job_request(task)
+        task["job_request"] = job_request
         result_sha, has_changes = commit_dirty_result(task, paths)
         task["result_sha"] = result_sha
         task["has_changes"] = has_changes
@@ -3120,7 +3593,7 @@ def server_run(project_id: str, task_id_value: str) -> int:
             "READY_ENVIRONMENT_FAILED",
             "READY_ENVIRONMENT_DIRTY",
         }
-        if has_changes and test_command and can_test and not active["cancelled"]:
+        if (has_changes or job_request) and test_command and can_test and not active["cancelled"]:
             create_data_links(task)
             task["state"] = "TESTING"
             task["tests"] = {"command": test_command, "started_at": utc_now()}
@@ -3143,8 +3616,57 @@ def server_run(project_id: str, task_id_value: str) -> int:
                 task["tests"]["dirty_status"] = test_dirty
             save_server_task(paths, task)
 
+        launched_job: dict[str, Any] | None = None
+        job_launch_error: str | None = None
+        if job_request and task.get("job_policy") == "prepare":
+            task["prepared_job_request"] = job_request
+            note("validated and recorded a prepared job request without launching it")
+        elif job_request and task.get("job_policy") == "launch":
+            if active["cancelled"] or task.get("cancel_requested"):
+                job_launch_error = "Task was cancelled before the requested job could launch"
+            elif codex_rc != 0:
+                job_launch_error = f"Codex exited {codex_rc}; requested job was not launched"
+            elif not test_command:
+                job_launch_error = (
+                    "No test command is configured; a runner-mediated job requires a successful "
+                    "smoke/test command before launch"
+                )
+            elif environment_state:
+                job_launch_error = (
+                    f"Environment validation ended in {environment_state}; requested job was not launched"
+                )
+            elif test_dirty.strip():
+                job_launch_error = "The test command dirtied the source worktree; requested job was not launched"
+            elif test_rc != 0:
+                job_launch_error = f"The test command exited {test_rc}; requested job was not launched"
+            else:
+                try:
+                    launched_job = start_frozen_job(paths, task, job_request)
+                    task["launched_job"] = {
+                        "run_id": launched_job["run_id"],
+                        "state": launched_job["state"],
+                        "worktree": launched_job["worktree"],
+                        "state_dir": launched_job["state_dir"],
+                        "tmux_session": launched_job["tmux_session"],
+                        "source_sha": launched_job["source_sha"],
+                    }
+                    note(
+                        f"launched frozen experiment job {launched_job['run_id']} "
+                        f"from {launched_job['source_sha']}"
+                    )
+                except Exception as exc:
+                    job_launch_error = str(exc)
+            if job_launch_error:
+                task["job_launch_error"] = job_launch_error
+                note("requested job was not launched: " + job_launch_error)
+        save_server_task(paths, task)
+
         if active["cancelled"] or task.get("cancel_requested"):
             task["state"] = "CANCELLED_READY" if has_changes else "CANCELLED_NOOP"
+        elif job_launch_error:
+            task["state"] = "READY_JOB_NOT_LAUNCHED"
+        elif job_request and task.get("job_policy") == "prepare":
+            task["state"] = "READY_JOB_PREPARED"
         elif not has_changes and codex_rc == 0:
             task["state"] = "NOOP"
         elif not has_changes:
@@ -3201,9 +3723,10 @@ def tmux_pane_state(task: Mapping[str, Any]) -> dict[str, Any]:
         [tmux, "list-panes", "-t", session, "-F", "#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}"],
         check=False,
     )
-    if completed.returncode != 0:
+    lines = completed.stdout.splitlines()
+    if completed.returncode != 0 or not lines:
         return {"exists": False, "running": False, "pane_dead": None, "pane_dead_status": None}
-    first = completed.stdout.splitlines()[0].split("\t")
+    first = lines[0].split("\t")
     pane_dead = first[0] == "1" if first else None
     return {
         "exists": True,
@@ -3378,6 +3901,947 @@ def server_logs(project_id: str, lines: int) -> dict[str, Any]:
     return {"ok": True, "task": task, "log": "\n\n".join(sections)}
 
 
+# ---------------------------------------------------------------------------
+# Frozen long-running experiment jobs
+# ---------------------------------------------------------------------------
+
+
+def job_state_path(paths: Mapping[str, Path], run_id: str) -> Path:
+    validate_safe_id(run_id, "run id")
+    return paths["jobs_state"] / run_id / "run.json"
+
+
+def load_server_job(paths: Mapping[str, Path], run_id: str) -> dict[str, Any] | None:
+    return read_json(job_state_path(paths, run_id))
+
+
+def save_server_job(paths: Mapping[str, Path], job: Mapping[str, Any]) -> dict[str, Any]:
+    value = dict(job)
+    state_path = job_state_path(paths, value["run_id"])
+    # A stop request is monotonic.  Preserve it when the runner writes state
+    # concurrently with the user-facing stop command.
+    existing = read_json(state_path)
+    if isinstance(existing, dict) and existing.get("stop_requested"):
+        value["stop_requested"] = True
+    value["updated_at"] = utc_now()
+    atomic_write_json(state_path, value)
+    atomic_write_json(
+        state_path.parent / "status.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "project_id": value.get("project_id"),
+            "run_id": value.get("run_id"),
+            "name": value.get("name"),
+            "state": value.get("state"),
+            "created_at": value.get("created_at"),
+            "started_at": value.get("started_at"),
+            "finished_at": value.get("finished_at"),
+            "exit_code": value.get("exit_code"),
+            "completion_marker_present": value.get("completion_marker_present"),
+            "updated_at": value["updated_at"],
+            "error": value.get("error"),
+            "analysis": value.get("analysis"),
+        },
+    )
+    return value
+
+
+def job_slug(name: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9]+", "-", name.strip()).strip("-").lower()
+    return (value or "run")[:40]
+
+
+def experiment_run_id(name: str) -> str:
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}-{job_slug(name)}-{os.urandom(3).hex()}"
+
+
+def job_environment_text(job: Mapping[str, Any]) -> str:
+    fields = {
+        "run_id": job.get("run_id"),
+        "hostname": job.get("hostname"),
+        "platform": job.get("platform"),
+        "python": job.get("python"),
+        "git_version": job.get("git_version"),
+        "source_sha": job.get("source_sha"),
+        "bootstrap_command": job.get("bootstrap_cmd") or "(none)",
+        "requested_cuda_visible_devices": job.get("gpus") or "(inherited)",
+        "effective_cuda_visible_devices": job.get("effective_cuda_visible_devices")
+        or "(unset)",
+        "worktree": job.get("worktree"),
+        "run_dir": job.get("state_dir"),
+    }
+    text = "".join(f"{key}={value}\n" for key, value in fields.items())
+    lock_hashes = job.get("lock_hashes") or {}
+    if isinstance(lock_hashes, Mapping):
+        for path, digest in sorted(lock_hashes.items()):
+            text += f"lock_sha256[{path}]={digest}\n"
+    return text
+
+
+def create_job_data_links(job: Mapping[str, Any]) -> None:
+    create_data_links(
+        {
+            "worktree": job["worktree"],
+            "data_links": job.get("data_links") or [],
+        }
+    )
+
+
+def validate_job_completion_marker(
+    task: Mapping[str, Any], completion_marker: str
+) -> None:
+    """Keep completion evidence inside the frozen worktree, not a linked dataset."""
+    if not completion_marker:
+        return
+    marker = PurePosixPath(completion_marker)
+    for item in task.get("data_links") or []:
+        target_value = item.get("target") if isinstance(item, Mapping) else None
+        if not isinstance(target_value, str):
+            continue
+        target = PurePosixPath(target_value)
+        if marker == target or target in marker.parents:
+            raise CodexRemoteError(
+                "Completion marker cannot be located inside a configured data link",
+                code="INVALID_JOB_REQUEST",
+            )
+
+
+def job_completion_marker_path(worktree: Path, completion_marker: str) -> Path:
+    """Return a marker path without permitting symlink-parent escapes."""
+    marker = PurePosixPath(completion_marker)
+    if marker.is_absolute() or ".." in marker.parts or not marker.parts:
+        raise CodexRemoteError(
+            "Completion marker must be a nonempty path inside the frozen worktree",
+            code="INVALID_JOB_REQUEST",
+        )
+    parent = worktree
+    for part in marker.parts[:-1]:
+        parent = parent / part
+        if parent.is_symlink():
+            raise CodexRemoteError(
+                f"Completion-marker parent is a symlink: {parent}",
+                code="INVALID_COMPLETION_MARKER",
+            )
+        if parent.exists() and not parent.is_dir():
+            raise CodexRemoteError(
+                f"Completion-marker parent is not a directory: {parent}",
+                code="INVALID_COMPLETION_MARKER",
+            )
+    return parent / marker.parts[-1]
+
+
+def start_frozen_job(
+    paths: Mapping[str, Path], task: Mapping[str, Any], request: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Launch REQUEST from an immutable result SHA, independently of Codex."""
+    normalized = normalized_job_request(request)
+    validate_job_completion_marker(task, normalized["completion_marker"])
+    source_sha = task.get("result_sha")
+    if not isinstance(source_sha, str) or not source_sha:
+        raise CodexRemoteError(
+            "Cannot launch a job before publishing a result snapshot",
+            code="JOB_SOURCE_MISSING",
+        )
+    tools = dict(task.get("tools") or {})
+    for name in ("bash", "git", "tmux"):
+        if not tools.get(name):
+            tools[name] = login_which(name)
+    missing = [name for name in ("bash", "git", "tmux") if not tools.get(name)]
+    if missing:
+        raise CodexRemoteError(
+            "Cannot launch job; server tools missing: " + ", ".join(missing),
+            code="REMOTE_PREREQUISITES_MISSING",
+        )
+    tools["python3"] = str(Path(sys.executable).resolve())
+    git_version = command_version(tools["git"], "--version")
+
+    run_id = experiment_run_id(normalized["name"])
+    state_dir = paths["jobs_state"] / run_id
+    state_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    for name in ("checkpoints", "results"):
+        (state_dir / name).mkdir(mode=0o700)
+    worktree = paths["job_worktrees"] / run_id
+    source_ref = f"refs/codex/{task['project_id']}/job/{run_id}"
+    session = f"job-{task['project_id'][-10:]}-{run_id[-12:]}"
+    runner_helper = state_dir / "codex-job-runner.py"
+    runner_helper.write_bytes(Path(__file__).resolve().read_bytes())
+    runner_helper.chmod(0o700)
+    job: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "project_id": task["project_id"],
+        "project_name": task.get("project_name"),
+        "run_id": run_id,
+        "name": normalized["name"],
+        "state": "STARTING",
+        "created_at": utc_now(),
+        "source_task_id": task.get("task_id"),
+        "source_sha": source_sha,
+        "source_ref": source_ref,
+        "input_sha": task.get("input_sha"),
+        "command": normalized["command"],
+        "bootstrap_cmd": task.get("bootstrap_cmd") or "",
+        "gpus": normalized["gpus"],
+        "inherited_cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "effective_cuda_visible_devices": normalized["gpus"]
+        or os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "completion_marker": normalized["completion_marker"],
+        "resume_command": normalized["resume_command"],
+        "metadata": normalized["metadata"],
+        "requested_at": normalized["requested_at"],
+        "launch_validation": {
+            "codex_exit_code": task.get("codex_exit_code"),
+            "environment_refresh": task.get("environment_refresh"),
+            "tests": task.get("tests"),
+        },
+        "worktree": str(worktree),
+        "state_dir": str(state_dir),
+        "results_dir": str(state_dir / "results"),
+        "checkpoints_dir": str(state_dir / "checkpoints"),
+        "run_log": str(state_dir / "run.log"),
+        "tmux_session": session,
+        "runner_helper": str(runner_helper),
+        "runner_helper_sha256": sha256_file(runner_helper),
+        "data_links": list(task.get("data_links") or []),
+        "data_links_active": False,
+        "lock_hashes": dict(
+            task.get("result_lock_hashes") or task.get("lock_hashes") or {}
+        ),
+        "model": task.get("model"),
+        "profile": task.get("profile"),
+        "reasoning_effort": task.get("reasoning_effort"),
+        "tools": tools,
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": sys.version.replace("\n", " "),
+        "git_version": git_version.get("stdout") or git_version.get("stderr"),
+    }
+    save_server_job(paths, job)
+    try:
+        run(["git", "--git-dir", paths["broker"], "update-ref", source_ref, source_sha])
+        env = os.environ.copy()
+        env["GIT_LFS_SKIP_SMUDGE"] = "1"
+        run(
+            [
+                "git",
+                "--git-dir",
+                paths["broker"],
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                source_sha,
+            ],
+            env=env,
+        )
+        marker = job.get("completion_marker") or ""
+        if marker:
+            marker_path = job_completion_marker_path(worktree, marker)
+            if marker_path.exists() or marker_path.is_symlink():
+                raise CodexRemoteError(
+                    f"Completion marker already exists in the frozen source: {marker}",
+                    code="COMPLETION_MARKER_EXISTS",
+                )
+            job["completion_marker_initially_absent"] = True
+        atomic_write_text(state_dir / "command.txt", shlex.join(job["command"]) + "\n")
+        if job.get("bootstrap_cmd"):
+            atomic_write_text(
+                state_dir / "bootstrap-command.txt",
+                str(job["bootstrap_cmd"]) + "\n",
+            )
+        atomic_write_text(state_dir / "source-snapshot.txt", source_sha + "\n")
+        atomic_write_text(state_dir / "environment.txt", job_environment_text(job))
+        runner_argv = [
+            tools["python3"],
+            str(runner_helper),
+            "_server-job-run",
+            "--project-id",
+            task["project_id"],
+            "--run-id",
+            run_id,
+        ]
+        command = shlex.join([tools["bash"], "-lc", "exec " + shlex.join(runner_argv)])
+        job["runner_command"] = command
+        job = save_server_job(paths, job)
+        run([tools["tmux"], "new-session", "-d", "-s", session, command])
+        tmux_option = run(
+            [tools["tmux"], "set-option", "-t", session, "remain-on-exit", "on"],
+            check=False,
+        )
+        if tmux_option.returncode != 0:
+            atomic_write_text(
+                state_dir / "tmux-warning.txt",
+                (tmux_option.stderr or tmux_option.stdout or "tmux set-option failed")
+                + "\n",
+            )
+        # The runner can advance to RUNNING or even finish before tmux returns.
+        # Never overwrite that newer state with this stale STARTING object.
+        return load_server_job(paths, run_id) or job
+    except Exception as exc:
+        if job.get("data_links_active"):
+            try:
+                remove_data_links(job)
+            except Exception as cleanup_exc:
+                job["data_link_cleanup_error"] = str(cleanup_exc)
+            else:
+                job["data_links_active"] = False
+        job["state"] = "FAILED"
+        job["error"] = f"Job launch setup failed: {exc}"
+        job["finished_at"] = utc_now()
+        save_server_job(paths, job)
+        raise
+
+
+def job_process_environment(job: Mapping[str, Any]) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONUNBUFFERED": "1",
+            "CODEX_RUN_ID": str(job["run_id"]),
+            "CODEX_RUN_DIR": str(job["state_dir"]),
+            "CODEX_RESULTS_DIR": str(job["results_dir"]),
+            "CODEX_CHECKPOINTS_DIR": str(job["checkpoints_dir"]),
+            "CODEX_SOURCE_SHA": str(job["source_sha"]),
+        }
+    )
+    if job.get("gpus"):
+        env["CUDA_VISIBLE_DEVICES"] = str(job["gpus"])
+    return env
+
+
+def inspect_job_source(job: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare a job worktree with the exact source commit it was given."""
+    worktree = Path(job["worktree"])
+    source_sha = str(job["source_sha"])
+    head_sha = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    tracked_changes = git(
+        worktree, "diff", "--name-status", source_sha, "--"
+    ).stdout.strip()
+    untracked_paths = git(
+        worktree, "ls-files", "--others", "--exclude-standard"
+    ).stdout.splitlines()
+    return {
+        "expected_head_sha": source_sha,
+        "head_sha": head_sha,
+        "head_matches_source": head_sha == source_sha,
+        "tracked_changes": tracked_changes,
+        "tracked_clean": not bool(tracked_changes) and head_sha == source_sha,
+        "untracked_paths": untracked_paths,
+    }
+
+
+def server_job_run(project_id: str, run_id: str) -> int:
+    paths = ensure_server_layout(project_id)
+    job = load_server_job(paths, run_id)
+    if not job:
+        raise CodexRemoteError("Job not found", code="JOB_NOT_FOUND")
+    if job.get("state") != "STARTING":
+        raise CodexRemoteError(
+            f"Job runner may start only from STARTING, not {job.get('state')}",
+            code="JOB_NOT_STARTABLE",
+            details=job,
+        )
+    log_path = Path(job["run_log"])
+    active: dict[str, Any] = {"process": None, "stop": False}
+
+    def save_note(message: str) -> None:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{utc_now()} [runner] {message}\n")
+            handle.flush()
+
+    def refresh_stop_request() -> bool:
+        latest = load_server_job(paths, run_id)
+        if latest and (
+            latest.get("stop_requested")
+            or latest.get("state") in {"STOPPED", "STOP_REQUESTED"}
+        ):
+            active["stop"] = True
+            job["stop_requested"] = True
+        return bool(active["stop"] or job.get("stop_requested"))
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        active["stop"] = True
+        job["stop_requested"] = True
+        process = active.get("process")
+        if process is not None and process.poll() is None:
+            terminate_child_process(process, process_group=True)
+        save_server_job(paths, job)
+        save_note(f"received signal {signum}")
+
+    def run_job_process(argv: Sequence[str], output_path: Path) -> int:
+        output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with output_path.open("a", encoding="utf-8") as output:
+            process = subprocess.Popen(
+                list(argv),
+                cwd=Path(job["worktree"]),
+                env=job_process_environment(job),
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+            active["process"] = process
+            job["process_pid"] = process.pid
+            job["process_start_ticks"] = process_start_ticks(process.pid)
+            save_server_job(paths, job)
+            if refresh_stop_request():
+                terminate_child_process(process, process_group=True)
+            returncode = process.wait()
+            refresh_stop_request()
+        active["process"] = None
+        job.pop("process_pid", None)
+        job.pop("process_start_ticks", None)
+        save_server_job(paths, job)
+        return returncode
+
+    def finish_before_command(state: str, exit_code: int, error: str | None = None) -> int:
+        if job.get("data_links_active"):
+            remove_data_links(job)
+            job["data_links_active"] = False
+        job["source_integrity"] = inspect_job_source(job)
+        job["state"] = state
+        job["phase"] = "finished"
+        job["exit_code"] = exit_code
+        if error:
+            job["error"] = error
+        job["finished_at"] = utc_now()
+        job.pop("process_pid", None)
+        save_server_job(paths, job)
+        save_note(f"finished in state {state} before experiment command; exit code {exit_code}")
+        return 0 if state == "SUCCEEDED" else 1
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    try:
+        job["runner_pid"] = os.getpid()
+        job["server_boot_id"] = linux_boot_id()
+        job["runner_start_ticks"] = process_start_ticks(os.getpid())
+        job["started_at"] = utc_now()
+        bootstrap = str(job.get("bootstrap_cmd") or "")
+        job["state"] = "BOOTSTRAPPING" if bootstrap else "RUNNING"
+        job["phase"] = "bootstrap" if bootstrap else "preparing-data"
+        job = save_server_job(paths, job)
+        if refresh_stop_request():
+            return finish_before_command("STOPPED", 0, "Job was stopped before startup completed")
+
+        if bootstrap:
+            bootstrap_log = Path(job["state_dir"]) / "bootstrap.log"
+            job["bootstrap"] = {
+                "command": bootstrap,
+                "started_at": utc_now(),
+                "log": str(bootstrap_log),
+            }
+            job = save_server_job(paths, job)
+            save_note("bootstrapping frozen worktree: " + bootstrap)
+            bootstrap_rc = run_job_process(
+                [job["tools"]["bash"], "-lc", bootstrap], bootstrap_log
+            )
+            bootstrap_status = git_status_porcelain(Path(job["worktree"]))
+            bootstrap_integrity = inspect_job_source(job)
+            job["bootstrap"].update(
+                {
+                    "exit_code": bootstrap_rc,
+                    "finished_at": utc_now(),
+                    "dirty_after_bootstrap": bool(bootstrap_status.strip()),
+                    "source_integrity": bootstrap_integrity,
+                }
+            )
+            if bootstrap_status.strip():
+                job["bootstrap"]["dirty_status"] = bootstrap_status
+            job = save_server_job(paths, job)
+            if refresh_stop_request():
+                return finish_before_command(
+                    "STOPPED", bootstrap_rc, "Job was stopped during frozen-worktree bootstrap"
+                )
+            if bootstrap_rc != 0:
+                return finish_before_command(
+                    "FAILED",
+                    bootstrap_rc,
+                    f"Frozen-worktree bootstrap command exited {bootstrap_rc}",
+                )
+            if bootstrap_status.strip() or not bootstrap_integrity["tracked_clean"]:
+                return finish_before_command(
+                    "FAILED",
+                    bootstrap_rc,
+                    "Frozen-worktree bootstrap changed the pinned source checkout",
+                )
+            marker = str(job.get("completion_marker") or "")
+            if marker:
+                marker_path = job_completion_marker_path(Path(job["worktree"]), marker)
+                if marker_path.exists() or marker_path.is_symlink():
+                    return finish_before_command(
+                        "FAILED",
+                        bootstrap_rc,
+                        "Frozen-worktree bootstrap created the experiment completion marker before the command ran",
+                    )
+
+        job["phase"] = "preparing-data"
+        job["state"] = "RUNNING"
+        job = save_server_job(paths, job)
+        create_job_data_links(job)
+        job["data_links_active"] = bool(job.get("data_links"))
+        job = save_server_job(paths, job)
+        if refresh_stop_request():
+            return finish_before_command("STOPPED", 0, "Job was stopped before the experiment command started")
+
+        job["phase"] = "command"
+        job["command_started_at"] = utc_now()
+        job = save_server_job(paths, job)
+        save_note("starting: " + shlex.join(job["command"]))
+        returncode = run_job_process(job["command"], log_path)
+        job["command_finished_at"] = utc_now()
+        job["exit_code"] = returncode
+
+        marker = str(job.get("completion_marker") or "")
+        marker_present = True
+        marker_error: str | None = None
+        if marker:
+            try:
+                marker_path = job_completion_marker_path(Path(job["worktree"]), marker)
+                marker_present = marker_path.is_file() and not marker_path.is_symlink()
+                if not marker_present:
+                    marker_error = (
+                        "Completion marker is missing or is not a regular, non-symlink file: "
+                        + marker
+                    )
+            except CodexRemoteError as exc:
+                marker_present = False
+                marker_error = str(exc)
+        job["completion_marker_present"] = marker_present
+        if marker_error:
+            job["completion_marker_error"] = marker_error
+        else:
+            job.pop("completion_marker_error", None)
+
+        # Data links are needed only while the experiment runs. Removing them
+        # narrows later read-only analysis to the frozen source and captured run
+        # artifacts, and verifies that the command did not replace a configured
+        # link.
+        remove_data_links(job)
+        job["data_links_active"] = False
+        source_integrity = inspect_job_source(job)
+        job["source_integrity"] = source_integrity
+        tracked_changes = str(source_integrity["tracked_changes"])
+        head_sha = str(source_integrity["head_sha"])
+        source_sha = str(source_integrity["expected_head_sha"])
+
+        if refresh_stop_request():
+            job["state"] = "STOPPED"
+        elif returncode != 0:
+            job["state"] = "FAILED"
+        elif not source_integrity["tracked_clean"]:
+            job["state"] = "SOURCE_DIRTY"
+            details = []
+            if head_sha != source_sha:
+                details.append(f"HEAD moved from {source_sha} to {head_sha}")
+            if tracked_changes:
+                details.append("tracked changes: " + tracked_changes.replace("\n", "; "))
+            job["error"] = (
+                "The experiment altered its frozen source identity: " + "; ".join(details)
+            )
+        elif not marker_present:
+            job["state"] = "INCOMPLETE"
+            job["error"] = marker_error or f"Completion marker was not created: {marker}"
+        else:
+            job["state"] = "SUCCEEDED"
+        job["phase"] = "finished"
+        job["finished_at"] = utc_now()
+        job.pop("process_pid", None)
+        job = save_server_job(paths, job)
+        save_note(f"finished in state {job['state']} with exit code {returncode}")
+        return 0 if job["state"] == "SUCCEEDED" else 1
+    except Exception as exc:
+        if job.get("data_links_active"):
+            try:
+                remove_data_links(job)
+            except Exception as cleanup_exc:
+                job["data_link_cleanup_error"] = str(cleanup_exc)
+            else:
+                job["data_links_active"] = False
+        job["state"] = "STOPPED" if active["stop"] else "FAILED"
+        job["phase"] = "finished"
+        job["error"] = str(exc)
+        job["traceback"] = traceback.format_exc()
+        job["finished_at"] = utc_now()
+        job.pop("process_pid", None)
+        job.pop("process_start_ticks", None)
+        save_server_job(paths, job)
+        save_note(f"failed: {exc}")
+        return 1
+
+
+def process_identity_alive(pid: Any, boot_id: Any, start_ticks: Any) -> bool:
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if boot_id and linux_boot_id() and boot_id != linux_boot_id():
+        return False
+    if start_ticks is not None and process_start_ticks(value) != int(start_ticks):
+        return False
+    try:
+        os.kill(value, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def job_with_runtime_status(paths: Mapping[str, Path], job: dict[str, Any]) -> dict[str, Any]:
+    value = dict(job)
+    value["tmux"] = tmux_pane_state(value)
+    worktree_value = value.get("worktree")
+    value["worktree_exists"] = bool(
+        isinstance(worktree_value, str) and worktree_value and Path(worktree_value).is_dir()
+    )
+    value["process_alive"] = process_identity_alive(
+        value.get("process_pid"),
+        value.get("server_boot_id"),
+        value.get("process_start_ticks"),
+    )
+    if value.get("state") in JOB_ACTIVE_STATES:
+        pane = value["tmux"]
+        if not value["process_alive"] and (pane.get("pane_dead") or not pane.get("exists")):
+            value["state"] = "ORPHANED"
+            value["error"] = "Job runner and process disappeared while the job was active"
+            value["finished_at"] = utc_now()
+            if value.get("data_links_active"):
+                try:
+                    remove_data_links(value)
+                except Exception as exc:
+                    value["data_link_cleanup_error"] = str(exc)
+                else:
+                    value["data_links_active"] = False
+            value = save_server_job(paths, value)
+            value["tmux"] = pane
+            value["worktree_exists"] = bool(
+                isinstance(worktree_value, str)
+                and worktree_value
+                and Path(worktree_value).is_dir()
+            )
+            value["process_alive"] = False
+    analysis = value.get("analysis")
+    if isinstance(analysis, dict) and analysis.get("state") in {"STARTING", "RUNNING"}:
+        analysis_task = {
+            "tools": value.get("tools") or {},
+            "tmux_session": analysis.get("tmux_session"),
+        }
+        analysis_tmux = tmux_pane_state(analysis_task)
+        value["analysis_tmux"] = analysis_tmux
+        if analysis_tmux.get("pane_dead") or not analysis_tmux.get("exists"):
+            analysis = dict(analysis)
+            analysis["state"] = "ORPHANED"
+            analysis["error"] = "Codex analysis runner disappeared while analysis was active"
+            analysis["finished_at"] = utc_now()
+            value["analysis"] = analysis
+            value = save_server_job(paths, value)
+            value["analysis_tmux"] = analysis_tmux
+    return value
+
+
+def server_jobs(project_id: str) -> dict[str, Any]:
+    paths = ensure_server_layout(project_id)
+    jobs = []
+    for path in paths["jobs_state"].glob("*/run.json"):
+        value = read_json(path)
+        if isinstance(value, dict):
+            jobs.append(job_with_runtime_status(paths, value))
+    jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return {"ok": True, "jobs": jobs}
+
+
+def server_job_status(project_id: str, run_id: str) -> dict[str, Any]:
+    paths = ensure_server_layout(project_id)
+    job = load_server_job(paths, run_id)
+    if not job:
+        raise CodexRemoteError(f"Job not found: {run_id}", code="JOB_NOT_FOUND")
+    return {"ok": True, "job": job_with_runtime_status(paths, job)}
+
+
+def server_job_logs(project_id: str, run_id: str, lines: int) -> dict[str, Any]:
+    status = server_job_status(project_id, run_id)
+    job = status["job"]
+    state_dir = Path(job["state_dir"])
+    sections = []
+    for title, filename in (
+        ("Run", "run.log"),
+        ("Frozen-worktree bootstrap", "bootstrap.log"),
+        ("Analysis events", "analysis.jsonl"),
+        ("Analysis stderr", "analysis.stderr.log"),
+    ):
+        content = tail_file(state_dir / filename, lines)
+        if content:
+            sections.append(f"===== {title} =====\n{content}")
+    return {"ok": True, "job": job, "log": "\n\n".join(sections)}
+
+
+def server_job_stop(project_id: str, run_id: str) -> dict[str, Any]:
+    paths = ensure_server_layout(project_id)
+    job = load_server_job(paths, run_id)
+    if not job:
+        raise CodexRemoteError(f"Job not found: {run_id}", code="JOB_NOT_FOUND")
+    job = job_with_runtime_status(paths, job)
+    if job.get("state") not in JOB_ACTIVE_STATES:
+        raise CodexRemoteError(
+            f"Job is not active; current state is {job.get('state')}",
+            code="JOB_NOT_ACTIVE",
+            details=job,
+        )
+    job["stop_requested"] = True
+    job["state"] = "STOP_REQUESTED"
+    job = save_server_job(paths, job)
+    pid = job.get("process_pid")
+    if process_identity_alive(pid, job.get("server_boot_id"), job.get("process_start_ticks")):
+        try:
+            os.killpg(int(pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    elif not pid:
+        tmux = job.get("tools", {}).get("tmux") or login_which("tmux")
+        if tmux and job.get("tmux_session"):
+            run([tmux, "kill-session", "-t", job["tmux_session"]], check=False)
+        job["state"] = "STOPPED"
+        job["finished_at"] = utc_now()
+        job = save_server_job(paths, job)
+    return {"ok": True, "job": job}
+
+
+def job_analysis_schema() -> dict[str, Any]:
+    string_array = {"type": "array", "items": {"type": "string"}}
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "run_complete": {"type": "boolean"},
+            "summary": {"type": "string"},
+            "source_and_command": {"type": "string"},
+            "coverage_checks": string_array,
+            "headline_results": string_array,
+            "anomalies": string_array,
+            "supported_conclusions": string_array,
+            "unsupported_conclusions": string_array,
+            "recommended_actions": string_array,
+        },
+        "required": [
+            "run_complete",
+            "summary",
+            "source_and_command",
+            "coverage_checks",
+            "headline_results",
+            "anomalies",
+            "supported_conclusions",
+            "unsupported_conclusions",
+            "recommended_actions",
+        ],
+    }
+
+
+def job_analysis_prompt(job: Mapping[str, Any]) -> str:
+    return f"""Inspect and interpret frozen experiment run {job['run_id']}.
+
+Read the run manifest at {Path(job['state_dir']) / 'run.json'}, the status and logs in
+{job['state_dir']}, the frozen source at {job['worktree']}, and any artifacts in
+{job['results_dir']} and {job['checkpoints_dir']}.
+
+First verify the exit status, completion marker, expected groups/rows/artifacts, malformed or
+zero-byte files, and whether the run is actually complete. Do not infer completion merely from
+a nonempty output file. Identify the exact source SHA and command, headline metrics and
+uncertainty, comparison with any clearly identified prior comparable output, anomalies that
+could invalidate interpretation, supported conclusions, unsupported conclusions, and concrete
+next actions. Do not modify files, relaunch work, stop processes, or delete outputs. Return only
+the requested structured result.
+"""
+
+
+def job_analysis_command(job: Mapping[str, Any]) -> list[str]:
+    codex = job.get("tools", {}).get("codex") or login_which("codex")
+    if not codex:
+        raise CodexRemoteError("Codex is unavailable for analysis", code="REMOTE_PREREQUISITES_MISSING")
+    state_dir = Path(job["state_dir"])
+    command = [codex, "--ask-for-approval", "never", "exec", "--json", "--sandbox", "read-only"]
+    command.extend(["--output-schema", str(state_dir / "analysis-schema.json")])
+    command.extend(["--output-last-message", str(state_dir / "analysis.json")])
+    if job.get("model"):
+        command.extend(["--model", job["model"]])
+    if job.get("profile"):
+        command.extend(["--profile", job["profile"]])
+    if job.get("reasoning_effort"):
+        command.extend(["--config", f"model_reasoning_effort={job['reasoning_effort']}"])
+    command.extend(
+        [
+            "--config",
+            "developer_instructions="
+            + json.dumps(
+                "Analyze this completed experiment read-only. Do not edit files, start or stop "
+                "jobs, use network search, or claim completion without checking the manifest, "
+                "exit status, completion marker, and artifact coverage."
+            ),
+            "-",
+        ]
+    )
+    return command
+
+
+def render_job_analysis(value: Mapping[str, Any], run_id: str) -> str:
+    sections = [f"# Experiment analysis: {run_id}", ""]
+    sections.append(f"**Run complete:** {'yes' if value.get('run_complete') else 'no'}")
+    sections.extend(["", "## Summary", "", str(value.get("summary") or "")])
+    sections.extend(["", "## Source and command", "", str(value.get("source_and_command") or "")])
+    for heading, key in (
+        ("Coverage checks", "coverage_checks"),
+        ("Headline results", "headline_results"),
+        ("Anomalies", "anomalies"),
+        ("Supported conclusions", "supported_conclusions"),
+        ("Unsupported conclusions", "unsupported_conclusions"),
+        ("Recommended actions", "recommended_actions"),
+    ):
+        sections.extend(["", f"## {heading}", ""])
+        items = value.get(key) or []
+        if items:
+            sections.extend(f"- {item}" for item in items)
+        else:
+            sections.append("- None identified.")
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def server_job_analyze(project_id: str, run_id: str) -> int:
+    paths = ensure_server_layout(project_id)
+    job = load_server_job(paths, run_id)
+    if not job:
+        raise CodexRemoteError("Job not found", code="JOB_NOT_FOUND")
+    state_dir = Path(job["state_dir"])
+    analysis = dict(job.get("analysis") or {})
+    analysis["state"] = "RUNNING"
+    analysis["started_at"] = utc_now()
+    analysis["runner_pid"] = os.getpid()
+    job["analysis"] = analysis
+    save_server_job(paths, job)
+    try:
+        atomic_write_json(state_dir / "analysis-schema.json", job_analysis_schema())
+        # A failed rerun must never be mistaken for the structured output from
+        # an earlier successful analysis attempt.
+        for stale_name in ("analysis.json", "analysis.md"):
+            with contextlib.suppress(FileNotFoundError):
+                (state_dir / stale_name).unlink()
+        command = job_analysis_command(job)
+        with (state_dir / "analysis.jsonl").open("w", encoding="utf-8") as out, (
+            state_dir / "analysis.stderr.log"
+        ).open("w", encoding="utf-8") as err:
+            completed = subprocess.run(
+                command,
+                cwd=Path(job["worktree"]),
+                input=job_analysis_prompt(job),
+                stdout=out,
+                stderr=err,
+                text=True,
+                check=False,
+            )
+        value = read_json(state_dir / "analysis.json")
+        if completed.returncode != 0 or not isinstance(value, dict):
+            raise CodexRemoteError(
+                f"Codex analysis exited {completed.returncode} without valid structured output",
+                code="JOB_ANALYSIS_FAILED",
+            )
+        atomic_write_text(state_dir / "analysis.md", render_job_analysis(value, run_id))
+        analysis.update(
+            {
+                "state": "SUCCEEDED",
+                "exit_code": completed.returncode,
+                "finished_at": utc_now(),
+                "analysis_json": str(state_dir / "analysis.json"),
+                "analysis_markdown": str(state_dir / "analysis.md"),
+            }
+        )
+        job["analysis"] = analysis
+        save_server_job(paths, job)
+        return 0
+    except Exception as exc:
+        analysis.update(
+            {
+                "state": "FAILED",
+                "error": str(exc),
+                "finished_at": utc_now(),
+            }
+        )
+        job["analysis"] = analysis
+        save_server_job(paths, job)
+        return 1
+
+
+def server_job_summarize(project_id: str, run_id: str) -> dict[str, Any]:
+    paths = ensure_server_layout(project_id)
+    job = load_server_job(paths, run_id)
+    if not job:
+        raise CodexRemoteError(f"Job not found: {run_id}", code="JOB_NOT_FOUND")
+    status = job_with_runtime_status(paths, job)
+    if status.get("state") in JOB_ACTIVE_STATES:
+        raise CodexRemoteError(
+            "Wait until the experiment job is no longer active before interpreting it",
+            code="JOB_ACTIVE",
+            details=status,
+        )
+    analysis = dict(job.get("analysis") or {})
+    if analysis.get("state") in {"STARTING", "RUNNING"}:
+        return {"ok": True, "job": status, "analysis": analysis, "idempotent": True}
+    tmux = job.get("tools", {}).get("tmux") or login_which("tmux")
+    bash = job.get("tools", {}).get("bash") or login_which("bash")
+    python3 = job.get("tools", {}).get("python3") or str(Path(sys.executable).resolve())
+    if not tmux or not bash:
+        raise CodexRemoteError("tmux or bash is unavailable", code="REMOTE_PREREQUISITES_MISSING")
+    state_dir = Path(job["state_dir"])
+    helper = state_dir / "codex-job-runner.py"
+    current_helper = Path(__file__).resolve()
+    current_helper_sha256 = sha256_file(current_helper)
+    if not helper.exists() or sha256_file(helper) != current_helper_sha256:
+        helper.write_bytes(current_helper.read_bytes())
+        helper.chmod(0o700)
+    job["runner_helper_sha256"] = current_helper_sha256
+    session = f"analysis-{project_id[-9:]}-{run_id[-10:]}"
+    runner_argv = [
+        python3,
+        str(helper),
+        "_server-job-analyze",
+        "--project-id",
+        project_id,
+        "--run-id",
+        run_id,
+    ]
+    command = shlex.join([bash, "-lc", "exec " + shlex.join(runner_argv)])
+    analysis = {
+        "state": "STARTING",
+        "created_at": utc_now(),
+        "tmux_session": session,
+        "runner_command": command,
+    }
+    job["analysis"] = analysis
+    job = save_server_job(paths, job)
+    run([tmux, "kill-session", "-t", session], check=False)
+    try:
+        run([tmux, "new-session", "-d", "-s", session, command])
+        run([tmux, "set-option", "-t", session, "remain-on-exit", "on"])
+    except Exception as exc:
+        analysis.update(
+            {
+                "state": "FAILED",
+                "error": f"Could not start Codex analysis runner: {exc}",
+                "finished_at": utc_now(),
+            }
+        )
+        job["analysis"] = analysis
+        save_server_job(paths, job)
+        raise
+    return {"ok": True, "job": job, "analysis": analysis, "idempotent": False}
+
+
+def server_job_analysis(project_id: str, run_id: str) -> dict[str, Any]:
+    status = server_job_status(project_id, run_id)
+    job = status["job"]
+    state_dir = Path(job["state_dir"])
+    text = (state_dir / "analysis.md").read_text(encoding="utf-8") if (state_dir / "analysis.md").is_file() else ""
+    value = read_json(state_dir / "analysis.json")
+    return {"ok": True, "job": job, "analysis": value, "markdown": text}
+
+
 def server_cancel(project_id: str) -> dict[str, Any]:
     paths = ensure_server_layout(project_id)
     task = load_server_task(paths)
@@ -3528,6 +4992,12 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--profile", default="")
         command.add_argument("--reasoning-effort", choices=sorted(SAFE_REASONING), default="")
         command.add_argument("--enable-search", action="store_true")
+        command.add_argument(
+            "--job-policy",
+            choices=sorted(JOB_POLICIES),
+            default="deny",
+            help="whether Codex may prepare or request one frozen experiment launch",
+        )
 
     doctor = sub.add_parser("doctor", help="verify local and remote prerequisites")
     add_common(doctor)
@@ -3569,6 +5039,39 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(clean)
     clean.add_argument("--discard", action="store_true")
 
+    jobs = sub.add_parser("jobs", help="list frozen experiment jobs for this project")
+    add_common(jobs)
+
+    job_status_parser = sub.add_parser("job-status", help="show one frozen experiment job")
+    add_common(job_status_parser)
+    job_status_parser.add_argument("--run-id", required=True)
+
+    job_logs_parser = sub.add_parser("job-logs", help="show logs for one experiment job")
+    add_common(job_logs_parser)
+    job_logs_parser.add_argument("--run-id", required=True)
+    job_logs_parser.add_argument("--tail", type=int, default=400)
+
+    job_stop_parser = sub.add_parser("job-stop", help="stop one active experiment job")
+    add_common(job_stop_parser)
+    job_stop_parser.add_argument("--run-id", required=True)
+
+    job_summarize_parser = sub.add_parser(
+        "job-summarize", help="start a read-only Codex interpretation of a finished job"
+    )
+    add_common(job_summarize_parser)
+    job_summarize_parser.add_argument("--run-id", required=True)
+
+    job_analysis_parser = sub.add_parser(
+        "job-analysis", help="show the structured interpretation of a job"
+    )
+    add_common(job_analysis_parser)
+    job_analysis_parser.add_argument("--run-id", required=True)
+
+    install_agents = sub.add_parser(
+        "install-agents", help="install/update the managed global AGENTS.md block on the server"
+    )
+    add_common(install_agents)
+
     server_init_parser = sub.add_parser("_server-init", parents=[internal_parser()])
     server_doctor_parser = sub.add_parser("_server-doctor", parents=[internal_parser()])
     server_status_parser = sub.add_parser("_server-status", parents=[internal_parser()])
@@ -3586,6 +5089,31 @@ def build_parser() -> argparse.ArgumentParser:
     server_clean_parser.add_argument("--action", choices=("archive", "discard"), required=True)
     server_stale_parser = sub.add_parser("_server-discard-stale", parents=[internal_parser()])
     server_stale_parser.add_argument("--task-id", required=True)
+    job_request_parser = sub.add_parser("_job-request")
+    job_request_parser.add_argument("--request-file", required=True)
+    job_request_parser.add_argument("--name", required=True)
+    job_request_parser.add_argument("--gpus", default="")
+    job_request_parser.add_argument("--completion-marker", default="")
+    job_request_parser.add_argument("--resume-command", default="")
+    job_request_parser.add_argument("--metadata", action="append", default=[])
+    job_request_parser.add_argument("job_command", nargs=argparse.REMAINDER)
+    sub.add_parser("_server-jobs", parents=[internal_parser()])
+    internal_job_status = sub.add_parser("_server-job-status", parents=[internal_parser()])
+    internal_job_status.add_argument("--run-id", required=True)
+    internal_job_logs = sub.add_parser("_server-job-logs", parents=[internal_parser()])
+    internal_job_logs.add_argument("--run-id", required=True)
+    internal_job_logs.add_argument("--tail", type=int, default=400)
+    internal_job_stop = sub.add_parser("_server-job-stop", parents=[internal_parser()])
+    internal_job_stop.add_argument("--run-id", required=True)
+    internal_job_summarize = sub.add_parser("_server-job-summarize", parents=[internal_parser()])
+    internal_job_summarize.add_argument("--run-id", required=True)
+    internal_job_analysis = sub.add_parser("_server-job-analysis", parents=[internal_parser()])
+    internal_job_analysis.add_argument("--run-id", required=True)
+    internal_job_run = sub.add_parser("_server-job-run", parents=[internal_parser()])
+    internal_job_run.add_argument("--run-id", required=True)
+    internal_job_analyze = sub.add_parser("_server-job-analyze", parents=[internal_parser()])
+    internal_job_analyze.add_argument("--run-id", required=True)
+    sub.add_parser("_server-install-agents", parents=[internal_parser()])
     return parser
 
 
@@ -3608,6 +5136,20 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
         return cmd_recover(args)
     if args.command == "clean":
         return cmd_clean(args)
+    if args.command == "jobs":
+        return cmd_jobs(args)
+    if args.command == "job-status":
+        return cmd_job_status(args)
+    if args.command == "job-logs":
+        return cmd_job_logs(args)
+    if args.command == "job-stop":
+        return cmd_job_stop(args)
+    if args.command == "job-summarize":
+        return cmd_job_summarize(args)
+    if args.command == "job-analysis":
+        return cmd_job_analysis(args)
+    if args.command == "install-agents":
+        return cmd_install_agents(args)
     if args.command == "_server-init":
         return server_init(args.project_id)
     if args.command == "_server-doctor":
@@ -3630,6 +5172,37 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
         return server_clean(args.project_id, args.action)
     if args.command == "_server-discard-stale":
         return server_discard_stale(args.project_id, args.task_id)
+    if args.command == "_job-request":
+        command = list(args.job_command)
+        if command and command[0] == "--":
+            command.pop(0)
+        return request_job_file(
+            Path(args.request_file),
+            name=args.name,
+            command=command,
+            gpus=args.gpus,
+            completion_marker=args.completion_marker,
+            resume_command=args.resume_command,
+            metadata_values=args.metadata,
+        )
+    if args.command == "_server-jobs":
+        return server_jobs(args.project_id)
+    if args.command == "_server-job-status":
+        return server_job_status(args.project_id, args.run_id)
+    if args.command == "_server-job-logs":
+        return server_job_logs(args.project_id, args.run_id, args.tail)
+    if args.command == "_server-job-stop":
+        return server_job_stop(args.project_id, args.run_id)
+    if args.command == "_server-job-summarize":
+        return server_job_summarize(args.project_id, args.run_id)
+    if args.command == "_server-job-analysis":
+        return server_job_analysis(args.project_id, args.run_id)
+    if args.command == "_server-job-run":
+        return server_job_run(args.project_id, args.run_id)
+    if args.command == "_server-job-analyze":
+        return server_job_analyze(args.project_id, args.run_id)
+    if args.command == "_server-install-agents":
+        return server_install_agents(args.project_id, read_json_stdin())
     raise CodexRemoteError(f"Unknown command: {args.command}", code="INVALID_COMMAND")
 
 

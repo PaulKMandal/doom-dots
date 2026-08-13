@@ -41,6 +41,11 @@ The `codex-remote-job' executable and the current project's resolved options
 are appended to this list."
   :type '(repeat string))
 
+(defcustom my/codex-remote-research-agents-template
+  (expand-file-name "templates/codex/research-AGENTS.md" doom-user-dir)
+  "Template used when creating a repository-level research AGENTS.md."
+  :type 'file)
+
 (defvar-local my/codex-remote-bootstrap-cmd nil
   "Optional command used to prepare a new Codex worktree.
 
@@ -113,7 +118,7 @@ verifies that Codex did not replace them.")
   '("READY_TESTS_FAILED" "READY_CODEX_FAILED" "READY_TESTS_DIRTY"
     "READY_ENVIRONMENT_FAILED" "READY_ENVIRONMENT_DIRTY"
     "READY_ENVIRONMENT_UNVERIFIED" "READY_RECOVERED_UNVERIFIED"
-    "CANCELLED_READY")
+    "CANCELLED_READY" "READY_JOB_NOT_LAUNCHED" "READY_JOB_PREPARED")
   "Importable states that require an explicit warning in the frontend.")
 
 (defun my/codex-remote--get (object key)
@@ -146,6 +151,7 @@ verifies that Codex did not replace them.")
           :profile my/codex-remote-profile
           :reasoning my/codex-remote-reasoning-effort
           :search my/codex-remote-enable-search
+          :job-policy "deny"
           :timeout my/codex-remote-timeout
           :max-untracked my/codex-remote-max-untracked-bytes)))
 
@@ -306,6 +312,8 @@ ON-ERROR with the parsed JSON object and process buffer."
             `(("State" . ,(my/codex-remote--get task 'state))
               ("Mode" . ,(or (my/codex-remote--get task 'execution_mode)
                                "exec"))
+              ("Job policy" . ,(or (my/codex-remote--get task 'job_policy)
+                                     "deny"))
               ("Task" . ,(my/codex-remote--get task 'task_id))
               ("Project" . ,(my/codex-remote--get task 'project_name))
               ("Started" . ,(or (my/codex-remote--get task 'codex_started_at)
@@ -331,6 +339,12 @@ ON-ERROR with the parsed JSON object and process buffer."
                                        (my/codex-remote--get tests 'command)))
               ("Test exit" . ,(and tests
                                     (my/codex-remote--get tests 'exit_code)))
+              ("Launched run" . ,(when-let ((job
+                                              (my/codex-remote--get
+                                               task 'launched_job)))
+                                    (my/codex-remote--get job 'run_id)))
+              ("Job launch error" . ,(my/codex-remote--get
+                                        task 'job_launch_error))
               ("Error" . ,(my/codex-remote--get task 'error)))))
       (mapcar (lambda (entry)
                 (format "%-17s %s"
@@ -422,6 +436,8 @@ ON-ERROR with the parsed JSON object and process buffer."
       (setq arguments (append arguments (list "--reasoning-effort" value))))
     (when (plist-get context :search)
       (setq arguments (append arguments '("--enable-search"))))
+    (when-let ((value (plist-get context :job-policy)))
+      (setq arguments (append arguments (list "--job-policy" value))))
     arguments))
 
 (defun my/codex-remote--task-command (action context)
@@ -493,13 +509,16 @@ validation failure does not destroy a multiline task description."
             "Remote Codex prompt — C-c C-c submit, C-c C-k cancel"))
     (pop-to-buffer buffer)))
 
-(defun my/codex-remote-start (&optional edit-prompt)
-  "Start a durable remote Codex task.
+(defun my/codex-remote--start-with-policy (policy edit-prompt)
+  "Start a durable remote Codex task using launch POLICY.
 
 Use the active region as the prompt when present.  With prefix EDIT-PROMPT,
 open a multiline prompt buffer; otherwise read a short prompt in the minibuffer."
-  (interactive "P")
-  (let ((context (my/codex-remote--context)))
+  (let* ((context (my/codex-remote--context))
+         (context (plist-put context :job-policy policy))
+         (label (if (equal policy "launch")
+                    "Remote Codex task (one frozen job authorized): "
+                  "Remote Codex task: ")))
     (cond
      ((use-region-p)
       (my/codex-remote--submit-prompt
@@ -510,7 +529,21 @@ open a multiline prompt buffer; otherwise read a short prompt in the minibuffer.
      (t
       (my/codex-remote--submit-prompt
        context
-       (read-string "Remote Codex task: "))))))
+       (read-string label))))))
+
+(defun my/codex-remote-start (&optional edit-prompt)
+  "Start a durable remote Codex task without detached-job authorization."
+  (interactive "P")
+  (my/codex-remote--start-with-policy "deny" edit-prompt))
+
+(defun my/codex-remote-start-job (&optional edit-prompt)
+  "Start Codex with authorization to request one frozen experiment job.
+
+Codex cannot launch the process directly.  It must submit one request, after
+which the trusted runner requires the configured smoke/test command to pass,
+freezes the result revision, and starts the independent job."
+  (interactive "P")
+  (my/codex-remote--start-with-policy "launch" edit-prompt))
 
 (defun my/codex-remote-logs ()
   "Show recent logs for the current project task."
@@ -597,15 +630,18 @@ When READ-ONLY is non-nil, attach the tmux client without allowing input."
   "Return TASK's tmux session name, or signal a useful user error."
   (let* ((session (my/codex-remote--get task 'tmux_session))
          (state (my/codex-remote--get task 'state))
+         (identifier (or (my/codex-remote--get task 'task_id)
+                         (my/codex-remote--get task 'run_id)
+                         state))
          (tmux (my/codex-remote--get task 'tmux)))
     (unless session
-      (user-error "Task %s has no tmux session" state))
+      (user-error "%s has no tmux session" identifier))
     (unless (my/codex-remote--get tmux 'exists)
-      (user-error "Task %s has no tmux session; use SPC r c l for logs" state))
+      (user-error "%s has no live tmux session; inspect its logs" identifier))
     (when (my/codex-remote--get tmux 'pane_dead)
       (user-error
-       "Task %s has already exited%s; use SPC r c l for logs"
-       state
+       "%s has already exited%s; inspect its logs"
+       identifier
        (if-let ((status (my/codex-remote--get tmux 'pane_dead_status)))
            (format " with status %s" status)
          "")))
@@ -614,7 +650,8 @@ When READ-ONLY is non-nil, attach the tmux client without allowing input."
 (defun my/codex-remote--open-tmux (context task)
   "Monitor TASK's live tmux pane in Emacs's built-in terminal emulator."
   (let* ((session (my/codex-remote--require-live-tmux task))
-         (task-id (my/codex-remote--get task 'task_id)))
+         (task-id (or (my/codex-remote--get task 'task_id)
+                      (my/codex-remote--get task 'run_id))))
     (require 'term)
     (let* ((name (format "codex-remote-tmux:%s" task-id))
            (buffer-name (format "*%s*" name))
@@ -718,15 +755,14 @@ When READ-ONLY is non-nil, attach the tmux client without allowing input."
            (or (my/codex-remote--get task 'task_id) "-")
            (error-message-string err))))))))
 
-(defun my/codex-remote-interactive ()
-  "Start or reattach to a managed interactive Codex TUI outside Emacs.
+(defun my/codex-remote--interactive-with-policy (policy)
+  "Start or reattach to a managed interactive Codex TUI using POLICY.
 
 A new session uses the same hidden local snapshot, isolated server worktree,
 result publication, and safe local import path as `my/codex-remote-start'.  If
 an interactive session is already active, this command simply reattaches to
 its existing tmux session without resnapshotting or saving local buffers."
-  (interactive)
-  (let* ((context (my/codex-remote--context))
+  (let* ((context (plist-put (my/codex-remote--context) :job-policy policy))
          (command (my/codex-remote--common-args "status" context)))
     (my/codex-remote--run
      "interactive-status" command context
@@ -749,23 +785,41 @@ its existing tmux session without resnapshotting or saving local buffers."
              "Outstanding %s Codex task is %s; import, archive, or discard it before starting an interactive TUI"
              mode state))))))))
 
+(defun my/codex-remote-interactive ()
+  "Start or reattach to managed interactive Codex without job authorization."
+  (interactive)
+  (my/codex-remote--interactive-with-policy "deny"))
+
+(defun my/codex-remote-interactive-job ()
+  "Start or reattach to interactive Codex with one frozen job authorized.
+
+An already-running interactive task is only reattached; its original launch
+policy is not upgraded."
+  (interactive)
+  (my/codex-remote--interactive-with-policy "launch"))
+
 
 (defun my/codex-remote--job-command (context)
-  "Return the external terminal command for a one-shot job using CONTEXT."
-  (append
-   (cons (my/codex-remote--job-terminal-executable)
-         (cdr my/codex-remote-job-terminal-command))
-   (list (my/codex-remote--job-executable)
-         "--project-root" (plist-get context :root)
-         "--backend" my/codex-remote-backend
-         "--host" (plist-get context :host)
-         "--remote-dir" (plist-get context :remote-dir)
-         "--timeout" (number-to-string (plist-get context :timeout))
-         "--max-untracked-bytes"
-         (number-to-string (plist-get context :max-untracked)))
-   (my/codex-remote--task-option-args context)
-   (unless (plist-get context :search) '("--disable-search"))
-   '("--ignore-config" "--pause-at-end")))
+  "Return the external terminal command for a one-shot job using CONTEXT.
+
+The terminal frontend remains an ordinary editing task.  Frozen-job launch
+authorization is deliberately available only through the explicit uppercase
+Doom commands, so do not pass the internal job-policy option here."
+  (let ((ordinary-context (plist-put (copy-sequence context) :job-policy nil)))
+    (append
+     (cons (my/codex-remote--job-terminal-executable)
+           (cdr my/codex-remote-job-terminal-command))
+     (list (my/codex-remote--job-executable)
+           "--project-root" (plist-get context :root)
+           "--backend" my/codex-remote-backend
+           "--host" (plist-get context :host)
+           "--remote-dir" (plist-get context :remote-dir)
+           "--timeout" (number-to-string (plist-get context :timeout))
+           "--max-untracked-bytes"
+           (number-to-string (plist-get context :max-untracked)))
+     (my/codex-remote--task-option-args ordinary-context)
+     (unless (plist-get context :search) '("--disable-search"))
+     '("--ignore-config" "--pause-at-end"))))
 
 (defun my/codex-remote-job ()
   "Open an external terminal to prompt for and watch a managed one-shot job.
@@ -792,6 +846,327 @@ importable through `my/codex-remote-apply'."
                          (process-exit-status proc)))))))
       (message "Opened terminal prompt/watcher for a managed remote Codex job")
       process)))
+
+
+;; Frozen experiment jobs ----------------------------------------------------
+
+(defun my/codex-job--command (action context run-id &rest extra)
+  "Return backend ACTION for RUN-ID using CONTEXT and EXTRA arguments."
+  (append (my/codex-remote--common-args action context)
+          (list "--run-id" run-id)
+          extra))
+
+(defun my/codex-job--display-command (command)
+  "Render JSON COMMAND argv for status buffers."
+  (if (listp command)
+      (mapconcat (lambda (value)
+                   (shell-quote-argument (format "%s" value)))
+                 command " ")
+    "-"))
+
+(defun my/codex-job--lines (job)
+  "Return readable status lines for frozen experiment JOB."
+  (let* ((analysis (my/codex-remote--get job 'analysis))
+         (bootstrap (my/codex-remote--get job 'bootstrap))
+         (source-integrity (my/codex-remote--get job 'source_integrity))
+         (tmux (my/codex-remote--get job 'tmux))
+         (fields
+          `(("State" . ,(my/codex-remote--get job 'state))
+            ("Phase" . ,(my/codex-remote--get job 'phase))
+            ("Run" . ,(my/codex-remote--get job 'run_id))
+            ("Name" . ,(my/codex-remote--get job 'name))
+            ("Created" . ,(my/codex-remote--get job 'created_at))
+            ("Started" . ,(my/codex-remote--get job 'started_at))
+            ("Finished" . ,(my/codex-remote--get job 'finished_at))
+            ("Source SHA" . ,(my/codex-remote--get job 'source_sha))
+            ("Source task" . ,(my/codex-remote--get job 'source_task_id))
+            ("GPUs" . ,(or (my/codex-remote--get job 'gpus) "inherited"))
+            ("Command" . ,(my/codex-job--display-command
+                             (my/codex-remote--get job 'command)))
+            ("Bootstrap" . ,(my/codex-remote--get job 'bootstrap_cmd))
+            ("Bootstrap exit" . ,(and bootstrap
+                                      (my/codex-remote--get bootstrap 'exit_code)))
+            ("Exit" . ,(my/codex-remote--get job 'exit_code))
+            ("Completion marker" . ,(my/codex-remote--get
+                                       job 'completion_marker))
+            ("Marker present"
+             . ,(when-let ((marker (my/codex-remote--get
+                                    job 'completion_marker)))
+                  (unless (string-empty-p marker)
+                    (if (my/codex-remote--get
+                         job 'completion_marker_present)
+                        "yes"
+                      "no"))))
+            ("Tracked source clean"
+             . ,(when source-integrity
+                  (if (my/codex-remote--get source-integrity 'tracked_clean)
+                      "yes"
+                    "no")))
+            ("Source HEAD unchanged"
+             . ,(when source-integrity
+                  (if (my/codex-remote--get
+                       source-integrity 'head_matches_source)
+                      "yes"
+                    "no")))
+            ("Untracked run files"
+             . ,(when-let ((paths (and source-integrity
+                                      (my/codex-remote--get
+                                       source-integrity 'untracked_paths))))
+                  (length paths)))
+            ("Worktree" . ,(my/codex-remote--get job 'worktree))
+            ("Run directory" . ,(my/codex-remote--get job 'state_dir))
+            ("tmux session" . ,(my/codex-remote--get job 'tmux_session))
+            ("tmux process" . ,(my/codex-remote--tmux-status-label tmux))
+            ("Process alive" . ,(my/codex-remote--get job 'process_alive))
+            ("Analysis" . ,(and analysis
+                                  (my/codex-remote--get analysis 'state)))
+            ("Error" . ,(my/codex-remote--get job 'error)))))
+    (mapcar (lambda (entry)
+              (format "%-20s %s"
+                      (concat (car entry) ":")
+                      (if (or (null (cdr entry))
+                              (equal (cdr entry) ""))
+                          "-"
+                        (cdr entry))))
+            fields)))
+
+(defun my/codex-job--show-status-response (response process-buffer)
+  "Display a frozen-job status RESPONSE from PROCESS-BUFFER."
+  (let ((job (my/codex-remote--get response 'job))
+        (buffer (get-buffer-create "*codex-job-status*")))
+    (when (buffer-live-p process-buffer)
+      (kill-buffer process-buffer))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize "Frozen experiment job\n" 'face 'bold))
+        (insert (make-string 76 ?-) "\n")
+        (insert (string-join (my/codex-job--lines job) "\n") "\n")
+        (goto-char (point-min))
+        (special-mode)))
+    (display-buffer buffer)))
+
+(defun my/codex-jobs--show-list-response (response process-buffer)
+  "Display the experiment-job list in RESPONSE."
+  (let ((jobs (my/codex-remote--get response 'jobs))
+        (buffer (get-buffer-create "*codex-jobs*")))
+    (when (buffer-live-p process-buffer)
+      (kill-buffer process-buffer))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize "Frozen experiment jobs\n" 'face 'bold))
+        (insert (make-string 100 ?-) "\n")
+        (if jobs
+            (dolist (job jobs)
+              (insert
+               (format "%-42s %-14s %-24s %s\n"
+                       (or (my/codex-remote--get job 'run_id) "-")
+                       (or (my/codex-remote--get job 'state) "-")
+                       (or (my/codex-remote--get job 'name) "-")
+                       (or (my/codex-remote--get job 'created_at) "-"))))
+          (insert "No frozen experiment jobs exist for this project.\n"))
+        (goto-char (point-min))
+        (special-mode)))
+    (display-buffer buffer)))
+
+(defun my/codex-jobs-list ()
+  "List frozen experiment jobs for the current project."
+  (interactive)
+  (let* ((context (my/codex-remote--context))
+         (command (my/codex-remote--common-args "jobs" context)))
+    (my/codex-remote--run
+     "jobs" command context
+     :on-success #'my/codex-jobs--show-list-response)))
+
+(defun my/codex-job--select (context callback)
+  "Select a job for CONTEXT, then call CALLBACK with its run ID."
+  (my/codex-remote--run
+   "job-select"
+   (my/codex-remote--common-args "jobs" context)
+   context
+   :quiet t
+   :on-success
+   (lambda (response buffer)
+     (kill-buffer buffer)
+     (let ((jobs (my/codex-remote--get response 'jobs)))
+       (if (not jobs)
+           (message "No frozen experiment jobs exist for this project")
+         (let ((choices
+                (mapcar
+                 (lambda (job)
+                   (let ((run-id (my/codex-remote--get job 'run_id)))
+                     (cons
+                      (format "%s  [%s]  %s"
+                              run-id
+                              (or (my/codex-remote--get job 'state) "-")
+                              (or (my/codex-remote--get job 'name) "-"))
+                      run-id)))
+                 jobs)))
+           ;; Prompt outside the process sentinel so minibuffer interaction is
+           ;; not nested inside process cleanup.
+           (run-at-time
+            0 nil
+            (lambda ()
+              (let* ((choice (completing-read "Experiment job: " choices nil t))
+                     (run-id (cdr (assoc choice choices))))
+                (funcall callback run-id))))))))))
+
+(defun my/codex-job-status ()
+  "Select and show one frozen experiment job."
+  (interactive)
+  (let ((context (my/codex-remote--context)))
+    (my/codex-job--select
+     context
+     (lambda (run-id)
+       (my/codex-remote--run
+        "job-status" (my/codex-job--command "job-status" context run-id)
+        context :on-success #'my/codex-job--show-status-response)))))
+
+(defun my/codex-job-logs ()
+  "Select a frozen experiment job and show its recent logs."
+  (interactive)
+  (let ((context (my/codex-remote--context)))
+    (my/codex-job--select
+     context
+     (lambda (run-id)
+       (my/codex-remote--run
+        "job-logs"
+        (my/codex-job--command "job-logs" context run-id "--tail" "500")
+        context
+        :on-success
+        (lambda (response process-buffer)
+          (let ((log (or (my/codex-remote--get response 'log) ""))
+                (buffer (get-buffer-create "*codex-job-logs*")))
+            (kill-buffer process-buffer)
+            (with-current-buffer buffer
+              (let ((inhibit-read-only t))
+                (erase-buffer)
+                (insert log)
+                (goto-char (point-min))
+                (special-mode)))
+            (display-buffer buffer))))))))
+
+(defun my/codex-job-attach ()
+  "Select an active experiment job and monitor its tmux pane read-only."
+  (interactive)
+  (let ((context (my/codex-remote--context)))
+    (my/codex-job--select
+     context
+     (lambda (run-id)
+       (my/codex-remote--run
+        "job-attach"
+        (my/codex-job--command "job-status" context run-id)
+        context
+        :on-success
+        (lambda (response buffer)
+          (kill-buffer buffer)
+          (my/codex-remote--open-tmux
+           context (my/codex-remote--get response 'job))))))))
+
+(defun my/codex-job-stop ()
+  "Select and stop an active frozen experiment job."
+  (interactive)
+  (let ((context (my/codex-remote--context)))
+    (my/codex-job--select
+     context
+     (lambda (run-id)
+       (when (yes-or-no-p (format "Stop experiment job %s? " run-id))
+         (my/codex-remote--run
+          "job-stop" (my/codex-job--command "job-stop" context run-id)
+          context
+          :on-success
+          (lambda (response buffer)
+            (kill-buffer buffer)
+            (message "Stop requested for experiment job %s"
+                     (my/codex-remote--get
+                      (my/codex-remote--get response 'job) 'run_id)))))))))
+
+(defun my/codex-job-interpret ()
+  "Start a read-only Codex interpretation of a finished experiment job."
+  (interactive)
+  (let ((context (my/codex-remote--context)))
+    (my/codex-job--select
+     context
+     (lambda (run-id)
+       (my/codex-remote--run
+        "job-interpret"
+        (my/codex-job--command "job-summarize" context run-id)
+        context
+        :on-success
+        (lambda (response buffer)
+          (kill-buffer buffer)
+          (let ((analysis (my/codex-remote--get response 'analysis)))
+            (message "Experiment interpretation for %s is %s"
+                     run-id
+                     (or (my/codex-remote--get analysis 'state)
+                         "starting")))))))))
+
+(defun my/codex-job-analysis ()
+  "Select and show the latest structured interpretation for an experiment."
+  (interactive)
+  (let ((context (my/codex-remote--context)))
+    (my/codex-job--select
+     context
+     (lambda (run-id)
+       (my/codex-remote--run
+        "job-analysis"
+        (my/codex-job--command "job-analysis" context run-id)
+        context
+        :on-success
+        (lambda (response process-buffer)
+          (let* ((markdown (or (my/codex-remote--get response 'markdown) ""))
+                 (job (my/codex-remote--get response 'job))
+                 (analysis (my/codex-remote--get job 'analysis))
+                 (buffer (get-buffer-create "*codex-job-analysis*")))
+            (kill-buffer process-buffer)
+            (with-current-buffer buffer
+              (let ((inhibit-read-only t))
+                (erase-buffer)
+                (if (string-empty-p markdown)
+                    (insert (format "No completed analysis is available. Current analysis state: %s\n"
+                                    (or (my/codex-remote--get analysis 'state)
+                                        "not started")))
+                  (insert markdown))
+                (goto-char (point-min))
+                (if (fboundp 'markdown-mode)
+                    (markdown-mode)
+                  (special-mode))))
+            (display-buffer buffer))))))))
+
+
+;; AGENTS.md setup -----------------------------------------------------------
+
+(defun my/codex-remote-install-global-agents ()
+  "Install or update the managed global Codex instructions on the server."
+  (interactive)
+  (let ((context (my/codex-remote--context)))
+    (when (yes-or-no-p
+           (format "Install managed global Codex instructions on %s? "
+                   (plist-get context :host)))
+      (my/codex-remote--run
+       "install-agents"
+       (my/codex-remote--common-args "install-agents" context)
+       context
+       :on-success
+       (lambda (response buffer)
+         (kill-buffer buffer)
+         (message "Installed managed global Codex instructions at %s"
+                  (my/codex-remote--get response 'path)))))))
+
+(defun my/codex-remote-project-agents ()
+  "Create or open this repository's research-oriented AGENTS.md."
+  (interactive)
+  (let* ((context (my/codex-remote--context))
+         (root (plist-get context :root))
+         (target (expand-file-name "AGENTS.md" root)))
+    (unless (file-readable-p my/codex-remote-research-agents-template)
+      (user-error "Research AGENTS template is unavailable: %s"
+                  my/codex-remote-research-agents-template))
+    (unless (file-exists-p target)
+      (copy-file my/codex-remote-research-agents-template target nil)
+      (message "Created %s; review and commit it with the repository" target))
+    (find-file target)))
 
 
 (defun my/codex-remote--open-conflict-worktree (response)

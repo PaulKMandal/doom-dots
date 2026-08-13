@@ -219,7 +219,8 @@
                    :model "gpt-test"
                    :profile "server"
                    :reasoning "high"
-                   :search t)))
+                   :search t
+                   :job-policy "deny")))
     (cl-letf (((symbol-function 'my/codex-remote--job-terminal-executable)
                (lambda () "/run/current-system/sw/bin/kitty"))
               ((symbol-function 'my/codex-remote--job-executable)
@@ -269,6 +270,65 @@
     (should (string-match-p "task-1" text))
     (should (string-match-p "abc123" text))
     (should (string-match-p "pytest" text))))
+
+(ert-deftest codex-remote-launch-policy-is-forwarded-only-for-explicit-task-modes ()
+  (let* ((my/codex-remote-backend "/tmp/codex-remote")
+         (context '(:root "/tmp/project/"
+                    :host "rhel-test"
+                    :remote-dir "/srv/project"
+                    :timeout 5
+                    :max-untracked 2048
+                    :job-policy "launch"))
+         (start (my/codex-remote--start-command context))
+         (interactive (my/codex-remote--interactive-command context)))
+    (dolist (command (list start interactive))
+      (let ((position (seq-position command "--job-policy" #'equal)))
+        (should position)
+        (should (equal (nth (1+ position) command) "launch"))))))
+
+(ert-deftest codex-remote-frozen-job-command-preserves-run-id ()
+  (let ((my/codex-remote-backend "/tmp/codex-remote")
+        (context '(:root "/tmp/project/"
+                   :host "rhel-test"
+                   :remote-dir "/srv/project"
+                   :timeout 5
+                   :max-untracked 2048)))
+    (should
+     (equal
+      (my/codex-job--command "job-status" context "run-123")
+      '("/tmp/codex-remote" "job-status"
+        "--project-root" "/tmp/project/"
+        "--host" "rhel-test"
+        "--remote-dir" "/srv/project"
+        "--timeout" "5"
+        "--max-untracked-bytes" "2048"
+        "--run-id" "run-123")))))
+
+(ert-deftest codex-remote-frozen-job-lines-show-source-command-and-analysis ()
+  (let ((text
+         (string-join
+          (my/codex-job--lines
+           '((state . "SUCCEEDED")
+             (phase . "finished")
+             (run_id . "run-123")
+             (name . "heldout transfer")
+             (source_sha . "abc123")
+             (source_task_id . "task-1")
+             (gpus . "0,1")
+             (command . ("python" "run.py" "--tag" "heldout"))
+             (bootstrap_cmd . "uv sync --frozen")
+             (bootstrap . ((exit_code . 0)))
+             (completion_marker . "outputs/COMPLETE")
+             (completion_marker_present . t)
+             (analysis . ((state . "SUCCEEDED")))))
+          "\n")))
+    (should (string-match-p "SUCCEEDED" text))
+    (should (string-match-p "run-123" text))
+    (should (string-match-p "abc123" text))
+    (should (string-match-p "python run\\.py --tag heldout" text))
+    (should (string-match-p "uv sync --frozen" text))
+    (should (string-match-p "Bootstrap exit:.*0" text))
+    (should (string-match-p "outputs/COMPLETE" text))))
 
 (provide 'codex-remote-ert)
 ;;; codex-remote-ert.el ends here

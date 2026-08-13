@@ -63,24 +63,36 @@
        :desc "Open vterm"                   "t" #'my/project-remote-terminal
        (:prefix ("c" . "codex")
         :desc "Start remote Codex task"       "s" #'my/codex-remote-start
+        :desc "Start Codex + frozen job"       "S" #'my/codex-remote-start-job
         :desc "Check remote Codex setup"      "d" #'my/codex-remote-doctor
         :desc "Show remote Codex status"      "t" #'my/codex-remote-status
         :desc "Monitor Codex tmux"            "a" #'my/codex-remote-attach
         :desc "Start/reattach managed Codex TUI" "i" #'my/codex-remote-interactive
-        :desc "Start terminal Codex job"       "j" #'my/codex-remote-job
+        :desc "Interactive Codex + frozen job" "I" #'my/codex-remote-interactive-job
+        :desc "Open one-shot Codex terminal"   "j" #'my/codex-remote-job
         :desc "Show remote Codex logs"        "l" #'my/codex-remote-logs
         :desc "Recover orphaned Codex work"   "r" #'my/codex-remote-recover
         :desc "Fetch/apply Codex result"      "f" #'my/codex-remote-apply
         :desc "Cancel active Codex task"      "x" #'my/codex-remote-cancel
         :desc "Archive imported Codex task"   "c" #'my/codex-remote-clean
-        :desc "Discard remote Codex task"     "X" #'my/codex-remote-discard)))
+        :desc "Discard remote Codex task"     "X" #'my/codex-remote-discard
+        :desc "Install global AGENTS"          "g" #'my/codex-remote-install-global-agents
+        :desc "Create/open project AGENTS"     "A" #'my/codex-remote-project-agents)
+       (:prefix ("j" . "experiment jobs")
+        :desc "List experiment jobs"           "l" #'my/codex-jobs-list
+        :desc "Show experiment status"         "s" #'my/codex-job-status
+        :desc "Show experiment logs"           "t" #'my/codex-job-logs
+        :desc "Monitor experiment tmux"        "a" #'my/codex-job-attach
+        :desc "Stop experiment job"            "x" #'my/codex-job-stop
+        :desc "Interpret finished job"          "i" #'my/codex-job-interpret
+        :desc "Show job interpretation"        "r" #'my/codex-job-analysis)))
 
 (set-popup-rule! "^\\*remote-vterm\\*$"
   :side 'bottom
   :size 0.3
   :select t
   :quit nil)
-(set-popup-rule! "^\\*codex-remote-\\(logs\\|status\\|tmux\\)"
+(set-popup-rule! "^\\*codex-\\(remote-\\(logs\\|status\\|tmux\\)\\|job\\|jobs\\)"
   :side 'bottom
   :size 0.4
   :select t

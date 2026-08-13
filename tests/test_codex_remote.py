@@ -921,6 +921,571 @@ class ServerRunnerTests(RepositoryTestCase):
         self.assertIn(".env", task["error"])
 
 
+class ExperimentJobTests(RepositoryTestCase):
+    def test_job_request_helper_validates_and_runner_consumes_file(self) -> None:
+        state_dir = self.base / "state"
+        state_dir.mkdir()
+        request_path = self.root / cr.JOB_REQUEST_RELATIVE
+        response = cr.request_job_file(
+            request_path,
+            name="heldout transfer",
+            command=["python", "run.py", "--tag", "heldout"],
+            gpus="0,1",
+            completion_marker="outputs/COMPLETE",
+            resume_command="python run.py --resume",
+            metadata_values=["panel=confirmation", "seed=17"],
+        )
+        self.assertTrue(response["ok"])
+        task = {
+            "worktree": str(self.root),
+            "state_dir": str(state_dir),
+            "job_policy": "launch",
+        }
+        request = cr.consume_job_request(task)
+        assert request is not None
+        self.assertEqual(request["gpus"], "0,1")
+        self.assertEqual(request["metadata"]["panel"], "confirmation")
+        self.assertFalse(request_path.exists())
+        self.assertEqual(
+            json.loads((state_dir / "job-request.json").read_text(encoding="utf-8"))["name"],
+            "heldout transfer",
+        )
+
+    def test_unauthorized_manual_job_request_is_blocked_and_removed(self) -> None:
+        state_dir = self.base / "state-deny"
+        state_dir.mkdir()
+        request_path = self.root / cr.JOB_REQUEST_RELATIVE
+        cr.atomic_write_json(
+            request_path,
+            {"name": "bad", "command": ["sleep", "10"]},
+        )
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.consume_job_request(
+                {
+                    "worktree": str(self.root),
+                    "state_dir": str(state_dir),
+                    "job_policy": "deny",
+                }
+            )
+        self.assertEqual(caught.exception.code, "JOB_NOT_AUTHORIZED")
+        self.assertFalse(request_path.exists())
+
+    def test_frozen_job_records_manifest_and_runs_independently(self) -> None:
+        home = self.base / "job-home"
+        home.mkdir()
+        project_id = "experiment-project"
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            source_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+            git(self.root, "push", str(paths["broker"]), f"HEAD:refs/source/{source_sha}")
+            task = {
+                "project_id": project_id,
+                "project_name": "experiment",
+                "task_id": "task-source",
+                "input_sha": source_sha,
+                "result_sha": source_sha,
+                "result_lock_hashes": {"uv.lock": "deadbeef"},
+                "data_links": [],
+                "model": None,
+                "profile": None,
+                "reasoning_effort": "high",
+                "tools": {
+                    "bash": shutil.which("bash"),
+                    "git": shutil.which("git"),
+                    "tmux": shutil.which("true"),
+                    "codex": shutil.which("true"),
+                },
+            }
+            script = (
+                "from pathlib import Path; import json, os; "
+                "Path('done.marker').write_text('done\\n'); "
+                "Path(os.environ['CODEX_RESULTS_DIR'], 'result.json').write_text("
+                "json.dumps({'run': os.environ['CODEX_RUN_ID'], "
+                "'source': os.environ['CODEX_SOURCE_SHA']})); "
+                "Path(os.environ['CODEX_CHECKPOINTS_DIR'], 'checkpoint.txt').write_text('checkpoint\\n')"
+            )
+            request = {
+                "name": "smoke experiment",
+                "command": [cr.sys.executable, "-c", script],
+                "gpus": "0,1",
+                "completion_marker": "done.marker",
+                "resume_command": "python run.py --resume",
+                "metadata": {"panel": "confirmation", "seed": "17"},
+            }
+            job = cr.start_frozen_job(paths, task, request)
+            try:
+                returncode = cr.server_job_run(project_id, job["run_id"])
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+
+            self.assertEqual(returncode, 0)
+            finished = cr.load_server_job(paths, job["run_id"])
+            assert finished is not None
+            self.assertEqual(finished["state"], "SUCCEEDED")
+            self.assertEqual(finished["source_sha"], source_sha)
+            self.assertTrue(finished["completion_marker_present"])
+            state_dir = Path(finished["state_dir"])
+            self.assertTrue((state_dir / "run.json").is_file())
+            self.assertTrue((state_dir / "status.json").is_file())
+            self.assertTrue((state_dir / "command.txt").is_file())
+            self.assertTrue((state_dir / "environment.txt").is_file())
+            self.assertIn(
+                "lock_sha256[uv.lock]=deadbeef",
+                (state_dir / "environment.txt").read_text(encoding="utf-8"),
+            )
+            self.assertTrue((state_dir / "results" / "result.json").is_file())
+            self.assertTrue((state_dir / "checkpoints" / "checkpoint.txt").is_file())
+            worktree = Path(finished["worktree"])
+            self.assertEqual(git(worktree, "rev-parse", "HEAD").stdout.strip(), source_sha)
+            result = json.loads(
+                (state_dir / "results" / "result.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["run"], finished["run_id"])
+            self.assertEqual(result["source"], source_sha)
+
+    def test_frozen_job_bootstraps_its_fresh_worktree_before_command(self) -> None:
+        home = self.base / "bootstrap-job-home"
+        home.mkdir()
+        project_id = "bootstrap-experiment-project"
+        (self.root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+        source_sha = commit_all(self.root, "ignore local virtual environment")
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            git(self.root, "push", str(paths["broker"]), f"HEAD:refs/source/{source_sha}")
+            task = {
+                "project_id": project_id,
+                "project_name": "bootstrap-experiment",
+                "task_id": "task-source",
+                "input_sha": source_sha,
+                "result_sha": source_sha,
+                "bootstrap_cmd": "mkdir -p .venv && printf ready > .venv/ready",
+                "data_links": [],
+                "tools": {
+                    "bash": shutil.which("bash"),
+                    "git": shutil.which("git"),
+                    "tmux": shutil.which("true"),
+                    "codex": shutil.which("true"),
+                },
+            }
+            script = (
+                "from pathlib import Path; "
+                "assert Path('.venv/ready').read_text() == 'ready'; "
+                "Path('BOOTSTRAP_COMPLETE').write_text('done\\n')"
+            )
+            job = cr.start_frozen_job(
+                paths,
+                task,
+                {
+                    "name": "bootstrapped frozen job",
+                    "command": [cr.sys.executable, "-c", script],
+                    "completion_marker": "BOOTSTRAP_COMPLETE",
+                },
+            )
+            try:
+                returncode = cr.server_job_run(project_id, job["run_id"])
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+
+            finished = cr.load_server_job(paths, job["run_id"])
+            assert finished is not None
+            self.assertEqual(returncode, 0)
+            self.assertEqual(finished["state"], "SUCCEEDED")
+            self.assertEqual(finished["bootstrap"]["exit_code"], 0)
+            self.assertFalse(finished["bootstrap"]["dirty_after_bootstrap"])
+            self.assertTrue(finished["bootstrap"]["source_integrity"]["tracked_clean"])
+            self.assertTrue((Path(finished["worktree"]) / ".venv" / "ready").is_file())
+            state_dir = Path(finished["state_dir"])
+            self.assertEqual(
+                (state_dir / "bootstrap-command.txt").read_text(encoding="utf-8").strip(),
+                task["bootstrap_cmd"],
+            )
+            self.assertIn(
+                "bootstrap_command=" + task["bootstrap_cmd"],
+                (state_dir / "environment.txt").read_text(encoding="utf-8"),
+            )
+
+    def test_fast_job_cannot_be_reset_to_stale_starting_state(self) -> None:
+        home = self.base / "fast-job-home"
+        home.mkdir()
+        project_id = "fast-experiment-project"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            source_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+            git(self.root, "push", str(paths["broker"]), f"HEAD:refs/source/{source_sha}")
+            fake_tmux = home / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/bash\n"
+                "set -e\n"
+                "if [ \"${1:-}\" = new-session ]; then\n"
+                "  command=${!#}\n"
+                "  command=${command/ -lc / -c }\n"
+                "  exec bash -c \"$command\"\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_tmux.chmod(0o755)
+            task = {
+                "project_id": project_id,
+                "project_name": "fast-experiment",
+                "task_id": "task-source",
+                "input_sha": source_sha,
+                "result_sha": source_sha,
+                "bootstrap_cmd": "",
+                "data_links": [],
+                "tools": {
+                    "bash": shutil.which("bash"),
+                    "git": shutil.which("git"),
+                    "tmux": str(fake_tmux),
+                    "codex": shutil.which("true"),
+                },
+            }
+            script = "from pathlib import Path; Path('FAST_COMPLETE').write_text('done\\n')"
+            returned = cr.start_frozen_job(
+                paths,
+                task,
+                {
+                    "name": "fast completion",
+                    "command": [cr.sys.executable, "-c", script],
+                    "completion_marker": "FAST_COMPLETE",
+                },
+            )
+            stored = cr.load_server_job(paths, returned["run_id"])
+            assert stored is not None
+
+        self.assertEqual(returned["state"], "SUCCEEDED")
+        self.assertEqual(stored["state"], "SUCCEEDED")
+        self.assertTrue(stored["completion_marker_present"])
+
+    def test_completion_marker_cannot_resolve_inside_data_link(self) -> None:
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.validate_job_completion_marker(
+                {"data_links": [{"source": "/srv/data", "target": "data"}]},
+                "data/already-complete.marker",
+            )
+        self.assertEqual(caught.exception.code, "INVALID_JOB_REQUEST")
+
+    def test_frozen_job_rejects_completion_marker_already_in_source(self) -> None:
+        home = self.base / "existing-marker-home"
+        home.mkdir()
+        project_id = "existing-marker-project"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            source_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+            git(self.root, "push", str(paths["broker"]), f"HEAD:refs/source/{source_sha}")
+            task = {
+                "project_id": project_id,
+                "project_name": "existing-marker",
+                "task_id": "task-source",
+                "input_sha": source_sha,
+                "result_sha": source_sha,
+                "data_links": [],
+                "tools": {
+                    "bash": shutil.which("bash"),
+                    "git": shutil.which("git"),
+                    "tmux": shutil.which("true"),
+                    "codex": shutil.which("true"),
+                },
+            }
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.start_frozen_job(
+                    paths,
+                    task,
+                    {
+                        "name": "stale marker run",
+                        "command": [cr.sys.executable, "-c", "print('not launched')"],
+                        "completion_marker": "tracked.txt",
+                    },
+                )
+        self.assertEqual(caught.exception.code, "COMPLETION_MARKER_EXISTS")
+
+    def test_frozen_job_detects_tracked_source_mutation(self) -> None:
+        home = self.base / "dirty-job-home"
+        home.mkdir()
+        project_id = "dirty-experiment-project"
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            source_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+            git(self.root, "push", str(paths["broker"]), f"HEAD:refs/source/{source_sha}")
+            task = {
+                "project_id": project_id,
+                "project_name": "dirty-experiment",
+                "task_id": "task-source",
+                "input_sha": source_sha,
+                "result_sha": source_sha,
+                "data_links": [],
+                "tools": {
+                    "bash": shutil.which("bash"),
+                    "git": shutil.which("git"),
+                    "tmux": shutil.which("true"),
+                    "codex": shutil.which("true"),
+                },
+            }
+            script = (
+                "from pathlib import Path; import subprocess; "
+                "Path('tracked.txt').write_text('changed during run\\n'); "
+                "subprocess.run(['git', 'add', 'tracked.txt'], check=True); "
+                "subprocess.run(['git', '-c', 'user.name=Experiment', "
+                "'-c', 'user.email=experiment@example.invalid', 'commit', "
+                "'-m', 'mutate frozen source'], check=True); "
+                "Path('COMPLETE').write_text('done\\n')"
+            )
+            job = cr.start_frozen_job(
+                paths,
+                task,
+                {
+                    "name": "dirty source run",
+                    "command": [cr.sys.executable, "-c", script],
+                    "completion_marker": "COMPLETE",
+                },
+            )
+            try:
+                returncode = cr.server_job_run(project_id, job["run_id"])
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+
+            finished = cr.load_server_job(paths, job["run_id"])
+            assert finished is not None
+            self.assertEqual(returncode, 1)
+            self.assertEqual(finished["state"], "SOURCE_DIRTY")
+            self.assertEqual(finished["exit_code"], 0)
+            self.assertTrue(finished["completion_marker_present"])
+            self.assertFalse(finished["source_integrity"]["tracked_clean"])
+            self.assertFalse(finished["source_integrity"]["head_matches_source"])
+            self.assertIn("tracked.txt", finished["source_integrity"]["tracked_changes"])
+
+    def test_server_runner_launches_only_after_test_from_squashed_result(self) -> None:
+        home = self.base / "mediated-home"
+        home.mkdir()
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            project_id, task_id, paths = ServerRunnerTests.prepare_server_task(self, home)
+            task = cr.load_server_task(paths, task_id)
+            assert task is not None
+            task["job_policy"] = "launch"
+            task["test_cmd"] = "grep -q CODEX tracked.txt"
+            fake_codex = Path(task["tools"]["codex"])
+            request = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "name": "mediated launch",
+                "command": [cr.sys.executable, "-c", "print('job')"],
+                "gpus": "0,1",
+                "completion_marker": "",
+                "resume_command": "",
+                "metadata": {"panel": "heldout"},
+                "requested_at": cr.utc_now(),
+            }
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "sys.stdin.read()\n"
+                "root = pathlib.Path.cwd()\n"
+                "(root / 'tracked.txt').write_text('one\\ntwo\\nCODEX\\nfour\\n')\n"
+                f"(root / {cr.JOB_REQUEST_RELATIVE!r}).write_text(json.dumps({request!r}))\n"
+                "print(json.dumps({'type': 'thread.started', 'thread_id': 'thread-job'}), flush=True)\n"
+                "print(json.dumps({'type': 'turn.completed'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            cr.save_server_task(paths, task)
+            try:
+                returncode = cr.server_run(project_id, task_id)
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+
+            finished = cr.load_server_task(paths, task_id)
+            assert finished is not None
+            self.assertEqual(returncode, 0)
+            self.assertEqual(finished["state"], "READY")
+            self.assertEqual(finished["tests"]["exit_code"], 0)
+            self.assertIn("launched_job", finished)
+            run_id = finished["launched_job"]["run_id"]
+            job = cr.load_server_job(paths, run_id)
+            assert job is not None
+            self.assertEqual(job["source_sha"], finished["result_sha"])
+            self.assertEqual(job["source_task_id"], task_id)
+            self.assertEqual(job["metadata"]["panel"], "heldout")
+            tree_paths = command(
+                "git", "--git-dir", paths["broker"], "ls-tree", "-r", "--name-only", finished["result_sha"]
+            ).stdout.splitlines()
+            self.assertNotIn(cr.JOB_REQUEST_RELATIVE, tree_paths)
+
+    def test_runner_refuses_job_launch_without_configured_test(self) -> None:
+        home = self.base / "no-test-home"
+        home.mkdir()
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            project_id, task_id, paths = ServerRunnerTests.prepare_server_task(self, home)
+            task = cr.load_server_task(paths, task_id)
+            assert task is not None
+            task["job_policy"] = "launch"
+            task["test_cmd"] = None
+            fake_codex = Path(task["tools"]["codex"])
+            request = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "name": "must not launch",
+                "command": [cr.sys.executable, "-c", "print('unsafe launch')"],
+                "gpus": "0,1",
+                "completion_marker": "",
+                "resume_command": "",
+                "metadata": {},
+                "requested_at": cr.utc_now(),
+            }
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "sys.stdin.read()\n"
+                "root = pathlib.Path.cwd()\n"
+                "(root / 'tracked.txt').write_text('one\\ntwo\\nCODEX\\nfour\\n')\n"
+                f"(root / {cr.JOB_REQUEST_RELATIVE!r}).write_text(json.dumps({request!r}))\n"
+                "print(json.dumps({'type': 'turn.completed'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            cr.save_server_task(paths, task)
+            try:
+                returncode = cr.server_run(project_id, task_id)
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+
+            finished = cr.load_server_task(paths, task_id)
+            assert finished is not None
+            self.assertEqual(returncode, 0)
+            self.assertEqual(finished["state"], "READY_JOB_NOT_LAUNCHED")
+            self.assertIn("No test command is configured", finished["job_launch_error"])
+            self.assertNotIn("launched_job", finished)
+            self.assertEqual(list(paths["jobs_state"].glob("*/run.json")), [])
+
+    def test_analysis_command_is_noninteractive_and_read_only(self) -> None:
+        job = {
+            "tools": {"codex": "/opt/codex"},
+            "state_dir": "/tmp/run-state",
+            "model": "gpt-test",
+            "profile": "server",
+            "reasoning_effort": "high",
+        }
+        command_value = cr.job_analysis_command(job)
+        self.assertEqual(command_value[:4], ["/opt/codex", "--ask-for-approval", "never", "exec"])
+        self.assertEqual(command_value[command_value.index("--sandbox") + 1], "read-only")
+        self.assertIn("--output-schema", command_value)
+        self.assertIn("--output-last-message", command_value)
+        self.assertEqual(command_value[-1], "-")
+
+    def test_failed_analysis_cannot_reuse_stale_structured_output(self) -> None:
+        home = self.base / "analysis-home"
+        home.mkdir()
+        project_id = "analysis-project"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            state_dir = paths["jobs_state"] / "run-analysis"
+            state_dir.mkdir(parents=True)
+            fake_codex = home / "codex"
+            fake_codex.write_text(
+                "#!/bin/sh\ncat >/dev/null\nexit 0\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            stale = {
+                "run_complete": True,
+                "summary": "stale",
+                "source_and_command": "stale",
+                "coverage_checks": [],
+                "headline_results": [],
+                "anomalies": [],
+                "supported_conclusions": [],
+                "unsupported_conclusions": [],
+                "recommended_actions": [],
+            }
+            cr.atomic_write_json(state_dir / "analysis.json", stale)
+            (state_dir / "analysis.md").write_text("stale\n", encoding="utf-8")
+            job = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "run_id": "run-analysis",
+                "name": "analysis",
+                "state": "SUCCEEDED",
+                "created_at": cr.utc_now(),
+                "state_dir": str(state_dir),
+                "worktree": str(self.root),
+                "results_dir": str(state_dir / "results"),
+                "checkpoints_dir": str(state_dir / "checkpoints"),
+                "source_sha": git(self.root, "rev-parse", "HEAD").stdout.strip(),
+                "command": ["true"],
+                "tools": {"codex": str(fake_codex)},
+            }
+            cr.save_server_job(paths, job)
+            returncode = cr.server_job_analyze(project_id, "run-analysis")
+            finished = cr.load_server_job(paths, "run-analysis")
+            assert finished is not None
+
+        self.assertEqual(returncode, 1)
+        self.assertEqual(finished["analysis"]["state"], "FAILED")
+        self.assertFalse((state_dir / "analysis.json").exists())
+        self.assertFalse((state_dir / "analysis.md").exists())
+
+    def test_global_agents_install_preserves_user_content_and_replaces_managed_block(self) -> None:
+        home = self.base / "agents-home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            target = home / ".codex" / "AGENTS.md"
+            target.parent.mkdir()
+            target.write_text("# My existing instructions\n\nKeep this.\n", encoding="utf-8")
+            content = "# Managed\n\n- First version.\n"
+            payload = {
+                "content": content,
+                "sha256": cr.hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            }
+            cr.server_install_agents("agents-project", payload)
+            replacement = "# Managed\n\n- Replacement.\n"
+            payload = {
+                "content": replacement,
+                "sha256": cr.hashlib.sha256(replacement.encode("utf-8")).hexdigest(),
+            }
+            cr.server_install_agents("agents-project", payload)
+            value = target.read_text(encoding="utf-8")
+
+        self.assertIn("# My existing instructions", value)
+        self.assertIn("Keep this.", value)
+        self.assertIn("- Replacement.", value)
+        self.assertNotIn("- First version.", value)
+        self.assertEqual(value.count(cr.GLOBAL_AGENTS_BEGIN), 1)
+        self.assertEqual(value.count(cr.GLOBAL_AGENTS_END), 1)
+
+
+    def test_global_agents_install_rejects_duplicate_managed_markers(self) -> None:
+        home = self.base / "duplicate-agents-home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            target = home / ".codex" / "AGENTS.md"
+            target.parent.mkdir()
+            target.write_text(
+                f"{cr.GLOBAL_AGENTS_BEGIN}\nfirst\n{cr.GLOBAL_AGENTS_END}\n"
+                f"{cr.GLOBAL_AGENTS_BEGIN}\nsecond\n{cr.GLOBAL_AGENTS_END}\n",
+                encoding="utf-8",
+            )
+            content = "# Managed\n"
+            payload = {
+                "content": content,
+                "sha256": cr.hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            }
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.server_install_agents("agents-project", payload)
+        self.assertEqual(caught.exception.code, "MALFORMED_MANAGED_BLOCK")
+
+
 class PromptInputTests(RepositoryTestCase):
     def test_subprocess_without_explicit_input_cannot_consume_parent_stdin(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -1092,6 +1657,7 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertIn("--json", value)
         self.assertEqual(value[value.index("--sandbox") + 1], "workspace-write")
         self.assertIn("model_reasoning_effort=high", value)
+        self.assertTrue(any("developer_instructions=" in item for item in value))
         self.assertEqual(value[-1], "-")
 
     def test_interactive_codex_command_launches_normal_tui_with_approvals(self) -> None:
@@ -1111,6 +1677,7 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertIn("gpt-test", value)
         self.assertIn("server", value)
         self.assertIn("model_reasoning_effort=high", value)
+        self.assertTrue(any("developer_instructions=" in item for item in value))
 
     def test_interactive_command_reuses_active_interactive_task(self) -> None:
         args = argparse.Namespace(max_untracked_bytes=1024)
@@ -1268,6 +1835,7 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertEqual(value["data_links"], args.data_link)
         self.assertEqual(value["reasoning_effort"], "high")
         self.assertTrue(value["enable_search"])
+        self.assertEqual(value["job_policy"], "deny")
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 

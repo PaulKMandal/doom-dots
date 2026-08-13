@@ -6,6 +6,13 @@ The laptop checkout remains canonical: Codex receives an exact hidden snapshot,
 runs on the server under `tmux`, and returns only its additional changes as
 ordinary unstaged local modifications.
 
+It also adds a separate frozen experiment-job layer. An explicitly authorized
+Codex task may submit one structured launch request, but Codex cannot detach the
+process itself. The trusted runner validates the request, requires the configured
+smoke/test command to pass, freezes the exact result revision into a dedicated
+worktree, and launches a job that is independent of both Emacs and the Codex
+session.
+
 ## Behavior preserved from the existing configuration
 
 The existing bindings retain their current meanings:
@@ -28,66 +35,93 @@ The Codex worktree is never placed in `my/remote-dir`, so the existing
 
 ## Added bindings
 
-The new commands are under `SPC r c`:
+### Codex editing commands
+
+The Codex commands are under `SPC r c`:
 
 | Binding | Action |
 | --- | --- |
 | `SPC r c d` | check local/server prerequisites and Codex authentication |
-| `SPC r c s` | start a managed noninteractive `codex exec` task |
+| `SPC r c s` | start an ordinary managed noninteractive `codex exec` task |
+| `SPC r c S` | start Codex with authorization to request one frozen experiment job |
 | `SPC r c t` | show task and local orchestration status |
-| `SPC r c a` | monitor a live task in a read-only built-in Term buffer |
-| `SPC r c i` | start or reattach to a managed interactive Codex TUI in kitty |
-| `SPC r c j` | open a terminal prompt/watcher for the same one-shot job as `SPC r c s` |
-| `SPC r c l` | show the logs preserved for the current task |
+| `SPC r c a` | monitor a live Codex task in a read-only built-in Term buffer |
+| `SPC r c i` | start or reattach to an ordinary managed interactive Codex TUI in kitty |
+| `SPC r c I` | start or reattach to interactive Codex with one frozen job authorized |
+| `SPC r c j` | open the ordinary one-shot Codex prompt/watcher in kitty |
+| `SPC r c l` | show preserved task, Codex, environment, and test logs |
 | `SPC r c r` | safely publish a preserved orphaned/failed worktree without rerunning Codex |
 | `SPC r c f` | fetch, integrate, and apply the completed Codex delta locally |
-| `SPC r c x` | request cancellation while preserving the worktree |
-| `SPC r c c` | archive an already-imported task and remove remote worktree/refs |
+| `SPC r c x` | request Codex-task cancellation while preserving its worktree |
+| `SPC r c c` | archive an already-imported task and remove its worktree/refs |
 | `SPC r c X` | explicitly discard a task and its unimported work |
+| `SPC r c g` | install/update the managed global `~/.codex/AGENTS.md` block on the server |
+| `SPC r c A` | create from the research template, or open, the project `AGENTS.md` |
 
-With a region active, `SPC r c s` sends the region as the prompt. With a prefix
-argument (`C-u SPC r c s`), it opens a multiline prompt buffer; submit with
-`C-c C-c` or cancel with `C-c C-k`.
+Lowercase `s` and `i` never authorize a detached or long-running launch. Uppercase
+`S` and `I` authorize exactly one runner-mediated request for the new task. An
+already-running interactive task retains the policy with which it started;
+reattaching with `I` does not upgrade an ordinary task.
 
-`SPC r c s` is the one-shot mode: it sends a task prompt to noninteractive
-`codex exec`, then the runner finalizes and publishes the result automatically.
+With a region active, `SPC r c s` or `SPC r c S` sends the region as the prompt.
+With a prefix argument, either command opens a multiline prompt buffer; submit
+with `C-c C-c` or cancel with `C-c C-k`.
 
-`SPC r c j` starts that same one-shot mode from an external terminal. The
-terminal accepts a multiline prompt until `Ctrl-D`, submits it through the same
-`codex-remote start` backend, and watches the durable task's status and logs.
-Closing the watcher or pressing `Ctrl-C` after launch does not cancel the server
-job. The completed result is still imported with `SPC r c f`; this is not a
-second task type or a separate Git path.
+`SPC r c s` is the ordinary one-shot mode: it sends a task prompt to
+noninteractive `codex exec`, then the runner finalizes and publishes the result
+automatically. `SPC r c S` uses the same editing and import path but additionally
+allows Codex to create one structured experiment request through
+`"$CODEX_JOBCTL"`. The runner—not Codex—decides whether the authorization,
+source, environment, and smoke-test gates permit launch.
 
-`SPC r c i` is the conversational mode. If the project has no outstanding task,
-it creates the same hidden local snapshot and isolated server worktree as
-`SPC r c s`, but launches the ordinary interactive Codex TUI in a durable
-server-side `tmux` session and opens it in a separate kitty window. Running
-`SPC r c i` again while that TUI is active reattaches to the same session; it
-does not create another snapshot or task. Closing kitty, detaching with
+`SPC r c j` starts the same ordinary one-shot editing mode from an external
+terminal. It intentionally has no frozen-job authorization. The terminal accepts
+a multiline prompt until `Ctrl-D`, submits it through the same `codex-remote
+start` backend, and watches the durable task's status and logs. Closing the
+watcher or pressing `Ctrl-C` after launch does not cancel the server-side Codex
+task. Import its completed code changes with `SPC r c f`.
+
+`SPC r c i` is the ordinary conversational mode. If the project has no
+outstanding task, it creates the same hidden snapshot and isolated server
+worktree as `SPC r c s`, launches the Codex TUI under durable remote `tmux`, and
+opens it in kitty. Run it again to reattach. Closing kitty, detaching with
 `C-b d`, losing SSH, or suspending the laptop detaches only the client. Exit the
-Codex TUI with `/exit` or `/quit` when the coding session is complete; the
-runner then checks, finalizes, tests, and publishes the worktree so `SPC r c f`
-can import it. `SPC r c f` refuses while the interactive TUI remains active and
-tells you to reattach and exit first.
+TUI with `/exit` or `/quit`; the enclosing runner then finalizes, validates, and
+publishes the worktree. `SPC r c I` behaves identically but permits one
+runner-mediated experiment request.
 
 `SPC r c a` is a read-only monitor for either task mode through Emacs's built-in
-Term emulator. It does not depend on the native `vterm` module. The monitor is
-available only while the runner pane is live; after exit, use `SPC r c l` for
-preserved runner and test logs. Use `SPC r c x` to request cancellation rather
-than sending control input through the read-only monitor.
+Term emulator. After the pane exits, use `SPC r c l` for preserved logs. Use
+`SPC r c x` for cancellation rather than sending control input through the
+read-only monitor.
 
-The `s`, `j`, and `i` entry points share the same
-one-outstanding-task-per-project rule. `s` and `j` are two frontends for the
-same noninteractive mode; `i` is conversational. An active or completed task
-in either execution mode must be imported, archived, or explicitly discarded
-before another task can start.
+The `s`, `S`, `j`, `i`, and `I` entry points share the same
+one-outstanding-Codex-task-per-project rule. A task must be imported, archived,
+or explicitly discarded before another can start. Frozen experiment jobs are
+separate objects and may continue after their source Codex task is imported or
+archived.
 
 For one-shot tasks, `SPC r c l` includes the structured Codex event stream,
-stderr, final message, runner log, and test logs. For interactive TUI tasks it
-preserves the runner, environment-refresh, and test logs, but not a complete
-terminal transcript; inspect the live TUI before exiting when that context is
-important.
+stderr, final message, runner log, and test logs. For interactive tasks it
+preserves runner, environment-refresh, and test logs, but not a complete terminal
+transcript.
+
+### Frozen experiment-job commands
+
+Experiment-job commands are under `SPC r j`:
+
+| Binding | Action |
+| --- | --- |
+| `SPC r j l` | list all frozen jobs for the current project |
+| `SPC r j s` | select a job and show its manifest/runtime status |
+| `SPC r j t` | select a job and show recent bootstrap, run, and analysis logs |
+| `SPC r j a` | select an active job and monitor its `tmux` pane read-only |
+| `SPC r j x` | select and stop an active job after confirmation |
+| `SPC r j i` | start a read-only Codex interpretation of a finished job |
+| `SPC r j r` | show the latest structured interpretation as Markdown |
+
+These commands select from the project-scoped run registry. They do not require
+the source Codex editing task to remain active.
 
 ## Requirements
 
@@ -132,8 +166,9 @@ Codex configuration and authentication are used.
 
 ## Installation
 
-Apply the patch series from the root of the Doom configuration repository, then
-ensure the backend is executable and reload Doom:
+Use the modified repository archive, or apply the supplied patch from the root
+of the Doom configuration repository. Then ensure the backends are executable
+and reload Doom:
 
 ```sh
 chmod +x bin/codex-remote bin/codex-remote-job
@@ -235,13 +270,24 @@ source ownership and permissions must enforce read-only access when required.
 The backend rejects symlinked target parents so a configured link cannot be
 redirected outside the isolated worktree.
 
-Place stable project instructions in a checked-in `AGENTS.md`, including:
+Run `SPC r c g` once per server account to install the managed global working
+agreement in `~/.codex/AGENTS.md`. The command preserves content outside its
+marked managed block, so personal server-wide instructions can coexist with the
+Doom-managed policy.
 
-- the Nix/uv setup and test commands Codex should use;
-- generated-file policy;
-- experiment constraints;
-- paths Codex must not modify;
-- whether large data is read-only and how it should be accessed.
+Run `SPC r c A` in each research repository to create or open a checked-in
+project `AGENTS.md`. The supplied template covers immutable results, frozen
+panels and splits, seeds, model/control substitutions, smoke tests, job requests,
+and read-only interpretation. Tailor it to include the repository's exact Nix or
+uv commands, generated-file policy, experiment constraints, protected paths, and
+read-only data locations, then review and commit it normally.
+
+A frozen-job launch requires a nonempty `my/codex-remote-test-cmd` or inherited
+`my/remote-test-cmd`. The command should be a bounded unit/smoke validation, not
+the full experiment. A Codex request is preserved but deliberately not launched
+when no test command is configured, the environment refresh fails or dirties the
+source tree, the test fails or dirties the source tree, Codex exits nonzero, or
+the task is cancelled.
 
 ## Normal workflows
 
@@ -313,6 +359,156 @@ After ordinary `SPC r s`, a nonblocking status probe notifies you when a
 completed Codex result is still waiting to be imported. It does not change or
 block the existing rsync command and does not import automatically.
 
+## Frozen experiment jobs
+
+### Launch protocol
+
+Use `SPC r c S` for a one-shot implementation-and-launch task or `SPC r c I`
+for an interactive session. Describe both the code/validation work and the
+intended experiment in the prompt. Once the implementation is ready, Codex may
+make exactly one request using the helper exposed in its environment:
+
+```sh
+"$CODEX_JOBCTL" request \
+  --name "heldout transfer confirmation" \
+  --gpus 0,1 \
+  --completion-marker outputs/heldout_COMPLETE \
+  --resume-command "python -m experiments.transfer --resume --tag heldout" \
+  --metadata panel=confirmation \
+  --metadata seed=17 \
+  -- python -m experiments.transfer --tag heldout --seed 17
+```
+
+The command after `--` is stored and executed as an argv array rather than a
+second shell string. Metadata values are descriptive provenance; they do not
+replace the exact command or repository-specific run manifest.
+
+After Codex exits, the trusted runner:
+
+1. consumes and removes the request file so it cannot enter the returned source
+   tree;
+2. safety-checks and publishes a single sanitized result revision;
+3. refreshes the server environment when a supported lock file changed;
+4. runs the configured bounded test/smoke command against that exact result;
+5. refuses launch unless Codex, environment validation, and tests all succeeded
+   without dirtying nonignored source files;
+6. creates a pinned hidden source ref and a dedicated detached worktree;
+7. records the run manifest and starts a separate `tmux` runner;
+8. recreates the configured bootstrap environment inside that fresh frozen
+   worktree before exposing data links or starting the experiment command.
+
+Codex is explicitly instructed not to use `tmux`, `nohup`, shell backgrounding,
+`systemd`, or a scheduler directly. Ordinary lowercase task modes reject even a
+manually created request. The uppercase command is therefore a meaningful
+resource-authorization boundary, not a different prompt label.
+
+The experiment command itself runs as the ordinary remote user rather than
+inside the Codex editing sandbox. This is necessary for the repository's real
+environment, datasets, and GPUs, but it also means `SPC r c S` and
+`SPC r c I` should be used only for a trusted repository and a reviewed task
+description on a nonprivileged server account. The runner validates provenance
+and launch gates; it is not a container or a semantic malware detector for the
+requested program.
+
+The code result and experiment lifecycle are independent after launch. Import
+and review the source changes with `SPC r c f`; archiving that Codex task does
+not stop or delete its experiment job. The job executes from the frozen result
+SHA, so subsequent Codex or local edits cannot alter the source under the run.
+
+### Run identity and layout
+
+Each run has a unique ID and records the exact argv, source SHA, source task,
+host, platform, Python and Git versions, requested and effective GPU visibility,
+known lock-file hashes, the frozen-worktree bootstrap command and outcome,
+timestamps, completion marker, resume text, model/profile settings, metadata,
+process identity, exit code, and analysis state.
+
+The server run directory contains:
+
+```text
+~/.local/state/codex-remote/jobs/<project-id>/<run-id>/
+├── run.json
+├── status.json
+├── command.txt
+├── bootstrap-command.txt       # when a bootstrap command is configured
+├── source-snapshot.txt
+├── environment.txt
+├── bootstrap.log               # when bootstrap is configured
+├── run.log
+├── checkpoints/
+├── results/
+├── analysis-schema.json        # after interpretation starts
+├── analysis.json               # structured Codex result
+├── analysis.jsonl              # Codex event stream
+├── analysis.stderr.log
+└── analysis.md
+```
+
+The frozen source worktree is separate:
+
+```text
+~/.local/share/codex-remote/job-worktrees/<project-id>/<run-id>/
+```
+
+The frozen runner first executes the same configured bootstrap command in the
+new worktree. It refuses to continue if bootstrap exits nonzero, moves `HEAD`,
+changes tracked files, or leaves nonignored files. Ignored local environment
+state such as `.venv` may remain for the experiment command. Configured data
+links are exposed only after bootstrap succeeds and exist only while the
+experiment command is active. The runner verifies and removes them before
+marking the run terminal, so later interpretation is limited to the frozen
+source and captured run artifacts.
+
+The launched command receives:
+
+```text
+CODEX_RUN_ID
+CODEX_RUN_DIR
+CODEX_RESULTS_DIR
+CODEX_CHECKPOINTS_DIR
+CODEX_SOURCE_SHA
+CUDA_VISIBLE_DEVICES            # only when --gpus was supplied
+```
+
+Repository launchers should write durable artifacts to the results/checkpoints
+paths, record their own experiment-specific configuration, avoid overwriting
+completed outputs, and support resume by missing group/shard when practical.
+The optional completion marker is relative to the frozen worktree, must be
+absent before launch and remain absent through bootstrap, must not traverse a
+symlink parent, and must finish as a regular non-symlink file. It is checked in
+addition to the process exit code.
+
+Job states are `STARTING`, `BOOTSTRAPPING`, `RUNNING`, and `STOP_REQUESTED`
+while active; `SUCCEEDED`, `FAILED`, `INCOMPLETE`, `SOURCE_DIRTY`, `STOPPED`, or `ORPHANED`
+when terminal. Exit code zero without newly created completion evidence is
+`INCOMPLETE`, not success. A command that moves `HEAD` or changes tracked files
+relative to the recorded source SHA is `SOURCE_DIRTY`; untracked worktree
+artifacts are recorded in the manifest even when the run otherwise succeeds.
+
+### Read-only interpretation
+
+After a job is terminal, `SPC r j i` starts a separate Codex process with
+read-only sandboxing and no approvals. It is required to inspect the manifest,
+exit status, completion marker, expected groups/rows/shards, malformed or
+zero-byte artifacts, metrics and uncertainty, anomalies, and supported versus
+unsupported conclusions. A JSON Schema constrains the final result; the runner
+also renders it to `analysis.md`. `SPC r j r` displays that Markdown report.
+Interpretation cannot repair, relaunch, stop, or delete the run.
+
+### Persistence and reboot behavior
+
+Closing Emacs, suspending the laptop, losing SSH, exiting Codex, importing its
+source changes, or archiving the Codex task does not stop a launched experiment.
+A server reboot still terminates ordinary processes and `tmux`. On the next
+status check, a vanished active process is marked `ORPHANED`; the source
+worktree, manifest, logs, checkpoints, results, and recorded resume command are
+retained. Automatic restart is intentionally not attempted because safe resume
+semantics are experiment-specific.
+
+No automatic experiment-job cleanup is performed. This protects provenance but
+means old frozen worktrees and run directories should be reviewed and removed
+manually only after their artifacts and source identity are no longer needed.
+
 ## State model
 
 Important states include:
@@ -333,7 +529,14 @@ Important states include:
   was configured to refresh the server environment.
 - `READY_RECOVERED_UNVERIFIED`: `SPC r c r` published an orphaned/failed
   worktree without rerunning Codex, the environment refresh, or server tests.
-- `NOOP`: Codex made no changes; import acknowledges the task.
+- `READY_JOB_NOT_LAUNCHED`: Codex requested an experiment, but one of the
+  authorization/validation gates prevented launch; the code result remains
+  importable and the exact reason is retained.
+- `READY_JOB_PREPARED`: a validated request was recorded under the backend's
+  non-launching preparation policy. This policy is available to the backend but
+  is not bound in the default Doom UI.
+- `NOOP`: Codex made no changes; import acknowledges the task. A successful
+  frozen job can still have a `NOOP` source task when no code change was needed.
 - `CANCELLED_READY` / `CANCELLED_NOOP`: cancellation completed with or without
   changes.
 - `BLOCKED_UNSAFE_RESULT`: publication was blocked by the safety filter.
@@ -453,13 +656,18 @@ without applying the patch twice.
 
 ### Crash or reboot
 
-`SPC r c t` classifies a vanished active runner as `ORPHANED`; the worktree,
-logs, task inputs, frozen helper, and refs are retained. Inspect with logs/status.
+For a Codex editing task, `SPC r c t` classifies a vanished active runner as
+`ORPHANED`; the worktree, logs, task inputs, frozen helper, and refs are retained.
 Use `SPC r c r` to acquire the project lock, safety-check and publish the
 preserved worktree without rerunning Codex. The result becomes
-`READY_RECOVERED_UNVERIFIED`, and `SPC r c f` warns before importing because
-server tests were not rerun. Use explicit discard only after deciding the work
-is no longer needed.
+`READY_RECOVERED_UNVERIFIED`, and `SPC r c f` warns before import because server
+tests were not rerun.
+
+For a frozen experiment, `SPC r j s` marks a vanished active runner/process
+`ORPHANED` while preserving its independent worktree and run directory. The
+recorded resume command is advisory; relaunch is not automatic. Resume through
+the repository's experiment-specific, idempotent mechanism after inspecting
+partial outputs and checkpoints.
 
 ### Cancellation
 
@@ -475,7 +683,9 @@ Per project, the backend uses:
 ```text
 ~/.local/share/codex-remote/repos/<project-id>.git
 ~/.local/share/codex-remote/worktrees/<project-id>/<task-id>
+~/.local/share/codex-remote/job-worktrees/<project-id>/<run-id>
 ~/.local/state/codex-remote/<project-id>/<task-id>/
+~/.local/state/codex-remote/jobs/<project-id>/<run-id>/
 ~/.local/state/codex-remote/locks/<project-id>.lock
 ```
 
@@ -485,8 +695,10 @@ Local orchestration metadata and temporary conflict worktrees live under:
 ~/.local/state/codex-remote/<project-id>/
 ```
 
-Do not delete these directories while a task is active. `SPC r c c` and
-`SPC r c X` perform guarded cleanup.
+Do not delete these directories while a task or job is active. `SPC r c c` and
+`SPC r c X` perform guarded cleanup only for the Codex editing task; they never
+remove a frozen experiment. Experiment retention is deliberately explicit and
+manual.
 
 ## Tests
 
@@ -521,8 +733,12 @@ backup branches with exact task-input reconstruction, result publication,
 cancellation during bootstrap, lock-file-triggered environment refresh,
 configured tests, noninteractive and interactive Codex command construction,
 managed interactive task reuse/finalization, orphaned-worktree publication,
-terminal-job configuration and log following, and refusal to import a live
-interactive session.
+terminal-job configuration and log following, refusal to import a live
+interactive session, structured job-request validation and authorization,
+mandatory prelaunch tests, frozen-worktree environment bootstrapping, fast-job
+startup races, frozen-source manifests and execution, task/job separation,
+read-only structured analysis commands, global `AGENTS.md` managed
+block replacement, and the new Doom command construction/status renderers.
 
 A real acceptance test still requires your actual SSH alias and authenticated
 server. Use a disposable project change first, verify the remote paths printed
@@ -536,10 +752,12 @@ The feature is isolated to:
 - `bin/codex-remote`
 - `bin/codex-remote-job`
 - `lisp/codex-remote.el`
+- `templates/codex/global-AGENTS.md`
+- `templates/codex/research-AGENTS.md`
 - the `load!`, keybindings, and popup rule added to `config.el`
 - tests and this documentation
 
-Reverting the patch series removes the feature without changing
+Reverting the supplied patch removes the feature without changing
 `lisp/remote-dev.el` or any preexisting remote binding. Remote task state is not
 automatically deleted when code is reverted; archive or discard active tasks
 first, or retain the state directories for manual recovery.
