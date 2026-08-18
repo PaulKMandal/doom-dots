@@ -2987,8 +2987,14 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
             "model": payload.get("model")
             or (DEFAULT_INTERACTIVE_MODEL if execution_mode == "interactive" else None),
             "profile": payload.get("profile"),
-            "reasoning_effort": payload.get("reasoning_effort")
-            or (DEFAULT_INTERACTIVE_REASONING if execution_mode == "interactive" else None),
+            # Managed interactive sessions are deliberately pinned to Extra High.
+            # Project-local `high` settings remain available to one-shot tasks, but
+            # must not silently reduce the autonomous SPC r c i workflow.
+            "reasoning_effort": (
+                DEFAULT_INTERACTIVE_REASONING
+                if execution_mode == "interactive"
+                else payload.get("reasoning_effort")
+            ),
             "approval_policy": (
                 DEFAULT_INTERACTIVE_APPROVAL_POLICY
                 if execution_mode == "interactive"
@@ -3385,7 +3391,9 @@ def interactive_codex_command(task: Mapping[str, Any]) -> list[str]:
             str(task.get("model") or DEFAULT_INTERACTIVE_MODEL),
             "--config",
             "model_reasoning_effort="
-            + str(task.get("reasoning_effort") or DEFAULT_INTERACTIVE_REASONING),
+            + json.dumps(
+                str(task.get("reasoning_effort") or DEFAULT_INTERACTIVE_REASONING)
+            ),
             "--config",
             "developer_instructions=" + json.dumps(codex_job_instructions(task)),
         ]

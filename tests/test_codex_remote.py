@@ -539,7 +539,9 @@ class ServerStartTests(RepositoryTestCase):
                 "max_untracked_bytes": 1024 * 1024,
                 "model": None,
                 "profile": None,
-                "reasoning_effort": None,
+                # A project-local lower setting must not reduce managed
+                # interactive sessions below Extra High.
+                "reasoning_effort": "high",
                 "enable_search": False,
                 "lock_hashes": cr.file_hashes(self.root),
                 "created_at": cr.utc_now(),
@@ -1703,7 +1705,7 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertIn("--search", value)
         self.assertIn("gpt-test", value)
         self.assertIn("server", value)
-        self.assertIn("model_reasoning_effort=high", value)
+        self.assertIn('model_reasoning_effort="high"', value)
         self.assertTrue(any("developer_instructions=" in item for item in value))
 
     def test_interactive_codex_command_defaults_to_sol_and_xhigh(self) -> None:
@@ -1718,7 +1720,7 @@ class MiscellaneousTests(RepositoryTestCase):
         }
         value = cr.interactive_codex_command(task)
         self.assertEqual(value[value.index("--model") + 1], "gpt-5.6-sol")
-        self.assertIn("model_reasoning_effort=xhigh", value)
+        self.assertIn('model_reasoning_effort="xhigh"', value)
         self.assertEqual(value[value.index("--ask-for-approval") + 1], "never")
 
     def test_interactive_codex_environment_uses_task_private_tool_cache(self) -> None:

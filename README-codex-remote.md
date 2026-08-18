@@ -84,8 +84,10 @@ task. Import its completed code changes with `SPC r c f`.
 `SPC r c i` is the ordinary conversational mode. If the project has no
 outstanding task, it creates the same hidden snapshot and isolated server
 worktree as `SPC r c s`, launches the Codex TUI under durable remote `tmux`, and
-opens it in kitty. New interactive sessions default to GPT-5.6 Sol at extra-high
+opens it in kitty. New interactive sessions use GPT-5.6 Sol at extra-high
 reasoning and run without approval pauses inside a `workspace-write` sandbox.
+The extra-high setting is enforced for this managed interactive path even when
+an older project `.dir-locals.el` still requests `high`.
 Outbound public-network access is enabled inside that sandbox for project
 dependency resolution, while loopback, private-network destinations, and Unix
 sockets remain blocked except for the standard Nix daemon socket. A task-private
@@ -219,7 +221,9 @@ The following optional variables specialize the isolated Codex worktree:
   `gpt-5.6-sol` when this is nil.
 - `my/codex-remote-profile`: optional server-side Codex profile.
 - `my/codex-remote-reasoning-effort`: `minimal`, `low`, `medium`, `high`, or
-  `xhigh`. Interactive tasks default to `xhigh` when this is nil.
+  `xhigh` for one-shot tasks. Managed interactive `SPC r c i`/`I` sessions are
+  pinned to `xhigh`, so an older project-local `high` value cannot silently
+  reduce their reasoning level.
 - `my/codex-remote-enable-search`: non-nil enables live Codex web search.
 - `my/codex-remote-timeout`: short SSH connection timeout, default 5 seconds.
 - `my/codex-remote-max-untracked-bytes`: per-file transfer limit, default
