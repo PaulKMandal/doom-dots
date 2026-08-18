@@ -559,6 +559,14 @@ class ServerStartTests(RepositoryTestCase):
             self.assertEqual(task["execution_mode"], "interactive")
             self.assertIsNone(task["prompt_path"])
             self.assertTrue(task["tmux_session"].startswith("codexi-"))
+            self.assertEqual(task["model"], cr.DEFAULT_INTERACTIVE_MODEL)
+            self.assertEqual(
+                task["reasoning_effort"], cr.DEFAULT_INTERACTIVE_REASONING
+            )
+            self.assertEqual(
+                task["approval_policy"], cr.DEFAULT_INTERACTIVE_APPROVAL_POLICY
+            )
+            self.assertTrue(task["network_access"])
 
 
 class ServerCleanupTests(RepositoryTestCase):
@@ -880,6 +888,10 @@ class ServerRunnerTests(RepositoryTestCase):
             assert task is not None
             task["execution_mode"] = "interactive"
             task["prompt_path"] = None
+            task["model"] = cr.DEFAULT_INTERACTIVE_MODEL
+            task["reasoning_effort"] = cr.DEFAULT_INTERACTIVE_REASONING
+            task["approval_policy"] = cr.DEFAULT_INTERACTIVE_APPROVAL_POLICY
+            task["network_access"] = True
             task["test_cmd"] = "grep -q INTERACTIVE interactive.txt"
             fake_codex = Path(task["tools"]["codex"])
             fake_codex.write_text(
@@ -1660,24 +1672,80 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertTrue(any("developer_instructions=" in item for item in value))
         self.assertEqual(value[-1], "-")
 
-    def test_interactive_codex_command_launches_normal_tui_with_approvals(self) -> None:
+    def test_interactive_codex_command_is_autonomous_inside_workspace(self) -> None:
+        state_dir = self.base / "interactive-command-state"
         task = {
             "tools": {"codex": "/opt/codex"},
+            "state_dir": str(state_dir),
             "model": "gpt-test",
             "profile": "server",
             "reasoning_effort": "high",
+            "approval_policy": "never",
+            "network_access": True,
             "enable_search": True,
         }
         value = cr.interactive_codex_command(task)
         self.assertEqual(value[0], "/opt/codex")
         self.assertNotIn("exec", value)
         self.assertEqual(value[value.index("--sandbox") + 1], "workspace-write")
-        self.assertEqual(value[value.index("--ask-for-approval") + 1], "on-request")
+        self.assertEqual(value[value.index("--ask-for-approval") + 1], "never")
+        cache = state_dir / "tool-cache"
+        self.assertEqual(value[value.index("--add-dir") + 1], str(cache))
+        self.assertTrue(cache.is_dir())
+        self.assertIn("sandbox_workspace_write.network_access=true", value)
+        self.assertIn("features.network_proxy.enabled=true", value)
+        self.assertIn('features.network_proxy.domains={ "*" = "allow" }', value)
+        self.assertIn(
+            'features.network_proxy.unix_sockets={ '
+            '"/nix/var/nix/daemon-socket/socket" = "allow" }',
+            value,
+        )
         self.assertIn("--search", value)
         self.assertIn("gpt-test", value)
         self.assertIn("server", value)
         self.assertIn("model_reasoning_effort=high", value)
         self.assertTrue(any("developer_instructions=" in item for item in value))
+
+    def test_interactive_codex_command_defaults_to_sol_and_xhigh(self) -> None:
+        task = {
+            "tools": {"codex": "/opt/codex"},
+            "state_dir": str(self.base / "interactive-default-state"),
+            "model": None,
+            "profile": None,
+            "reasoning_effort": None,
+            "network_access": True,
+            "enable_search": False,
+        }
+        value = cr.interactive_codex_command(task)
+        self.assertEqual(value[value.index("--model") + 1], "gpt-5.6-sol")
+        self.assertIn("model_reasoning_effort=xhigh", value)
+        self.assertEqual(value[value.index("--ask-for-approval") + 1], "never")
+
+    def test_interactive_codex_environment_uses_task_private_tool_cache(self) -> None:
+        state_dir = self.base / "interactive-environment-state"
+        task = {
+            "execution_mode": "interactive",
+            "state_dir": str(state_dir),
+            "worktree": str(self.root),
+            "job_policy": "deny",
+        }
+        env = cr.codex_process_environment(task)
+        cache = state_dir / "tool-cache"
+        self.assertEqual(env["XDG_CACHE_HOME"], str(cache))
+        self.assertEqual(env["UV_CACHE_DIR"], str(cache / "uv"))
+        self.assertEqual(env["PIP_CACHE_DIR"], str(cache / "pip"))
+        self.assertTrue(cache.is_dir())
+
+    def test_codex_instructions_authorize_project_dependencies_not_host_activation(self) -> None:
+        instructions = cr.codex_job_instructions(
+            {"execution_mode": "interactive", "job_policy": "deny"}
+        )
+        self.assertIn("uv add", instructions)
+        self.assertIn("nix flake check", instructions)
+        self.assertIn("do not stop after merely proposing a plan", instructions)
+        self.assertIn("Do not use sudo", instructions)
+        self.assertIn("nixos-rebuild", instructions)
+        self.assertIn("systemctl", instructions)
 
     def test_interactive_command_reuses_active_interactive_task(self) -> None:
         args = argparse.Namespace(max_untracked_bytes=1024)

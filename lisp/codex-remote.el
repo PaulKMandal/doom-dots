@@ -314,6 +314,12 @@ ON-ERROR with the parsed JSON object and process buffer."
                                "exec"))
               ("Job policy" . ,(or (my/codex-remote--get task 'job_policy)
                                      "deny"))
+              ("Model" . ,(my/codex-remote--get task 'model))
+              ("Reasoning" . ,(my/codex-remote--get task 'reasoning_effort))
+              ("Approvals" . ,(my/codex-remote--get task 'approval_policy))
+              ("Network" . ,(if (my/codex-remote--get task 'network_access)
+                                  "enabled in sandbox"
+                                "sandbox default"))
               ("Task" . ,(my/codex-remote--get task 'task_id))
               ("Project" . ,(my/codex-remote--get task 'project_name))
               ("Started" . ,(or (my/codex-remote--get task 'codex_started_at)

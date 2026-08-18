@@ -74,6 +74,9 @@ LOCAL_RESOLVED_STATES = {"IMPORTED", "DISCARDED", "ARCHIVED"}
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,254}$")
 SAFE_REASONING = {"minimal", "low", "medium", "high", "xhigh"}
+DEFAULT_INTERACTIVE_MODEL = "gpt-5.6-sol"
+DEFAULT_INTERACTIVE_REASONING = "xhigh"
+DEFAULT_INTERACTIVE_APPROVAL_POLICY = "never"
 EXECUTION_MODES = {"exec", "interactive"}
 INTERACTIVE_ATTACH_STATES = {"STARTING", "BOOTSTRAPPING", "RUNNING"}
 
@@ -2698,6 +2701,18 @@ def codex_job_instructions(task: Mapping[str, Any]) -> str:
         "result directories. Do not inspect unrelated repositories, SSH keys, credentials, "
         "tokens, or secret files. Run bounded foreground tests normally."
     )
+    if task_execution_mode(task) == "interactive":
+        base += (
+            " When the user asks you to implement, build, fix, or change something, carry "
+            "the in-scope task through inspection, editing, relevant non-destructive "
+            "validation, failure diagnosis, and iteration; do not stop after merely "
+            "proposing a plan or ask for routine worktree actions. You may update project "
+            "dependency declarations and lock files when the task requires it, including "
+            "flake.nix, flake.lock, pyproject.toml, and uv.lock, and may run uv add, uv sync, "
+            "nix develop, nix build, and nix flake check. Do not use sudo, doas, su, "
+            "nixos-rebuild, home-manager switch, nix profile, nix-env, systemctl, or any "
+            "other host activation or service-management command."
+        )
     if policy == "launch":
         return base + (
             " One frozen long-running experiment launch is explicitly authorized, but you "
@@ -2721,6 +2736,19 @@ def codex_job_instructions(task: Mapping[str, Any]) -> str:
     )
 
 
+def interactive_tool_cache_dir(task: Mapping[str, Any]) -> Path:
+    """Return the task-private writable cache exposed to interactive Codex."""
+    state_dir = task.get("state_dir")
+    if not isinstance(state_dir, str) or not state_dir:
+        raise CodexRemoteError(
+            "Interactive Codex task is missing its state directory",
+            code="INVALID_TASK_STATE",
+        )
+    cache = Path(state_dir) / "tool-cache"
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return cache
+
+
 def codex_process_environment(task: Mapping[str, Any]) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
@@ -2732,6 +2760,15 @@ def codex_process_environment(task: Mapping[str, Any]) -> dict[str, str]:
             ),
         }
     )
+    if task_execution_mode(task) == "interactive":
+        cache = interactive_tool_cache_dir(task)
+        env.update(
+            {
+                "XDG_CACHE_HOME": str(cache),
+                "UV_CACHE_DIR": str(cache / "uv"),
+                "PIP_CACHE_DIR": str(cache / "pip"),
+            }
+        )
     return env
 
 
@@ -2787,6 +2824,12 @@ def cleanup_server_task_artifacts(
                     removed.stderr,
                 )
     run(["git", "--git-dir", paths["broker"], "worktree", "prune"], check=False)
+    state_dir_value = task.get("state_dir")
+    if isinstance(state_dir_value, str) and state_dir_value:
+        tool_cache = Path(state_dir_value) / "tool-cache"
+        if tool_cache.exists():
+            shutil.rmtree(tool_cache)
+            task["tool_cache_cleaned_at"] = utc_now()
     for key in ("input_ref", "result_ref"):
         ref = task.get(key)
         if isinstance(ref, str) and ref.startswith("refs/codex/"):
@@ -2941,9 +2984,17 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
             "test_cmd": payload.get("test_cmd"),
             "data_links": links,
             "max_untracked_bytes": int(payload.get("max_untracked_bytes") or DEFAULT_MAX_UNTRACKED_BYTES),
-            "model": payload.get("model"),
+            "model": payload.get("model")
+            or (DEFAULT_INTERACTIVE_MODEL if execution_mode == "interactive" else None),
             "profile": payload.get("profile"),
-            "reasoning_effort": payload.get("reasoning_effort"),
+            "reasoning_effort": payload.get("reasoning_effort")
+            or (DEFAULT_INTERACTIVE_REASONING if execution_mode == "interactive" else None),
+            "approval_policy": (
+                DEFAULT_INTERACTIVE_APPROVAL_POLICY
+                if execution_mode == "interactive"
+                else "never"
+            ),
+            "network_access": execution_mode == "interactive",
             "enable_search": bool(payload.get("enable_search")),
             "job_policy": payload.get("job_policy", "deny"),
             "lock_hashes": payload.get("lock_hashes") or {},
@@ -3297,24 +3348,44 @@ def codex_command(task: Mapping[str, Any]) -> list[str]:
 
 
 def interactive_codex_command(task: Mapping[str, Any]) -> list[str]:
-    """Build the ordinary interactive Codex TUI invocation for TASK."""
+    """Build an autonomous but workspace-confined interactive Codex TUI command."""
+    cache = interactive_tool_cache_dir(task)
     command = [
         task["tools"]["codex"],
         "--sandbox",
         "workspace-write",
         "--ask-for-approval",
-        "on-request",
+        str(task.get("approval_policy") or DEFAULT_INTERACTIVE_APPROVAL_POLICY),
+        "--add-dir",
+        str(cache),
     ]
+    if task.get("network_access"):
+        command.extend(
+            [
+                "--config",
+                "sandbox_workspace_write.network_access=true",
+                "--config",
+                "features.network_proxy.enabled=true",
+                "--config",
+                'features.network_proxy.domains={ "*" = "allow" }',
+                "--config",
+                (
+                    'features.network_proxy.unix_sockets={ '
+                    '"/nix/var/nix/daemon-socket/socket" = "allow" }'
+                ),
+            ]
+        )
     if task.get("enable_search"):
         command.append("--search")
-    if task.get("model"):
-        command.extend(["--model", task["model"]])
     if task.get("profile"):
         command.extend(["--profile", task["profile"]])
-    if task.get("reasoning_effort"):
-        command.extend(["--config", f"model_reasoning_effort={task['reasoning_effort']}"])
     command.extend(
         [
+            "--model",
+            str(task.get("model") or DEFAULT_INTERACTIVE_MODEL),
+            "--config",
+            "model_reasoning_effort="
+            + str(task.get("reasoning_effort") or DEFAULT_INTERACTIVE_REASONING),
             "--config",
             "developer_instructions=" + json.dumps(codex_job_instructions(task)),
         ]

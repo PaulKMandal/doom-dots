@@ -84,11 +84,23 @@ task. Import its completed code changes with `SPC r c f`.
 `SPC r c i` is the ordinary conversational mode. If the project has no
 outstanding task, it creates the same hidden snapshot and isolated server
 worktree as `SPC r c s`, launches the Codex TUI under durable remote `tmux`, and
-opens it in kitty. Run it again to reattach. Closing kitty, detaching with
-`C-b d`, losing SSH, or suspending the laptop detaches only the client. Exit the
-TUI with `/exit` or `/quit`; the enclosing runner then finalizes, validates, and
-publishes the worktree. `SPC r c I` behaves identically but permits one
-runner-mediated experiment request.
+opens it in kitty. New interactive sessions default to GPT-5.6 Sol at extra-high
+reasoning and run without approval pauses inside a `workspace-write` sandbox.
+Outbound public-network access is enabled inside that sandbox for project
+dependency resolution, while loopback, private-network destinations, and Unix
+sockets remain blocked except for the standard Nix daemon socket. A task-private
+cache is exposed for Nix/uv/Python tooling. The agent may edit the worktree and
+its dependency lock files, but the sandbox does not grant write access to host
+or system files. Project-specific model and reasoning settings still override
+the defaults.
+
+Run `SPC r c i` again to reattach. Closing kitty, detaching with `C-b d`, losing
+SSH, or suspending the laptop detaches only the client. Because approvals are
+set to `never`, an operation outside the sandbox fails rather than waiting for
+you; reattach to inspect any genuine blocker. Exit the TUI with `/exit` or
+`/quit`; the enclosing runner then finalizes, validates, and publishes the
+worktree. `SPC r c I` behaves identically but permits one runner-mediated
+experiment request.
 
 `SPC r c a` is a read-only monitor for either task mode through Emacs's built-in
 Term emulator. After the pane exits, use `SPC r c l` for preserved logs. Use
@@ -203,10 +215,11 @@ The following optional variables specialize the isolated Codex worktree:
   `my/remote-test-cmd` is used.
 - `my/codex-remote-data-links`: explicit server paths temporarily symlinked
   inside the isolated worktree, expressed as `SOURCE=RELATIVE_TARGET`.
-- `my/codex-remote-model`: optional model override.
+- `my/codex-remote-model`: optional model override. Interactive tasks default to
+  `gpt-5.6-sol` when this is nil.
 - `my/codex-remote-profile`: optional server-side Codex profile.
 - `my/codex-remote-reasoning-effort`: `minimal`, `low`, `medium`, `high`, or
-  `xhigh`.
+  `xhigh`. Interactive tasks default to `xhigh` when this is nil.
 - `my/codex-remote-enable-search`: non-nil enables live Codex web search.
 - `my/codex-remote-timeout`: short SSH connection timeout, default 5 seconds.
 - `my/codex-remote-max-untracked-bytes`: per-file transfer limit, default
@@ -247,6 +260,19 @@ Example `.dir-locals.el`:
 The bootstrap command must leave all nonignored repository files unchanged.
 Creating ignored `.venv`, `.direnv`, caches, or other environment state is fine.
 Use locked/frozen dependency commands where the project supports them.
+
+For managed interactive sessions, the runner sets `XDG_CACHE_HOME`,
+`UV_CACHE_DIR`, and `PIP_CACHE_DIR` to a task-private directory outside the Git
+worktree and grants Codex write access only to that cache in addition to the
+worktree. It enables Codex's command-network proxy with public destinations
+allowed, local/private destinations blocked, and only the standard
+`/nix/var/nix/daemon-socket/socket` Unix socket allowed. This permits normal
+public dependency resolution and Nix daemon builds without exposing SSH agents,
+D-Bus sockets, private services, or the rest of the server account. `uv add`,
+`uv sync`, `nix develop`, `nix build`, and `nix flake check` are in scope when
+needed by the requested implementation. Host activation and service-management
+commands such as `sudo`, `nixos-rebuild`, `home-manager switch`, `nix profile`,
+`nix-env`, and `systemctl` remain explicitly out of scope.
 
 The Codex-specific command overrides, data-link paths, model names, and
 profiles are intentionally not globally trusted. The first time a project sets
