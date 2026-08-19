@@ -321,6 +321,13 @@ ON-ERROR with the parsed JSON object and process buffer."
               ("Network" . ,(if (my/codex-remote--get task 'network_access)
                                   "enabled in sandbox"
                                 "sandbox default"))
+              ("Project env" . ,(my/codex-remote--get
+                                    task 'interactive_environment))
+              ("Bootstrap" . ,(when (my/codex-remote--get task 'bootstrap_cmd)
+                                  (if (my/codex-remote--get
+                                       task 'bootstrap_inferred)
+                                      "automatic locked uv sync"
+                                    "project configuration")))
               ("Task" . ,(my/codex-remote--get task 'task_id))
               ("Project" . ,(my/codex-remote--get task 'project_name))
               ("Started" . ,(or (my/codex-remote--get task 'codex_started_at)

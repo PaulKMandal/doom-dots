@@ -256,18 +256,39 @@ The bootstrap command must leave all nonignored repository files unchanged.
 Creating ignored `.venv`, `.direnv`, caches, or other environment state is fine.
 Use locked/frozen dependency commands where the project supports them.
 
-For managed interactive sessions, the runner sets `XDG_CACHE_HOME`,
-`UV_CACHE_DIR`, and `PIP_CACHE_DIR` to a task-private directory outside the Git
-worktree and grants Codex write access only to that cache in addition to the
-worktree. It enables Codex's command-network proxy with public destinations
-allowed, local/private destinations blocked, and only the standard
-`/nix/var/nix/daemon-socket/socket` Unix socket allowed. This permits normal
-public dependency resolution and Nix daemon builds without exposing SSH agents,
-D-Bus sockets, private services, or the rest of the server account. `uv add`,
-`uv sync`, `nix develop`, `nix build`, and `nix flake check` are in scope when
-needed by the requested implementation. Host activation and service-management
-commands such as `sudo`, `nixos-rebuild`, `home-manager switch`, `nix profile`,
-`nix-env`, and `systemctl` remain explicitly out of scope.
+For managed interactive sessions, environment preparation occurs in the trusted
+runner before Codex starts. When the configured bootstrap or test command uses
+`nix develop`, the runner reuses that exact development-shell target; otherwise
+it tries the flake's default shell and then `.#server`. The runner captures the
+resulting toolchain environment and launches Codex with its `PATH`, Python,
+`uv`, compilers, and system-library variables available. An existing `.venv` is
+activated automatically. If a repository contains both `pyproject.toml` and
+`uv.lock` but has no configured bootstrap, the runner infers a conservative
+`uv sync --frozen`; it does not invent or update a missing lock file.
+
+`XDG_CACHE_HOME`, `UV_CACHE_DIR`, and `PIP_CACHE_DIR` point to a task-private
+cache outside the Git worktree. Public dependency traffic is allowed through
+Codex's network proxy, while local/private destinations remain blocked. Linux
+Codex currently blocks Nix's Unix-domain daemon socket inside the command
+sandbox even when an exact socket allow rule is configured, so the workflow
+does not pretend that direct model-run `nix develop` is reliable. Nix realization
+and the exact user-configured bootstrap/test commands instead run through a
+narrow trusted control path:
+
+```sh
+$CODEX_ENVCTL refresh   # rerun bootstrap, then refresh the project-shell snapshot
+$CODEX_ENVCTL test      # run the configured bounded trusted test command
+$CODEX_ENVCTL check     # refresh, then test
+```
+
+Codex must commit tracked dependency changes before using those controls. The
+stable `$CODEX_DEV COMMAND ...` wrapper always reads the newest captured project
+environment while the TUI remains open, so a refreshed `uv` environment or Nix
+toolchain can be used without ending the conversation. Plain `uv add`, `uv sync`,
+`uv run`, Python, Ruff, pytest, and other tools are also available directly from
+the initially captured shell. Host activation and service-management commands
+such as `sudo`, `nixos-rebuild`, `home-manager switch`, `nix profile`, `nix-env`,
+and `systemctl` remain explicitly out of scope.
 
 The Codex-specific command overrides, data-link paths, model names, and
 profiles are intentionally not globally trusted. The first time a project sets
@@ -582,6 +603,15 @@ reconcile the task-specific `.venv`, or lets `nix develop` realize the changed
 lock. A failed or source-dirty refresh is recorded distinctly and tests are not
 run against that ambiguous environment. Without a bootstrap command, the result
 is importable but marked `READY_ENVIRONMENT_UNVERIFIED` rather than `READY`.
+
+During a live interactive task, Codex does not need to exit merely to perform
+the same validation. After committing a coherent checkpoint, it can invoke
+`$CODEX_ENVCTL refresh`, `test`, or `check`. These actions can execute only the
+bootstrap and test strings frozen when the task started; the sandboxed agent
+cannot substitute an arbitrary host command. Output is retained in the task
+state directory rather than written over the interactive terminal. Untracked
+environment products such as `.venv` remain ignored, while any tracked source
+mutation caused by bootstrap or tests is reported and stops the trusted action.
 
 ## Snapshot and result safety
 
