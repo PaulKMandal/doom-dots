@@ -1,37 +1,48 @@
 # Durable remote Codex from Doom Emacs
 
-This configuration adds a hidden Git transport and an isolated server worktree
-for Codex while leaving the existing rsync/SSH experiment workflow intact.
-The laptop checkout remains canonical: Codex receives an exact hidden snapshot,
-runs on the server under `tmux`, and returns only its additional changes as
-ordinary unstaged local modifications.
+This configuration keeps the laptop checkout canonical while Codex runs in an
+isolated server worktree under `tmux`. The existing rsync/SSH experiment path is
+preserved.
 
-It also adds a separate frozen experiment-job layer. An explicitly authorized
-Codex task may submit one structured launch request, but Codex cannot detach the
-process itself. The trusted runner validates the request, requires the configured
-smoke/test command to pass, freezes the exact result revision into a dedicated
-worktree, and launches a job that is independent of both Emacs and the Codex
-session.
+The two Codex modes return work differently:
 
-## Behavior preserved from the existing configuration
+- one-shot `codex exec` tasks still return a sanitized delta as ordinary local
+  modifications;
+- managed interactive tasks start from a clean named local branch, instruct
+  Codex to create small coherent commits, and let the laptop pull those commits
+  repeatedly while the TUI remains open.
 
-The existing bindings retain their current meanings:
+Interactive checkpoint pulls preserve Codex's individual commit messages and
+author metadata. They are integrated in a temporary worktree and fast-forwarded
+onto the current laptop branch only after a clean three-way replay. A conflict
+never modifies the canonical checkout.
 
-| Binding | Existing behavior |
+The frozen experiment-job layer remains separate. Interactive Codex may request
+one job from an exact committed checkpoint; the trusted runner freezes that
+revision and launches the job immediately in a dedicated worktree while the TUI
+continues running.
+
+## Existing remote workflow, now with automatic checkpoint reconciliation
+
+The familiar bindings remain the normal interface:
+
+| Binding | Behavior |
 | --- | --- |
-| `SPC r s` | rsync the local project to the normal server checkout |
-| `SPC r r` | run the configured command in the already-synced server checkout |
-| `SPC r R` | sync, then run the configured command |
-| `SPC r u` / `U` | setup remotely / sync then setup |
-| `SPC r q` / `Q` | smoke test remotely / sync then smoke test |
-| `SPC r T` | run the configured remote tests |
+| `SPC r s` | pull any new committed interactive-Codex checkpoints, then rsync the laptop project to the normal server checkout |
+| `SPC r r` | pull checkpoints, sync only when that pull advanced the laptop branch, then run the configured remote command |
+| `SPC r R` | pull checkpoints, always sync, then run |
+| `SPC r u` / `U` | pull, then setup remotely / pull, always sync, then setup |
+| `SPC r q` / `Q` | pull, then smoke test remotely / pull, always sync, then smoke test |
+| `SPC r T` | pull checkpoints, sync only when needed, then run configured remote tests |
 | `SPC r t` | open a vterm in the normal server checkout |
 
-In particular, lowercase `SPC r r` does **not** sync first. After importing a
-Codex result, use `SPC r s` followed by `SPC r r`, or use `SPC r R`.
+Thus the lowercase commands retain their old no-sync behavior when Codex has no
+new commits. When a live checkpoint is imported, the same keypress automatically
+rsyncs before running so the normal server checkout cannot lag behind the newly
+advanced laptop branch.
 
-The Codex worktree is never placed in `my/remote-dir`, so the existing
-`rsync --delete` operation cannot erase unfinished Codex work.
+The Codex worktree is never placed in `my/remote-dir`, so `rsync --delete`
+cannot erase unfinished interactive work.
 
 ## Added bindings
 
@@ -42,83 +53,62 @@ The Codex commands are under `SPC r c`:
 | Binding | Action |
 | --- | --- |
 | `SPC r c d` | check local/server prerequisites and Codex authentication |
-| `SPC r c s` | start an ordinary managed noninteractive `codex exec` task |
-| `SPC r c S` | start Codex with authorization to request one frozen experiment job |
-| `SPC r c t` | show task and local orchestration status |
-| `SPC r c a` | monitor a live Codex task in a read-only built-in Term buffer |
-| `SPC r c i` | start or reattach to an ordinary managed interactive Codex TUI in kitty |
-| `SPC r c I` | start or reattach to interactive Codex with one frozen job authorized |
+| `SPC r c s` | start an ordinary one-shot `codex exec` task without job authorization |
+| `SPC r c S` | start one-shot Codex with authorization to request one frozen experiment job |
+| `SPC r c t` | show task, live-checkpoint, and local orchestration status |
+| `SPC r c a` | monitor a live Codex task read-only inside Emacs |
+| `SPC r c i` | start or reattach to autonomous interactive Codex; one frozen job is authorized |
+| `SPC r c I` | compatibility alias for the same job-enabled interactive workflow |
+| `SPC r c p` | manually pull the latest committed interactive checkpoint without ending the TUI |
 | `SPC r c j` | open the ordinary one-shot Codex prompt/watcher in kitty |
 | `SPC r c l` | show preserved task, Codex, environment, and test logs |
-| `SPC r c r` | safely publish a preserved orphaned/failed worktree without rerunning Codex |
-| `SPC r c f` | fetch, integrate, and apply the completed Codex delta locally |
+| `SPC r c r` | publish a preserved orphaned/failed worktree without rerunning Codex |
+| `SPC r c f` | pull interactive commits, or import a completed one-shot result |
 | `SPC r c x` | request Codex-task cancellation while preserving its worktree |
-| `SPC r c c` | archive an already-imported task and remove its worktree/refs |
+| `SPC r c c` | archive an imported task and remove its worktree/refs |
 | `SPC r c X` | explicitly discard a task and its unimported work |
 | `SPC r c g` | install/update the managed global `~/.codex/AGENTS.md` block on the server |
 | `SPC r c A` | create from the research template, or open, the project `AGENTS.md` |
-
-Lowercase `s` and `i` never authorize a detached or long-running launch. Uppercase
-`S` and `I` authorize exactly one runner-mediated request for the new task. An
-already-running interactive task retains the policy with which it started;
-reattaching with `I` does not upgrade an ordinary task.
 
 With a region active, `SPC r c s` or `SPC r c S` sends the region as the prompt.
 With a prefix argument, either command opens a multiline prompt buffer; submit
 with `C-c C-c` or cancel with `C-c C-k`.
 
-`SPC r c s` is the ordinary one-shot mode: it sends a task prompt to
-noninteractive `codex exec`, then the runner finalizes and publishes the result
-automatically. `SPC r c S` uses the same editing and import path but additionally
-allows Codex to create one structured experiment request through
-`"$CODEX_JOBCTL"`. The runner—not Codex—decides whether the authorization,
-source, environment, and smoke-test gates permit launch.
+`SPC r c s` remains the one-shot mode. It does not expose granular internal
+Codex commits: the runner publishes one sanitized result commit and imports its
+net delta as local modifications. `SPC r c S` adds the older finalize-then-launch
+job path.
 
-`SPC r c j` starts the same ordinary one-shot editing mode from an external
-terminal. It intentionally has no frozen-job authorization. The terminal accepts
-a multiline prompt until `Ctrl-D`, submits it through the same `codex-remote
-start` backend, and watches the durable task's status and logs. Closing the
-watcher or pressing `Ctrl-C` after launch does not cancel the server-side Codex
-task. Import its completed code changes with `SPC r c f`.
+`SPC r c j` starts that ordinary one-shot mode from an external terminal and has
+no frozen-job authorization. Closing its watcher does not cancel the task.
 
-`SPC r c i` is the ordinary conversational mode. If the project has no
-outstanding task, it creates the same hidden snapshot and isolated server
-worktree as `SPC r c s`, launches the Codex TUI under durable remote `tmux`, and
-opens it in kitty. New interactive sessions use GPT-5.6 Sol at extra-high
-reasoning and run without approval pauses inside a `workspace-write` sandbox.
-The extra-high setting is enforced for this managed interactive path even when
-an older project `.dir-locals.el` still requests `high`.
-Outbound public-network access is enabled inside that sandbox for project
-dependency resolution, while loopback, private-network destinations, and Unix
-sockets remain blocked except for the standard Nix daemon socket. A task-private
-cache is exposed for Nix/uv/Python tooling. The agent may edit the worktree and
-its dependency lock files, but the sandbox does not grant write access to host
-or system files. Project-specific model and reasoning settings still override
-the defaults.
+`SPC r c i` is the persistent conversational mode. Starting a new interactive
+task requires a clean, named local branch because the server's real commit chain
+will later be integrated into that branch. Doom creates the isolated server
+worktree, launches Codex under durable `tmux`, and opens kitty. Running the same
+binding again reattaches to the existing TUI and conversation.
 
-Run `SPC r c i` again to reattach. Closing kitty, detaching with `C-b d`, losing
-SSH, or suspending the laptop detaches only the client. Because approvals are
-set to `never`, an operation outside the sandbox fails rather than waiting for
-you; reattach to inspect any genuine blocker. Exit the TUI with `/exit` or
-`/quit`; the enclosing runner then finalizes, validates, and publishes the
-worktree. `SPC r c I` behaves identically but permits one runner-mediated
-experiment request.
+Managed interactive sessions use GPT-5.6 Sol at extra-high reasoning, approval
+policy `never`, a `workspace-write` sandbox, public dependency-network access,
+a task-private Nix/uv/Python cache, and stable `Codex Remote` Git author and
+committer identity. Codex is instructed to commit each validated logical unit
+and never amend, rebase, reset, or otherwise rewrite a commit created in the
+managed session because the laptop may publish it at any time.
 
-`SPC r c a` is a read-only monitor for either task mode through Emacs's built-in
-Term emulator. After the pane exits, use `SPC r c l` for preserved logs. Use
-`SPC r c x` for cancellation rather than sending control input through the
-read-only monitor.
+Closing kitty, detaching with `C-b d`, losing SSH, or suspending the laptop only
+detaches. While Codex remains open, use the ordinary `SPC r` sync/run/test
+commands; they pull any new commits automatically. `SPC r c p` is available for
+a pull without any subsequent remote action. `SPC r c f` remains a compatible
+manual pull entry point.
 
-The `s`, `S`, `j`, `i`, and `I` entry points share the same
-one-outstanding-Codex-task-per-project rule. A task must be imported, archived,
-or explicitly discarded before another can start. Frozen experiment jobs are
-separate objects and may continue after their source Codex task is imported or
-archived.
+When the session is genuinely finished, `/exit` or `/quit` lets the runner
+commit any remaining safe dirty files, refresh a changed environment, run the
+configured tests, and publish the final commit chain. A final normal command or
+`SPC r c f` imports any last commits and acknowledges the task.
 
-For one-shot tasks, `SPC r c l` includes the structured Codex event stream,
-stderr, final message, runner log, and test logs. For interactive tasks it
-preserves runner, environment-refresh, and test logs, but not a complete terminal
-transcript.
+The `s`, `S`, `j`, `i`, and `I` entry points still share one outstanding Codex
+task per project. Frozen experiment jobs are separate and can continue after the
+source Codex task is imported or archived.
 
 ### Frozen experiment-job commands
 
@@ -321,82 +311,71 @@ the task is cancelled.
 
 ## Normal workflows
 
-Both modes begin from an exact hidden snapshot of the canonical laptop checkout
-and use the same isolated server worktree, result publication, import, conflict,
-and cleanup machinery.
-
 ### One-shot task
 
-1. Edit the local checkout normally. Staged, unstaged, and safe untracked source
-   files may all be present.
-2. Run `SPC r c d` once for the project/server combination.
-3. Run `SPC r c s` and provide the task prompt.
-4. Continue local work or disconnect/suspend the laptop. The server-side
-   `tmux` process continues.
-5. Inspect `SPC r c t` or `SPC r c l`; use `SPC r c a` for a read-only live
-   monitor.
-6. When the state is importable, run `SPC r c f`.
+1. Edit the local checkout normally; staged, unstaged, and safe untracked source
+   files may be present.
+2. Run `SPC r c s` and provide the prompt.
+3. Let the server-side `tmux` task finish.
+4. Run `SPC r c f` to apply the sanitized result delta as ordinary local
+   modifications.
+5. Review and commit locally as before.
 
-### Terminal one-shot job
+### Interactive task with live commits
 
-From Doom, run `SPC r c j`. Kitty opens, asks for a multiline prompt, and
-submits on `Ctrl-D`. It then follows state changes and runner/Codex/test logs.
-Closing the window or pressing `Ctrl-C` after launch detaches only the watcher;
-the tmux-backed server task continues.
+1. Commit or stash local work so the current branch is clean and named.
+2. Run `SPC r c i` and give Codex the implementation request in its TUI.
+3. Codex works in the isolated server checkout and creates coherent commits.
+4. Leave the TUI running. Whenever code should reach the laptop and normal
+   experiment checkout, use the command you already intended to use:
+   - `SPC r s` pulls and syncs;
+   - `SPC r r`, `SPC r T`, `SPC r q`, or `SPC r u` pull first and sync only if
+     a new commit was imported;
+   - uppercase combined commands still always sync.
+5. Run `SPC r c i` again whenever conversational input is needed.
+6. Use `/exit` or `/quit` only when the interactive session is finished.
 
-The same frontend can be run directly from a laptop terminal inside the local
-canonical repository:
+A pull publishes only the server's committed `HEAD`. Uncommitted in-progress
+Codex edits remain private to the interactive worktree until the agent creates a
+coherent commit. The status buffer reports whether the checkpoint worktree is
+currently dirty.
 
-```sh
-~/.config/doom/bin/codex-remote-job
-```
+When new commits exist, the laptop index and tracked files must be clean so
+the branch can advance without flattening or silently mixing local WIP into
+Codex's commit history. Unrelated untracked files may remain; a pull stops safely
+when an incoming commit would overwrite one of their paths. Commit or stash
+tracked edits and repeat the same sync/run/test binding. No separate `SPC r c`
+choreography is needed after that.
 
-Resume watching the current one-shot task without submitting another prompt:
+If local commits and Codex commits conflict, the backend preserves the rebase in
+an isolated integration worktree and leaves the canonical checkout unchanged.
+Resolve it there, complete the rebase, and rerun the same pull or remote command.
 
-```sh
-~/.config/doom/bin/codex-remote-job --watch
-```
+### Terminal one-shot watcher
 
-Use `--prompt-file task.txt` for a prepared prompt. The terminal frontend does
-not import results; after it reports `READY` or another importable state, return
-to Doom and run `SPC r c f`.
+`SPC r c j` opens kitty, accepts a multiline prompt until `Ctrl-D`, and watches
+the same durable one-shot mode as `SPC r c s`. Closing the watcher does not
+cancel the server task. Its completed result is imported with `SPC r c f`.
 
-### Interactive TUI session
+### Cleanup
 
-1. From the project, run `SPC r c i`.
-2. Doom saves project buffers, creates the managed hidden snapshot/worktree,
-   starts the ordinary Codex TUI under remote `tmux`, and opens kitty attached
-   read-write to that session.
-3. Use Codex normally. Closing kitty or detaching with `C-b d` leaves the TUI
-   running; run `SPC r c i` again to reattach to the same task.
-4. When the interactive coding session is complete, use `/exit` or `/quit`.
-   The enclosing runner resumes, finalizes the worktree, refreshes the
-   environment when required, runs configured tests, and publishes the result.
-5. Check `SPC r c t` or `SPC r c l`, then run `SPC r c f` when the state is
-   importable.
-
-### After either mode
-
-1. Review the resulting ordinary local changes in Emacs or Magit.
-2. Use `SPC r s` then `SPC r r`, or `SPC r R`, to run the reconciled local
-   state in the normal experiment checkout.
-3. After a successful import, `SPC r c c` may archive the server worktree.
-   Archive/discard removes the retained `tmux` session, worktree, and hidden
-   refs while keeping task metadata and logs. Starting the next task also
-   archives the prior imported task automatically.
-
-After ordinary `SPC r s`, a nonblocking status probe notifies you when a
-completed Codex result is still waiting to be imported. It does not change or
-block the existing rsync command and does not import automatically.
+After the final interactive or one-shot result is imported, `SPC r c c` archives
+the task. Starting the next task also archives a prior imported task
+automatically. Archive/discard removes the retained Codex tmux session,
+worktree, and hidden refs while retaining terminal metadata and logs.
 
 ## Frozen experiment jobs
 
 ### Launch protocol
 
-Use `SPC r c S` for a one-shot implementation-and-launch task or `SPC r c I`
-for an interactive session. Describe both the code/validation work and the
-intended experiment in the prompt. Once the implementation is ready, Codex may
-make exactly one request using the helper exposed in its environment:
+Managed interactive sessions started with `SPC r c i` are authorized to request
+one frozen experiment job. `SPC r c I` remains a compatibility alias for the
+same behavior. For a one-shot implementation-and-launch task, use
+`SPC r c S`; ordinary `SPC r c s` and `SPC r c j` remain non-launching.
+
+In an interactive session, Codex first commits the exact source revision to run
+and completes reasonable foreground validation. It then invokes the helper
+exposed in its environment:
 
 ```sh
 "$CODEX_JOBCTL" request \
@@ -413,37 +392,43 @@ The command after `--` is stored and executed as an argv array rather than a
 second shell string. Metadata values are descriptive provenance; they do not
 replace the exact command or repository-specific run manifest.
 
-After Codex exits, the trusted runner:
+For an interactive request, the trusted runner processes the request while the
+Codex TUI remains open:
 
-1. consumes and removes the request file so it cannot enter the returned source
-   tree;
-2. safety-checks and publishes a single sanitized result revision;
-3. refreshes the server environment when a supported lock file changed;
-4. runs the configured bounded test/smoke command against that exact result;
-5. refuses launch unless Codex, environment validation, and tests all succeeded
-   without dirtying nonignored source files;
-6. creates a pinned hidden source ref and a dedicated detached worktree;
-7. records the run manifest and starts a separate `tmux` runner;
-8. recreates the configured bootstrap environment inside that fresh frozen
-   worktree before exposing data links or starting the experiment command.
+1. remove and validate the request file outside the Codex sandbox;
+2. require a clean worktree so the requested source is an exact commit;
+3. safety-check and publish that committed checkpoint without rewriting prior
+   checkpoints;
+4. create a pinned hidden source ref and dedicated detached job worktree;
+5. record the run manifest and start a separate `tmux` runner;
+6. return the run ID to Codex while the conversation remains available;
+7. inside the frozen worktree, rerun the configured bootstrap command and the
+   configured bounded test/smoke command before starting the experiment.
 
-Codex is explicitly instructed not to use `tmux`, `nohup`, shell backgrounding,
-`systemd`, or a scheduler directly. Ordinary lowercase task modes reject even a
-manually created request. The uppercase command is therefore a meaningful
-resource-authorization boundary, not a different prompt label.
+The interactive job request may use the original task input commit when no code
+change was required. It may also use a later committed checkpoint. Uncommitted
+Codex edits are never included. Exactly one request is accepted per Codex task;
+subsequent experiment variants should be launched from a new managed task so
+source identity and provenance remain unambiguous.
 
-The experiment command itself runs as the ordinary remote user rather than
-inside the Codex editing sandbox. This is necessary for the repository's real
-environment, datasets, and GPUs, but it also means `SPC r c S` and
-`SPC r c I` should be used only for a trusted repository and a reviewed task
-description on a nonprivileged server account. The runner validates provenance
-and launch gates; it is not a container or a semantic malware detector for the
-requested program.
+For `SPC r c S`, there is no live request broker. `$CODEX_JOBCTL` records the
+request and returns immediately; after Codex exits, the existing one-shot
+finalizer publishes the sanitized result, refreshes the environment, runs the
+configured test command, and launches the frozen job only when all gates pass.
 
-The code result and experiment lifecycle are independent after launch. Import
-and review the source changes with `SPC r c f`; archiving that Codex task does
-not stop or delete its experiment job. The job executes from the frozen result
-SHA, so subsequent Codex or local edits cannot alter the source under the run.
+Codex is instructed not to use `tmux`, `nohup`, shell backgrounding, `systemd`,
+or a scheduler directly. The experiment command itself runs as the ordinary
+remote user rather than inside the Codex editing sandbox. This is necessary for
+the repository's real Nix/uv environment, datasets, and GPUs, but it means job
+authorization should be used only for a trusted repository and a reviewed task
+on a nonprivileged server account. The runner validates provenance and launch
+gates; it is not a general container or semantic malware detector.
+
+The code and experiment lifecycles are independent after launch. Pull committed
+source updates with the normal `SPC r` commands while Codex remains active, and
+finish/import the source task normally. Archiving that task does not stop or
+delete the frozen job. The job executes from its recorded source SHA, so later
+Codex or laptop edits cannot alter the running source.
 
 ### Run identity and layout
 
@@ -591,77 +576,108 @@ is importable but marked `READY_ENVIRONMENT_UNVERIFIED` rather than `READY`.
 
 ## Snapshot and result safety
 
-The local snapshot uses a temporary Git index and hidden ref. Starting a task
-does not switch branches or modify the visible `HEAD`, real index, staging
-organization, or working tree. The snapshot includes:
+The two execution modes intentionally use different input and result forms.
 
-- committed content;
-- staged changes;
-- unstaged tracked changes;
-- nonignored, safety-checked untracked source files.
+### One-shot tasks
 
-Version 1 blocks:
+A one-shot task creates an exact hidden snapshot with a temporary Git index.
+Starting it does not switch branches or modify visible `HEAD`, the real index,
+staging organization, or the working tree. The snapshot may include committed
+content, staged and unstaged tracked changes, and nonignored safety-checked
+untracked source files. The returned result is one sanitized commit whose net
+delta is applied locally as ordinary unstaged modifications; internal Codex
+scratch commits are not exposed.
 
-- merge/rebase/cherry-pick/revert/bisect/git-am operations in progress;
-- repositories containing submodules;
+### Managed interactive tasks
+
+A managed interactive task requires a clean named branch and uses the branch's
+actual `HEAD` as its input. That stable base allows Codex's real commits to be
+pulled repeatedly and preserved as commits on the laptop. Starting the task does
+not switch the local branch or modify its index or working tree.
+
+A live checkpoint publishes only the server worktree's committed `HEAD`.
+Uncommitted edits remain server-side and the status view reports that the
+checkpoint is dirty. Every later checkpoint must descend from the last published
+commit; an amend, rebase, or reset is blocked instead of silently replacing commits
+already pulled to the laptop. Codex is therefore instructed never to rewrite commits
+created in the managed session because a laptop pull may publish them at any time. If Codex
+exits with safe uncommitted files, the finalizer creates one clearly identifiable
+remainder commit as a recovery fallback, but the normal policy is for Codex to
+commit each validated logical unit itself.
+
+### Common safety checks
+
+Both modes block or reject:
+
+- merge/rebase/cherry-pick/revert/bisect/git-am operations in progress at unsafe
+  boundaries;
+- repositories containing submodules in paths the snapshot logic cannot safely
+  represent;
 - modified Git LFS paths;
-- suspicious untracked or result paths such as live `.env` files,
-  credentials, private keys, caches, virtual environments, Nix `result*`
-  links, generated outputs, and checkpoints; common placeholder names such as
-  `.env.example` remain usable;
-- nonregular untracked files;
-- symlinks escaping the repository;
-- files over the configured size limit.
+- suspicious source or result paths such as live `.env` files, credentials,
+  private keys, caches, virtual environments, Nix `result*` links, generated
+  outputs, and checkpoints; common placeholder names such as `.env.example`
+  remain usable;
+- nonregular files, symlinks escaping the repository, and files over the
+  configured size limit;
+- whitespace/error conditions reported by `git diff --check`.
 
-The same checks inspect every committed state in the Codex history, not only the
-final tree. A secret or oversized file that Codex commits and later deletes is
-therefore still blocked. For an accepted result, the backend publishes a single
-sanitized commit from the exact input snapshot to the final tree; Codex's
-intermediate commit chain is not fetched back to the laptop.
-
-These filename/size checks cannot detect a secret copied into an innocently
-named source file; do not expose secrets to the task worktree.
+The result scanner inspects every committed state between the task input and the
+published checkpoint/result, not only the final tree. A secret or oversized file
+that is committed and later deleted therefore still blocks publication. These
+filename and size checks cannot detect a secret copied into an innocently named
+source file; do not expose secrets to the task worktree.
 
 ## Import and conflicts
 
-Let `S` be the exact input snapshot, `R` the server result, and `C` a fresh
-snapshot of the current local state at import time. The backend replays `S..R`
-onto `C` inside a temporary local worktree. It verifies that the canonical
-checkout did not change during integration, then applies only `C..M` to the
-canonical working tree without staging or committing it.
+### Interactive commit pulls
 
-Expected behavior:
+Let `S` be the interactive task input, `Rₙ` the latest published server
+checkpoint, and `Rₙ₋₁` the last checkpoint already pulled. The backend fetches
+only the new commit range `Rₙ₋₁..Rₙ`, replays it onto the current local branch in
+a temporary integration worktree, and fast-forwards the canonical branch only
+after the replay and final state checks succeed. Commit boundaries, messages,
+authors, and ordering are retained. A later pull imports only commits that have
+not already been integrated. Unmodified Emacs buffers visiting files changed by
+the fast-forward are reverted automatically so the editor reflects the new
+checkout immediately.
 
-- different files: automatic import;
-- same file, nonoverlapping regions: normally automatic import;
-- incompatible edits: conflict preserved in the temporary integration
-  worktree; the canonical checkout remains unchanged.
+The ordinary `SPC r s`, `SPC r r`, `SPC r R`, setup, smoke, and test commands
+perform this checkpoint pull as their preflight. `SPC r c p` performs the same
+pull without a subsequent remote action, and `SPC r c f` remains a compatible
+manual pull/import command. Exiting the TUI is not required.
 
-On a conflict, Doom prompts for one of three actions:
+When new interactive commits are available, the local index and tracked files
+must be clean and the task's expected branch must be checked out. Unrelated
+untracked files are preserved unless an incoming commit needs the same path. This
+is the boundary that lets the branch advance without flattening Codex's history
+or silently mixing local tracked WIP into those commits. If no new commit exists,
+a dirty laptop checkout does not block the normal remote action. With an explicit
+prefix, `C-u SPC r c f` allows a deliberate pull onto a different current branch;
+branch changes are never automatic.
 
-1. **Resolve in the isolated integration worktree.** The canonical checkout
-   remains untouched. Resolve the files in the Magit worktree, complete the
-   rebase, and rerun `SPC r c f`; the backend verifies the recorded local base
-   before importing the resolved result.
-2. **Preserve current local development on a timestamped branch and retry.**
-   The backend creates `<branch>-local-<UTC timestamp>` containing all local
-   commits plus a synthetic WIP commit for the exact current tree. Doom asks
-   whether to push that branch to `origin`; when push is requested, the
-   original branch is not reset unless the push succeeds. The original branch
-   is then restored to the exact task-start `HEAD`, index, and working-tree
-   snapshot before the normal Codex import runs.
-3. **Abort.** The canonical checkout and remote result remain unchanged.
+If the replay conflicts, the canonical checkout remains byte-for-byte unchanged.
+The backend preserves the rebase in a separate `commit-integration` worktree and
+opens it in Magit when available. Resolve the files there, run the normal
+`git rebase --continue` sequence in that worktree, then repeat the same
+sync/run/test command or `SPC r c p`/`f`. The backend verifies that the local
+branch has not changed before fast-forwarding it.
 
-The local-backup strategy refuses when it cannot preserve the checkout safely,
-including a different current branch, a Git operation in progress, submodules,
-unsafe untracked files, or changed LFS paths. Recovery metadata is retained in
-`local-backup.json` under the local project state directory.
+### One-shot delta imports
 
-The import is branch-aware. If the checked-out branch differs from the branch
-on which the task started, Doom prompts before applying to the current branch;
-it never switches branches automatically. `C-u SPC r c f` deliberately skips
-that prompt. The timestamped-backup strategy is available only on the original
-task-start branch.
+One-shot tasks keep the previous dirty-snapshot workflow. Let `S` be the exact
+hidden input snapshot, `R` the sanitized server result, and `C` a fresh snapshot
+of the current local state. The backend replays `S..R` onto `C` in a temporary
+worktree and, when clean, applies only the resulting delta to the canonical
+working tree without staging or committing it.
+
+A one-shot conflict also leaves the canonical checkout untouched. Doom can open
+the isolated integration worktree for manual resolution, preserve current local
+development on a timestamped backup branch and retry from the task input, or
+abort while retaining all remote and local recovery state. The backup strategy
+refuses when it cannot preserve the checkout safely, including an unrelated Git
+operation, submodules, unsafe untracked files, changed LFS paths, or an
+incompatible branch.
 
 ## Recovery
 
@@ -678,11 +694,14 @@ server task when it started despite a lost SSH reply. If no matching task exists
 and local state remains unresolved, `SPC r c X` explicitly discards the stale
 state and hidden input ref.
 
-### Lost import acknowledgement
+### Lost pull or import acknowledgement
 
-The local result is recorded as `APPLIED_PENDING_REMOTE_ACK` before remote
-acknowledgement. Re-run `SPC r c f`; it acknowledges the existing local import
-without applying the patch twice.
+Interactive pulls record both the remote checkpoint SHA and the corresponding
+local tip before acknowledging a final task. Repeating the same normal remote
+command or `SPC r c p`/`f` therefore imports only genuinely new commits; an
+already integrated checkpoint is a no-op. One-shot imports retain the
+`APPLIED_PENDING_REMOTE_ACK` marker, so rerunning `SPC r c f` acknowledges the
+existing local delta without applying it twice.
 
 ### Crash or reboot
 
@@ -755,25 +774,27 @@ emacs --batch -Q \
   -f ert-run-tests-batch-and-exit
 ```
 
-The Python tests cover hidden dirty snapshots, visible Git-state preservation,
-file modes and symlinks, unsafe-file filtering and template-name handling,
-intermediate committed-result inspection, nonoverlapping same-file integration,
-true-conflict isolation and resolved-conflict continuation, timestamped local
-backup branches with exact task-input reconstruction, result publication,
-cancellation during bootstrap, lock-file-triggered environment refresh,
-configured tests, noninteractive and interactive Codex command construction,
-managed interactive task reuse/finalization, orphaned-worktree publication,
-terminal-job configuration and log following, refusal to import a live
-interactive session, structured job-request validation and authorization,
-mandatory prelaunch tests, frozen-worktree environment bootstrapping, fast-job
-startup races, frozen-source manifests and execution, task/job separation,
-read-only structured analysis commands, global `AGENTS.md` managed
-block replacement, and the new Doom command construction/status renderers.
+The Python suite currently contains 65 tests. It covers hidden dirty snapshots,
+visible Git-state preservation, file modes and symlinks, unsafe-file filtering,
+one-shot delta imports, incremental interactive checkpoint publication, history-
+rewrite rejection, commit-preserving pulls, repeated pulls, unrelated-untracked-file preservation,
+untracked-path collision blocking, isolated commit conflicts, clean/named
+interactive start requirements, final interactive commit-
+chain publication, trusted live job-request/response brokering, unchanged-input
+job launches, one-shot nonblocking job requests, frozen-worktree bootstrap and
+preflight tests, source-integrity checks, run manifests and state transitions,
+cancellation and recovery, terminal-job configuration and log following,
+read-only structured analysis, global `AGENTS.md` managed-block replacement, and
+the Doom command-construction/status helpers.
 
-A real acceptance test still requires your actual SSH alias and authenticated
-server. Use a disposable project change first, verify the remote paths printed
-by `SPC r c d`, disconnect while the task runs, and confirm that import leaves
-`HEAD` and the index unchanged.
+A real acceptance test still requires the actual SSH alias, authenticated server,
+kitty, tmux, and Codex account. For an interactive smoke test, start from a clean
+disposable branch, have Codex create two commits, pull after each with ordinary
+remote bindings, detach and reattach, and verify that both commit messages remain
+in local history. Then request a harmless frozen job and confirm that it starts
+while the TUI remains usable. For a one-shot smoke test, confirm that importing
+still leaves `HEAD` and the index unchanged while applying the result as local
+modifications.
 
 ## Rollback
 

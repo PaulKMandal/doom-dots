@@ -10,8 +10,8 @@
 
 ## Validation and jobs
 
-- Run the configured bounded test or smoke command before requesting a long job.
-- For an explicitly authorized long job, use `"$CODEX_JOBCTL" request`; do not launch detached work directly.
+- Commit a coherent, validated source checkpoint before requesting a long job.
+- For an authorized long job, use `"$CODEX_JOBCTL" request`; do not launch detached work directly. The trusted broker freezes the current commit, performs the configured bootstrap/test preflight, and starts the independent job without requiring the interactive TUI to exit.
 - Include a descriptive job name, exact argv command, GPU selection when applicable, a completion marker when the repository provides one, and useful metadata such as experiment tag, model panel, seeds, or dataset split.
 - Make runs resumable and idempotent where practical. Never overwrite a completed run directory.
 - Treat the source snapshot, command, environment, GPUs, seeds, data split, and output location as part of the result.
