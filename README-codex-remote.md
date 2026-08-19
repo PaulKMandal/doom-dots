@@ -8,8 +8,9 @@ The two Codex modes return work differently:
 
 - one-shot `codex exec` tasks still return a sanitized delta as ordinary local
   modifications;
-- managed interactive tasks start from a clean named local branch, instruct
-  Codex to create small coherent commits, and let the laptop pull those commits
+- managed interactive tasks start from a named branch, snapshot staged and
+  unstaged tracked edits invisibly, ignore every untracked path, instruct Codex
+  to create small coherent commits, and let the laptop pull those commits
   repeatedly while the TUI remains open.
 
 Interactive checkpoint pulls preserve Codex's individual commit messages and
@@ -323,7 +324,10 @@ the task is cancelled.
 
 ### Interactive task with live commits
 
-1. Commit or stash local work so the current branch is clean and named.
+1. Use a named local branch. You do not need to clean it before starting:
+   staged and unstaged tracked edits are captured in an invisible input
+   snapshot. Every untracked path is ignored, is not uploaded, and does not need
+   cleanup.
 2. Run `SPC r c i` and give Codex the implementation request in its TUI.
 3. Codex works in the isolated server checkout and creates coherent commits.
 4. Leave the TUI running. Whenever code should reach the laptop and normal
@@ -340,12 +344,17 @@ Codex edits remain private to the interactive worktree until the agent creates a
 coherent commit. The status buffer reports whether the checkpoint worktree is
 currently dirty.
 
-When new commits exist, the laptop index and tracked files must be clean so
-the branch can advance without flattening or silently mixing local WIP into
-Codex's commit history. Unrelated untracked files may remain; a pull stops safely
-when an incoming commit would overwrite one of their paths. Commit or stash
-tracked edits and repeat the same sync/run/test binding. No separate `SPC r c`
-choreography is needed after that.
+When new commits exist, the laptop index and tracked files must be clean at
+pull time so the branch can advance without flattening or silently mixing local
+WIP into Codex's commit history. This is not a start requirement. If tracked WIP
+is still present, ordinary `SPC r s/r/R/T/q/Q/u/U` commands simply defer the
+Codex checkpoint, notify you, and continue with their original sync/no-sync
+semantics. Commit or stash the tracked WIP when convenient; the next
+ordinary command imports the waiting commits automatically. Manual pull-only
+commands (`SPC r c p` and live `SPC r c f`) still report the tracked-state
+requirement because their sole requested action is the import. Unrelated
+untracked files may remain and are ignored unless an incoming commit needs the
+same path.
 
 If local commits and Codex commits conflict, the backend preserves the rebase in
 an isolated integration worktree and leaves the canonical checkout unchanged.
@@ -590,10 +599,14 @@ scratch commits are not exposed.
 
 ### Managed interactive tasks
 
-A managed interactive task requires a clean named branch and uses the branch's
-actual `HEAD` as its input. That stable base allows Codex's real commits to be
-pulled repeatedly and preserved as commits on the laptop. Starting the task does
-not switch the local branch or modify its index or working tree.
+A managed interactive task requires only a named branch. With clean tracked
+state it uses the branch's actual `HEAD`; otherwise it creates a hidden commit
+containing the exact staged and unstaged tracked working-tree state. The hidden
+commit does not move the visible branch or alter the real index. All untracked
+paths—including generated reports, scratch files, local datasets, and
+secret-like filenames—are ignored rather than inspected or transported.
+Starting the task therefore does not switch the local branch or modify its
+index, working tree, or untracked files.
 
 A live checkpoint publishes only the server worktree's committed `HEAD`.
 Uncommitted edits remain server-side and the status view reports that the
@@ -607,20 +620,15 @@ commit each validated logical unit itself.
 
 ### Common safety checks
 
-Both modes block or reject:
-
-- merge/rebase/cherry-pick/revert/bisect/git-am operations in progress at unsafe
-  boundaries;
-- repositories containing submodules in paths the snapshot logic cannot safely
-  represent;
-- modified Git LFS paths;
-- suspicious source or result paths such as live `.env` files, credentials,
-  private keys, caches, virtual environments, Nix `result*` links, generated
-  outputs, and checkpoints; common placeholder names such as `.env.example`
-  remain usable;
-- nonregular files, symlinks escaping the repository, and files over the
-  configured size limit;
-- whitespace/error conditions reported by `git diff --check`.
+Both modes block merge/rebase/cherry-pick/revert/bisect/git-am operations in
+progress at unsafe boundaries, unsupported submodules, modified tracked Git LFS
+paths, and unsafe result commits. One-shot snapshots additionally inspect any
+untracked files they intend to transport and reject secret/generated/oversized
+or escaping paths. Managed interactive starts never inspect or transport
+untracked paths, so those paths cannot block `SPC r c i`. Result publication
+still rejects secret-like files, generated outputs, nonregular files, escaping
+symlinks, oversized files, and relevant whitespace/error conditions created by
+Codex.
 
 The result scanner inspects every committed state between the task input and the
 published checkpoint/result, not only the final tree. A secret or oversized file
@@ -632,9 +640,10 @@ source file; do not expose secrets to the task worktree.
 
 ### Interactive commit pulls
 
-Let `S` be the interactive task input, `Rₙ` the latest published server
-checkpoint, and `Rₙ₋₁` the last checkpoint already pulled. The backend fetches
-only the new commit range `Rₙ₋₁..Rₙ`, replays it onto the current local branch in
+Let `S` be the interactive task input (either the actual starting `HEAD` or a
+hidden tracked-only snapshot), `Rₙ` the latest published server checkpoint, and
+`Rₙ₋₁` the last checkpoint already pulled. The backend fetches only the new
+commit range `Rₙ₋₁..Rₙ`, replays it onto the current local branch in
 a temporary integration worktree, and fast-forwards the canonical branch only
 after the replay and final state checks succeed. Commit boundaries, messages,
 authors, and ordering are retained. A later pull imports only commits that have
@@ -648,13 +657,15 @@ pull without a subsequent remote action, and `SPC r c f` remains a compatible
 manual pull/import command. Exiting the TUI is not required.
 
 When new interactive commits are available, the local index and tracked files
-must be clean and the task's expected branch must be checked out. Unrelated
-untracked files are preserved unless an incoming commit needs the same path. This
-is the boundary that lets the branch advance without flattening Codex's history
-or silently mixing local tracked WIP into those commits. If no new commit exists,
-a dirty laptop checkout does not block the normal remote action. With an explicit
-prefix, `C-u SPC r c f` allows a deliberate pull onto a different current branch;
-branch changes are never automatic.
+must be clean and the task's expected branch must be checked out before the
+branch can advance. Unrelated untracked files are preserved unless an incoming
+commit needs the same path. An automatic pull performed by an ordinary remote
+binding is deferred—not treated as a fatal error—when tracked WIP is present;
+the requested sync/run/test/setup action keeps its original behavior without
+importing that checkpoint, and a later ordinary invocation imports it after the tracked
+state is clean. Explicit pull-only commands continue to surface the requirement.
+With an explicit prefix, `C-u SPC r c f` allows a deliberate pull onto a
+different current branch; branch changes are never automatic.
 
 If the replay conflicts, the canonical checkout remains byte-for-byte unchanged.
 The backend preserves the rebase in a separate `commit-integration` worktree and
@@ -774,12 +785,13 @@ emacs --batch -Q \
   -f ert-run-tests-batch-and-exit
 ```
 
-The Python suite currently contains 65 tests. It covers hidden dirty snapshots,
+The Python suite currently contains 69 tests. It covers hidden dirty snapshots,
 visible Git-state preservation, file modes and symlinks, unsafe-file filtering,
 one-shot delta imports, incremental interactive checkpoint publication, history-
 rewrite rejection, commit-preserving pulls, repeated pulls, unrelated-untracked-file preservation,
-untracked-path collision blocking, isolated commit conflicts, clean/named
-interactive start requirements, final interactive commit-
+untracked-path collision blocking, isolated commit conflicts, named-branch
+interactive start requirements, tracked-WIP snapshots, complete untracked-file
+exclusion at interactive start, final interactive commit-
 chain publication, trusted live job-request/response brokering, unchanged-input
 job launches, one-shot nonblocking job requests, frozen-worktree bootstrap and
 preflight tests, source-integrity checks, run manifests and state transitions,
@@ -788,8 +800,10 @@ read-only structured analysis, global `AGENTS.md` managed-block replacement, and
 the Doom command-construction/status helpers.
 
 A real acceptance test still requires the actual SSH alias, authenticated server,
-kitty, tmux, and Codex account. For an interactive smoke test, start from a clean
-disposable branch, have Codex create two commits, pull after each with ordinary
+kitty, tmux, and Codex account. For an interactive smoke test, start from a
+disposable named branch; tracked WIP and untracked files may remain. Commit or
+stash tracked WIP before the first checkpoint pull, have Codex create two
+commits, pull after each with ordinary
 remote bindings, detach and reattach, and verify that both commit messages remain
 in local history. Then request a harmless frozen job and confirm that it starts
 while the TUI remains usable. For a one-shot smoke test, confirm that importing
