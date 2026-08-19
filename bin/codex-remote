@@ -44,6 +44,8 @@ JOB_REQUEST_RELATIVE = ".codex-job-request.json"
 JOB_RESPONSE_RELATIVE = ".codex-job-response.json"
 ENV_REQUEST_RELATIVE = ".codex-env-request.json"
 ENV_RESPONSE_RELATIVE = ".codex-env-response.json"
+COMMIT_REQUEST_RELATIVE = ".codex-commit-request.json"
+COMMIT_RESPONSE_RELATIVE = ".codex-commit-response.json"
 ENV_ACTIONS = {"refresh", "test", "check"}
 JOB_POLICIES = {"deny", "prepare", "launch"}
 JOB_ACTIVE_STATES = {"STARTING", "BOOTSTRAPPING", "RUNNING", "STOP_REQUESTED"}
@@ -3384,6 +3386,176 @@ def consume_env_request(task: Mapping[str, Any]) -> dict[str, Any] | None:
     return normalized_env_request(value)
 
 
+def normalized_commit_request(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one trusted commit request from sandboxed interactive Codex."""
+    message = value.get("message")
+    if not isinstance(message, str):
+        raise CodexRemoteError(
+            "A commit request needs a commit message",
+            code="INVALID_COMMIT_REQUEST",
+        )
+    message = message.strip()
+    if not message or len(message.encode("utf-8")) > 8192:
+        raise CodexRemoteError(
+            "Commit message must be nonempty and at most 8 KiB",
+            code="INVALID_COMMIT_REQUEST",
+        )
+    if any(ord(char) < 32 and char not in "\n\t" for char in message):
+        raise CodexRemoteError(
+            "Commit message contains unsupported control characters",
+            code="INVALID_COMMIT_REQUEST",
+        )
+
+    raw_paths = value.get("paths")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise CodexRemoteError(
+            "A commit request must name at least one repository path",
+            code="INVALID_COMMIT_REQUEST",
+        )
+    if len(raw_paths) > 256:
+        raise CodexRemoteError(
+            "A commit request may name at most 256 paths",
+            code="INVALID_COMMIT_REQUEST",
+        )
+
+    control_paths = {
+        JOB_REQUEST_RELATIVE,
+        JOB_RESPONSE_RELATIVE,
+        ENV_REQUEST_RELATIVE,
+        ENV_RESPONSE_RELATIVE,
+        COMMIT_REQUEST_RELATIVE,
+        COMMIT_RESPONSE_RELATIVE,
+    }
+    paths: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_paths:
+        if not isinstance(raw, str):
+            raise CodexRemoteError(
+                "Commit paths must be strings",
+                code="INVALID_COMMIT_REQUEST",
+            )
+        if not raw or len(raw.encode("utf-8")) > 4096:
+            raise CodexRemoteError(
+                "Commit paths must be nonempty and at most 4096 bytes",
+                code="INVALID_COMMIT_REQUEST",
+            )
+        if any(ord(char) < 32 for char in raw):
+            raise CodexRemoteError(
+                "Commit path contains unsupported control characters",
+                code="INVALID_COMMIT_REQUEST",
+            )
+        pure = PurePosixPath(raw)
+        if pure.is_absolute() or ".." in pure.parts or not pure.parts:
+            raise CodexRemoteError(
+                f"Commit path must stay inside the assigned worktree: {raw}",
+                code="INVALID_COMMIT_REQUEST",
+            )
+        normalized = pure.as_posix()
+        if normalized in {".", ""} or ".git" in pure.parts:
+            raise CodexRemoteError(
+                f"Commit path may not target Git metadata: {raw}",
+                code="INVALID_COMMIT_REQUEST",
+            )
+        if normalized in control_paths:
+            raise CodexRemoteError(
+                f"Commit path may not target codex-remote control state: {raw}",
+                code="INVALID_COMMIT_REQUEST",
+            )
+        if normalized not in seen:
+            seen.add(normalized)
+            paths.append(normalized)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "message": message,
+        "paths": paths,
+        "requested_at": value.get("requested_at") or utc_now(),
+    }
+
+
+def request_commit_file(
+    request_file: Path,
+    response_file: Path,
+    *,
+    message: str,
+    paths: Sequence[str],
+    wait_seconds: int,
+) -> dict[str, Any]:
+    """Ask the live trusted runner to create one Git commit."""
+    if (
+        request_file.name != COMMIT_REQUEST_RELATIVE
+        or response_file.name != COMMIT_RESPONSE_RELATIVE
+    ):
+        raise CodexRemoteError(
+            "Unexpected commit control path",
+            code="INVALID_COMMIT_REQUEST",
+        )
+    expected_path = os.environ.get("CODEX_COMMIT_REQUEST_PATH")
+    if expected_path and request_file.resolve(strict=False) != Path(expected_path).resolve(
+        strict=False
+    ):
+        raise CodexRemoteError(
+            "Commit request path does not match the runner-authorized worktree",
+            code="INVALID_COMMIT_REQUEST",
+        )
+    request = normalized_commit_request({"message": message, "paths": list(paths)})
+    if request_file.exists() or request_file.is_symlink():
+        raise CodexRemoteError(
+            "A commit request is already pending",
+            code="COMMIT_REQUEST_EXISTS",
+        )
+    with contextlib.suppress(FileNotFoundError):
+        response_file.unlink()
+    atomic_write_json(request_file, request)
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        response = read_json(response_file)
+        if response is not None:
+            with contextlib.suppress(FileNotFoundError):
+                response_file.unlink()
+            if not response.get("ok", False):
+                raise CodexRemoteError(
+                    str(response.get("error") or "The trusted commit action failed"),
+                    code=str(response.get("error_code") or "COMMIT_ACTION_FAILED"),
+                    details=response.get("details"),
+                )
+            return response
+        time.sleep(0.2)
+    raise CodexRemoteError(
+        "Timed out waiting for the trusted runner to process the commit request",
+        code="COMMIT_REQUEST_TIMEOUT",
+    )
+
+
+def consume_commit_request(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    request_path = Path(task["worktree"]) / COMMIT_REQUEST_RELATIVE
+    if not request_path.exists() and not request_path.is_symlink():
+        return None
+    if request_path.is_symlink() or not request_path.is_file():
+        raise CodexRemoteError(
+            "The commit request is not a regular file",
+            code="INVALID_COMMIT_REQUEST",
+        )
+    if request_path.stat().st_size > 256 * 1024:
+        with contextlib.suppress(FileNotFoundError):
+            request_path.unlink()
+        raise CodexRemoteError(
+            "The commit request is too large",
+            code="INVALID_COMMIT_REQUEST",
+        )
+    try:
+        value = read_json(request_path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            request_path.unlink()
+    if not isinstance(value, dict):
+        raise CodexRemoteError(
+            "The commit request is invalid JSON",
+            code="INVALID_COMMIT_REQUEST",
+        )
+    return normalized_commit_request(value)
+
+
 def normalized_job_request(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and normalize one frozen experiment launch request."""
     name = value.get("name")
@@ -3620,9 +3792,16 @@ def codex_job_instructions(task: Mapping[str, Any]) -> str:
         base += (
             " Create small, coherent Git commits whenever a logical unit is complete and "
             "validated so the laptop can pull those commits while this session remains open. "
-            "Do not amend, rebase, reset, or otherwise rewrite commits created in this "
-            "session; the laptop may publish them at any time. Leave incomplete work "
-            "uncommitted until it forms a coherent checkpoint."
+            "The workspace sandbox intentionally protects Git metadata, so do not run git add, "
+            "git commit, git reset, git rebase, git merge, or another Git command that writes "
+            "repository metadata. Read-only Git commands such as git status, git diff, git log, "
+            "and git show are fine. To create each logical commit, call the trusted broker as "
+            "\"$CODEX_COMMIT\" -m \"COMMIT MESSAGE\" -- PATH [PATH ...]. Name only the paths "
+            "that belong in that logical unit; the broker stages exactly those paths, creates "
+            "the commit with your message, safety-checks it, and immediately publishes it for "
+            "the laptop. Do not amend, rebase, reset, or otherwise rewrite brokered commits; "
+            "the laptop may pull them at any time. Leave incomplete work uncommitted until it "
+            "forms a coherent checkpoint."
             " When the user asks you to implement, build, fix, or change something, carry "
             "the in-scope task through inspection, editing, relevant non-destructive "
             "validation, failure diagnosis, and iteration; do not stop after merely "
@@ -3982,6 +4161,10 @@ def codex_process_environment(task: Mapping[str, Any]) -> dict[str, str]:
             "CODEX_ENV_REQUEST_PATH": str(
                 Path(task["worktree"]) / ENV_REQUEST_RELATIVE
             ),
+            "CODEX_COMMIT": str(task.get("commitctl_path") or ""),
+            "CODEX_COMMIT_REQUEST_PATH": str(
+                Path(task["worktree"]) / COMMIT_REQUEST_RELATIVE
+            ),
             "CODEX_DEV": str(task.get("dev_wrapper_path") or ""),
         }
     )
@@ -4187,10 +4370,13 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
         worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         jobctl_path = state_dir / "codex-jobctl"
         envctl_path = state_dir / "codex-envctl"
+        commitctl_path = state_dir / "codex-commit"
         request_path = worktree / JOB_REQUEST_RELATIVE
         response_path = worktree / JOB_RESPONSE_RELATIVE
         env_request_path = worktree / ENV_REQUEST_RELATIVE
         env_response_path = worktree / ENV_RESPONSE_RELATIVE
+        commit_request_path = worktree / COMMIT_REQUEST_RELATIVE
+        commit_response_path = worktree / COMMIT_RESPONSE_RELATIVE
         jobctl_command = (
             f"exec {shlex.quote(str(Path(sys.executable).resolve()))} "
             f"{shlex.quote(str(runner_helper))} _job-request "
@@ -4236,6 +4422,18 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
         )
         envctl_path.chmod(0o700)
 
+        commitctl_path.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            f"exec {shlex.quote(str(Path(sys.executable).resolve()))} "
+            f"{shlex.quote(str(runner_helper))} _commit-request "
+            f"--request-file {shlex.quote(str(commit_request_path))} "
+            f"--response-file {shlex.quote(str(commit_response_path))} "
+            "--wait-seconds 900 \"$@\"\n",
+            encoding="utf-8",
+        )
+        commitctl_path.chmod(0o700)
+
         session_prefix = "codexi" if execution_mode == "interactive" else "codex"
         session = f"{session_prefix}-{project_id[-12:]}-{task_id_value[-8:]}"
         task = {
@@ -4262,6 +4460,7 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
             "runner_helper_sha256": sha256_file(runner_helper),
             "jobctl_path": str(jobctl_path),
             "envctl_path": str(envctl_path),
+            "commitctl_path": str(commitctl_path),
             "tmux_session": session,
             "lock_path": str(paths["lock"]),
             "bootstrap_cmd": payload.get("bootstrap_cmd"),
@@ -4786,17 +4985,235 @@ def process_start_ticks(pid: int) -> int | None:
         return None
 
 
+def server_interactive_commit_action(
+    project_id: str,
+    task_id_value: str,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create and publish one Codex-authored commit outside the sandbox.
+
+    Interactive Codex can edit the assigned worktree but the workspace-write
+    sandbox intentionally protects Git metadata.  This broker uses a temporary
+    index so Codex can choose an exact path set without exposing the repository
+    index, refs, or object database to the sandboxed process.
+    """
+    paths = ensure_server_layout(project_id)
+    task = load_server_task(paths, task_id_value)
+    if not task:
+        raise CodexRemoteError("Task state not found", code="TASK_NOT_FOUND")
+    if task_execution_mode(task) != "interactive" or task.get("state") != "RUNNING":
+        raise CodexRemoteError(
+            "Commit control is available only while an interactive task is running",
+            code="COMMIT_CONTROL_NOT_RUNNING",
+        )
+
+    normalized = normalized_commit_request(request)
+    worktree = Path(task["worktree"])
+    if not worktree.is_dir():
+        raise CodexRemoteError(
+            "The interactive task worktree is missing",
+            code="CHECKPOINT_WORKTREE_MISSING",
+        )
+
+    # The sandbox cannot normally alter the real index.  Refuse to paper over
+    # unexpected staged state rather than mixing it into a Codex checkpoint.
+    staged = git(worktree, "diff", "--cached", "--quiet", "HEAD", "--", check=False)
+    if staged.returncode not in {0, 1}:
+        raise CodexRemoteError(
+            "Could not inspect the managed worktree index",
+            code="COMMIT_INDEX_CHECK_FAILED",
+        )
+    if staged.returncode == 1:
+        raise CodexRemoteError(
+            "The managed worktree index already contains staged changes; refusing to mix them into a brokered commit",
+            code="COMMIT_INDEX_DIRTY",
+            details={"status": git(worktree, "status", "--short", "--untracked-files=no").stdout},
+        )
+
+    input_sha = str(task.get("input_sha") or "")
+    head = current_head(worktree)
+    if not input_sha or git(
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        input_sha,
+        head,
+        check=False,
+    ).returncode != 0:
+        raise CodexRemoteError(
+            "Interactive Codex history no longer descends from the task input",
+            code="INVALID_RESULT_HISTORY",
+        )
+    prior = load_task_checkpoint(task) or {}
+    prior_sha = str(prior.get("sha") or input_sha)
+    if git(
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        prior_sha,
+        head,
+        check=False,
+    ).returncode != 0:
+        raise CodexRemoteError(
+            "Interactive Codex rewrote commits that were already published",
+            code="CHECKPOINT_HISTORY_REWRITTEN",
+            details={"published_sha": prior_sha, "current_head": head},
+        )
+
+    state_dir = Path(task["state_dir"])
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.TemporaryDirectory(prefix="commit-index-", dir=state_dir) as temp_dir:
+        temp_index = Path(temp_dir) / "index"
+        index_env = os.environ.copy()
+        index_env["GIT_INDEX_FILE"] = str(temp_index)
+        # Prevent Git pathspec magic from expanding a Codex-provided literal
+        # path into a broader staging set.
+        index_env["GIT_LITERAL_PATHSPECS"] = "1"
+        git(worktree, "read-tree", head, env=index_env)
+        git(
+            worktree,
+            "add",
+            "-A",
+            "--",
+            *normalized["paths"],
+            env=index_env,
+        )
+        staged_paths = nul_paths(
+            git(
+                worktree,
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                head,
+                "--",
+                env=index_env,
+            ).stdout
+        )
+        if not staged_paths:
+            raise CodexRemoteError(
+                "The requested paths contain no changes to commit",
+                code="COMMIT_NO_CHANGES",
+                details={"paths": normalized["paths"]},
+            )
+        diff_check = git(
+            worktree,
+            "diff",
+            "--cached",
+            "--check",
+            head,
+            "--",
+            env=index_env,
+            check=False,
+        )
+        if diff_check.returncode != 0:
+            raise CodexRemoteError(
+                "Brokered commit failed `git diff --cached --check`:\n"
+                + (diff_check.stdout or diff_check.stderr),
+                code="RESULT_DIFF_CHECK_FAILED",
+            )
+        tree = git(worktree, "write-tree", env=index_env).stdout.strip()
+
+    head_tree = git(worktree, "rev-parse", f"{head}^{{tree}}").stdout.strip()
+    if tree == head_tree:
+        raise CodexRemoteError(
+            "The requested paths contain no changes to commit",
+            code="COMMIT_NO_CHANGES",
+            details={"paths": normalized["paths"]},
+        )
+
+    commit_env = os.environ.copy()
+    commit_env.update(
+        {
+            "GIT_AUTHOR_NAME": "Codex Remote",
+            "GIT_AUTHOR_EMAIL": "codex-remote@localhost",
+            "GIT_COMMITTER_NAME": "Codex Remote",
+            "GIT_COMMITTER_EMAIL": "codex-remote@localhost",
+        }
+    )
+    commit_sha = git(
+        worktree,
+        "commit-tree",
+        tree,
+        "-p",
+        head,
+        env=commit_env,
+        input_data=normalized["message"].rstrip() + "\n",
+    ).stdout.strip()
+
+    # Validate the candidate object graph before advancing the worktree HEAD.
+    ensure_safe_result_delta(
+        worktree,
+        input_sha,
+        commit_sha,
+        int(task.get("max_untracked_bytes") or DEFAULT_MAX_UNTRACKED_BYTES),
+    )
+    if current_head(worktree) != head:
+        raise CodexRemoteError(
+            "The interactive HEAD changed while the trusted commit was being prepared; retry the commit",
+            code="COMMIT_HEAD_CHANGED",
+            details={"expected_head": head, "current_head": current_head(worktree)},
+        )
+    # A mixed reset updates the detached worktree HEAD and its real index while
+    # preserving every selected and unselected worktree file exactly as Codex
+    # left it.  Unselected WIP therefore stays uncommitted for a later logical
+    # checkpoint.
+    git(worktree, "reset", "--mixed", "--quiet", commit_sha)
+    checkpoint = publish_task_checkpoint(paths, task)
+    result = {
+        "ok": True,
+        "commit": {
+            "sha": commit_sha,
+            "message": normalized["message"],
+            "paths": staged_paths,
+        },
+        "checkpoint": checkpoint,
+        "remaining_tracked_status": tracked_status_porcelain(worktree),
+        "finished_at": utc_now(),
+    }
+    task["last_interactive_commit"] = result
+    save_server_task(paths, task)
+    return result
+
+
 def interactive_job_request_watcher(
     project_id: str,
     task_id_value: str,
     stop_event: threading.Event,
 ) -> None:
-    """Broker trusted environment and job requests while the TUI is active."""
+    """Broker trusted commit, environment, and job requests while the TUI is active."""
     paths = ensure_server_layout(project_id)
     while not stop_event.is_set():
         task = load_server_task(paths, task_id_value)
         if not task:
             return
+        commit_request_path = Path(task["worktree"]) / COMMIT_REQUEST_RELATIVE
+        commit_response_path = Path(task["worktree"]) / COMMIT_RESPONSE_RELATIVE
+        if commit_request_path.exists() or commit_request_path.is_symlink():
+            try:
+                request = consume_commit_request(task)
+                if request is None:
+                    time.sleep(0.1)
+                    continue
+                response = server_interactive_commit_action(
+                    project_id, task_id_value, request
+                )
+            except CodexRemoteError as exc:
+                response = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": exc.code,
+                    "details": exc.details,
+                }
+            except Exception as exc:  # defensive broker boundary
+                response = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": "UNEXPECTED_COMMIT_BROKER_ERROR",
+                    "details": traceback.format_exc(),
+                }
+            atomic_write_json(commit_response_path, response)
+            continue
         env_request_path = Path(task["worktree"]) / ENV_REQUEST_RELATIVE
         env_response_path = Path(task["worktree"]) / ENV_RESPONSE_RELATIVE
         if env_request_path.exists() or env_request_path.is_symlink():
@@ -5133,6 +5550,10 @@ def server_run(project_id: str, task_id_value: str) -> int:
                 (worktree / ENV_RESPONSE_RELATIVE).unlink()
             with contextlib.suppress(FileNotFoundError):
                 (worktree / ENV_REQUEST_RELATIVE).unlink()
+            with contextlib.suppress(FileNotFoundError):
+                (worktree / COMMIT_RESPONSE_RELATIVE).unlink()
+            with contextlib.suppress(FileNotFoundError):
+                (worktree / COMMIT_REQUEST_RELATIVE).unlink()
         else:
             prompt_path = task.get("prompt_path")
             if not isinstance(prompt_path, str) or not prompt_path:
@@ -7006,6 +7427,12 @@ def build_parser() -> argparse.ArgumentParser:
     env_request_parser.add_argument("--response-file", required=True)
     env_request_parser.add_argument("--wait-seconds", type=int, default=1800)
     env_request_parser.add_argument("--action", choices=sorted(ENV_ACTIONS), required=True)
+    commit_request_parser = sub.add_parser("_commit-request")
+    commit_request_parser.add_argument("--request-file", required=True)
+    commit_request_parser.add_argument("--response-file", required=True)
+    commit_request_parser.add_argument("--wait-seconds", type=int, default=900)
+    commit_request_parser.add_argument("-m", "--message", required=True)
+    commit_request_parser.add_argument("paths", nargs=argparse.REMAINDER)
     server_job_request_parser = sub.add_parser("_server-request-job")
     server_job_request_parser.add_argument("--project-id", required=True)
     server_job_request_parser.add_argument("--task-id", required=True)
@@ -7114,6 +7541,17 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
             Path(args.request_file),
             Path(args.response_file),
             action=args.action,
+            wait_seconds=args.wait_seconds,
+        )
+    if args.command == "_commit-request":
+        commit_paths = list(args.paths)
+        if commit_paths and commit_paths[0] == "--":
+            commit_paths.pop(0)
+        return request_commit_file(
+            Path(args.request_file),
+            Path(args.response_file),
+            message=args.message,
+            paths=commit_paths,
             wait_seconds=args.wait_seconds,
         )
     if args.command == "_server-request-job":
