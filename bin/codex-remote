@@ -4890,6 +4890,11 @@ def server_interactive_env_action(
                 "No trusted bootstrap command is configured or inferable for this task",
                 code="ENV_REFRESH_NOT_CONFIGURED",
             )
+        tools = task.get("tools")
+        nix = tools.get("nix") if isinstance(tools, Mapping) else None
+        bootstrap = nonmutating_nix_develop_command(
+            bootstrap, worktree, nix if isinstance(nix, str) else None
+        ) or bootstrap
         refresh_log = state_dir / "interactive-environment-refresh.log"
         rc = run_shell_quiet_logged(
             task["tools"]["bash"],
@@ -4930,6 +4935,11 @@ def server_interactive_env_action(
                 code="ENV_TEST_NOT_CONFIGURED",
                 details=result,
             )
+        tools = task.get("tools")
+        nix = tools.get("nix") if isinstance(tools, Mapping) else None
+        test_command = nonmutating_nix_develop_command(
+            test_command, worktree, nix if isinstance(nix, str) else None
+        ) or test_command
         test_log = state_dir / "interactive-trusted-tests.log"
         rc = run_shell_quiet_logged(
             task["tools"]["bash"],
@@ -5197,6 +5207,12 @@ def server_run(project_id: str, task_id_value: str) -> int:
 
         environment_state: str | None = None
         bootstrap = task.get("bootstrap_cmd")
+        if task_execution_mode(task) == "interactive" and isinstance(bootstrap, str):
+            tools = task.get("tools")
+            nix = tools.get("nix") if isinstance(tools, Mapping) else None
+            bootstrap = nonmutating_nix_develop_command(
+                bootstrap, worktree, nix if isinstance(nix, str) else None
+            ) or bootstrap
         if has_changes and changed_locks:
             if bootstrap:
                 task["state"] = "REFRESHING_ENVIRONMENT"
@@ -5254,6 +5270,12 @@ def server_run(project_id: str, task_id_value: str) -> int:
         test_rc: int | None = None
         test_dirty = ""
         test_command = task.get("test_cmd")
+        if task_execution_mode(task) == "interactive" and isinstance(test_command, str):
+            tools = task.get("tools")
+            nix = tools.get("nix") if isinstance(tools, Mapping) else None
+            test_command = nonmutating_nix_develop_command(
+                test_command, worktree, nix if isinstance(nix, str) else None
+            ) or test_command
         can_test = environment_state not in {
             "READY_ENVIRONMENT_FAILED",
             "READY_ENVIRONMENT_DIRTY",
@@ -6131,6 +6153,12 @@ def server_job_run(project_id: str, run_id: str) -> int:
         job["runner_start_ticks"] = process_start_ticks(os.getpid())
         job["started_at"] = utc_now()
         bootstrap = str(job.get("bootstrap_cmd") or "")
+        if bootstrap:
+            tools = job.get("tools")
+            nix = tools.get("nix") if isinstance(tools, Mapping) else None
+            bootstrap = nonmutating_nix_develop_command(
+                bootstrap, Path(job["worktree"]), nix if isinstance(nix, str) else None
+            ) or bootstrap
         job["state"] = "BOOTSTRAPPING" if bootstrap else "RUNNING"
         job["phase"] = "bootstrap" if bootstrap else "preparing-data"
         job = save_server_job(paths, job)
@@ -6199,6 +6227,11 @@ def server_job_run(project_id: str, run_id: str) -> int:
 
         preflight = str(job.get("preflight_test_cmd") or "")
         if preflight:
+            tools = job.get("tools")
+            nix = tools.get("nix") if isinstance(tools, Mapping) else None
+            preflight = nonmutating_nix_develop_command(
+                preflight, Path(job["worktree"]), nix if isinstance(nix, str) else None
+            ) or preflight
             preflight_log = Path(job["state_dir"]) / "preflight-tests.log"
             job["phase"] = "preflight-tests"
             job["preflight_tests"] = {

@@ -262,8 +262,9 @@ runner before Codex starts. When the configured bootstrap or test command uses
 it tries the flake's default shell and then `.#server`. The runner captures the
 resulting toolchain environment and launches Codex with its `PATH`, Python,
 `uv`, compilers, and system-library variables available. An existing `.venv` is
-activated automatically. Every trusted `nix develop` probe is made read-only
-with respect to flake locks: when `flake.lock` is absent,
+activated automatically. Trusted `nix develop` probes, bootstraps, refreshes,
+tests, and frozen-job preflights are made read-only with respect to flake locks:
+when `flake.lock` is absent,
 `--no-write-lock-file` permits an ephemeral resolution without creating a file;
 when a lock exists, `--no-update-lock-file --no-write-lock-file` keeps it pinned.
 If a repository contains both `pyproject.toml` and `uv.lock` but has no
