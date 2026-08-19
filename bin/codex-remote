@@ -494,13 +494,15 @@ def ensure_safe_untracked(root: Path, max_bytes: int) -> None:
         )
 
 
-def changed_paths(root: Path) -> list[str]:
+def changed_paths(root: Path, *, include_untracked: bool = True) -> list[str]:
     tracked = nul_paths(git(root, "diff", "--name-only", "-z", "HEAD", "--").stdout)
-    return sorted(set(tracked + untracked_paths(root)))
+    if include_untracked:
+        tracked.extend(untracked_paths(root))
+    return sorted(set(tracked))
 
 
-def ensure_no_changed_lfs_paths(root: Path) -> None:
-    paths = changed_paths(root)
+def ensure_no_changed_lfs_paths(root: Path, *, include_untracked: bool = True) -> None:
+    paths = changed_paths(root, include_untracked=include_untracked)
     if not paths:
         return
     lfs_paths: list[str] = []
@@ -661,7 +663,20 @@ def snapshot_tree_only(root: Path) -> str:
         return git(root, "write-tree", env=env).stdout.strip()
 
 
-def create_hidden_snapshot(root: Path, ref: str, message: str) -> dict[str, str]:
+def create_hidden_snapshot(
+    root: Path,
+    ref: str,
+    message: str,
+    *,
+    include_untracked: bool = True,
+) -> dict[str, str]:
+    """Create a hidden commit without touching the visible checkout.
+
+    One-shot tasks keep their historical behavior and may include safety-checked
+    untracked source files. Managed interactive tasks pass ``include_untracked=False``:
+    their input contains the exact tracked working-tree state, while every untracked
+    path remains private to the laptop and invisible to Codex.
+    """
     head = current_head(root)
     with tempfile.TemporaryDirectory(prefix="codex-remote-index-") as temp_dir:
         temp_index = Path(temp_dir) / "index"
@@ -672,7 +687,14 @@ def create_hidden_snapshot(root: Path, ref: str, message: str) -> dict[str, str]
         env.setdefault("GIT_COMMITTER_NAME", "Codex Remote")
         env.setdefault("GIT_COMMITTER_EMAIL", "codex-remote@localhost")
         git(root, "read-tree", "HEAD", env=env)
-        git(root, "add", "-A", "--", ".", env=env)
+        git(
+            root,
+            "add",
+            "-A" if include_untracked else "-u",
+            "--",
+            ".",
+            env=env,
+        )
         tree = git(root, "write-tree", env=env).stdout.strip()
         commit = git(
             root,
@@ -1008,11 +1030,25 @@ def common_local_args(args: argparse.Namespace) -> tuple[Path, str, str, int, st
     return root, host, remote_dir, timeout, project_id, project_name
 
 
-def check_startable_local(root: Path, max_bytes: int) -> None:
+def check_startable_local(
+    root: Path,
+    max_bytes: int,
+    *,
+    include_untracked: bool = True,
+) -> None:
+    """Validate local state before creating a task snapshot.
+
+    One-shot tasks intentionally transport selected untracked source files, so
+    they retain the existing untracked-file safety checks. Managed interactive
+    tasks preserve real commits and start from tracked Git state only: unrelated
+    untracked files are neither inspected nor uploaded and therefore must not
+    block ``SPC r c i``.
+    """
     ensure_git_idle(root)
     ensure_no_submodules(root)
-    ensure_safe_untracked(root, max_bytes)
-    ensure_no_changed_lfs_paths(root)
+    if include_untracked:
+        ensure_safe_untracked(root, max_bytes)
+    ensure_no_changed_lfs_paths(root, include_untracked=include_untracked)
 
 
 def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
@@ -1090,7 +1126,11 @@ def start_new_task(
         )
 
     root, host, remote_dir, timeout, project_id, project_name = common_local_args(args)
-    check_startable_local(root, args.max_untracked_bytes)
+    check_startable_local(
+        root,
+        args.max_untracked_bytes,
+        include_untracked=execution_mode != "interactive",
+    )
     context = ensure_remote_helper(host, timeout)
     init = remote_invoke(context, ["_server-init", "--project-id", project_id], timeout=timeout)
     status = remote_status(context, project_id, timeout)
@@ -1133,23 +1173,24 @@ def start_new_task(
             code="INTERACTIVE_REQUIRES_BRANCH",
         )
     if execution_mode == "interactive":
-        status_text = git_status_porcelain(root)
-        if status_text.strip():
-            raise CodexRemoteError(
-                "Managed interactive Codex now preserves and incrementally imports real "
-                "commits. Commit or stash the local working tree before starting SPC r c i.",
-                code="INTERACTIVE_REQUIRES_CLEAN_CHECKOUT",
-                details={"status": status_text},
+        tracked_status = tracked_status_porcelain(root)
+        if tracked_status.strip():
+            snapshot = create_hidden_snapshot(
+                root,
+                input_ref,
+                f"Codex remote interactive tracked snapshot {project_id}/{identifier}",
+                include_untracked=False,
             )
-        head = current_head(root)
-        tree = git(root, "rev-parse", f"{head}^{{tree}}").stdout.strip()
-        git(root, "update-ref", input_ref, head)
-        snapshot = {
-            "commit": head,
-            "tree": tree,
-            "head": head,
-            "index_tree": index_tree(root),
-        }
+        else:
+            head = current_head(root)
+            tree = git(root, "rev-parse", f"{head}^{{tree}}").stdout.strip()
+            git(root, "update-ref", input_ref, head)
+            snapshot = {
+                "commit": head,
+                "tree": tree,
+                "head": head,
+                "index_tree": index_tree(root),
+            }
     else:
         snapshot = create_hidden_snapshot(
             root,
@@ -3945,6 +3986,11 @@ def remove_data_links(task: Mapping[str, Any]) -> None:
             except OSError:
                 break
             parent = parent.parent
+
+
+def tracked_status_porcelain(root: Path) -> str:
+    """Return staged/unstaged tracked status without reporting untracked paths."""
+    return git(root, "status", "--porcelain=v1", "--untracked-files=no").stdout
 
 
 def git_status_porcelain(root: Path) -> str:

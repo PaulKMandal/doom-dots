@@ -131,6 +131,41 @@ class SnapshotTests(RepositoryTestCase):
         self.assertTrue((materialized / "script-link").is_symlink())
         self.assertEqual(os.readlink(materialized / "script-link"), "script.sh")
 
+    def test_tracked_only_hidden_snapshot_excludes_all_untracked_paths(self) -> None:
+        tracked = self.root / "tracked.txt"
+        tracked.write_text("one\nstaged\nthree\nfour\n", encoding="utf-8")
+        git(self.root, "add", "tracked.txt")
+        tracked.write_text("one\nstaged\nunstaged\nfour\n", encoding="utf-8")
+
+        untracked = {
+            ".env": "TOKEN=local-only\n",
+            "codex_remote_smoke_test.txt": "local smoke output\n",
+            "reports/bootstrap-summary.md": "generated locally\n",
+        }
+        for relative, content in untracked.items():
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+        before = visible_state(self.root)
+        snapshot = cr.create_hidden_snapshot(
+            self.root,
+            "refs/codex/test/input/tracked-only",
+            "tracked-only interactive snapshot",
+            include_untracked=False,
+        )
+        self.assertEqual(before, visible_state(self.root))
+
+        materialized = self.add_detached_worktree(
+            snapshot["commit"], "tracked-only-snapshot"
+        )
+        self.assertEqual(
+            (materialized / "tracked.txt").read_text(encoding="utf-8"),
+            "one\nstaged\nunstaged\nfour\n",
+        )
+        for relative in untracked:
+            self.assertFalse((materialized / relative).exists(), relative)
+
     def test_untracked_safety_detects_secrets_generated_files_large_files_and_escaping_links(self) -> None:
         (self.root / ".env").write_text("TOKEN=x\n", encoding="utf-8")
         (self.root / ".cache").mkdir()
@@ -606,6 +641,47 @@ class LiveCheckpointTests(RepositoryTestCase):
         self.assertEqual(git(self.root, "log", "-1", "--format=%s").stdout.strip(),
                          "remote logical unit three")
         self.assertTrue((self.root / "third.py").is_file())
+
+    def test_checkpoint_pull_from_dirty_tracked_input_preserves_codex_commit(self) -> None:
+        tracked = self.root / "tracked.txt"
+        tracked.write_text("one\nlocal-baseline\nthree\nfour\n", encoding="utf-8")
+        snapshot = cr.create_hidden_snapshot(
+            self.root,
+            "refs/codex/live/input/dirty-tracked",
+            "interactive tracked input",
+            include_untracked=False,
+        )
+        local_baseline = commit_all(self.root, "commit local starting state")
+
+        remote = self.add_detached_worktree(snapshot["commit"], "dirty-input-remote")
+        remote_lines = (remote / "tracked.txt").read_text(encoding="utf-8").splitlines()
+        remote_lines[3] = "codex-change"
+        (remote / "tracked.txt").write_text(
+            "\n".join(remote_lines) + "\n", encoding="utf-8"
+        )
+        remote_tip = commit_all(remote, "Codex logical unit")
+
+        result = cr.integrate_committed_checkpoint(
+            self.root,
+            "live-project",
+            "task-dirty-input",
+            snapshot["commit"],
+            remote_tip,
+            state_dir=self.base / "dirty-input-state",
+        )
+
+        self.assertEqual(result["changed_commit_count"], 1)
+        self.assertEqual(
+            git(self.root, "log", "-1", "--format=%s").stdout.strip(),
+            "Codex logical unit",
+        )
+        self.assertEqual(
+            git(self.root, "rev-parse", "HEAD^").stdout.strip(), local_baseline
+        )
+        self.assertEqual(
+            tracked.read_text(encoding="utf-8"),
+            "one\nlocal-baseline\nthree\ncodex-change\n",
+        )
 
     def test_checkpoint_pull_preserves_unrelated_untracked_files(self) -> None:
         input_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
@@ -1877,13 +1953,17 @@ class MiscellaneousTests(RepositoryTestCase):
             job_policy="launch",
         )
 
-    def test_interactive_start_requires_clean_named_local_branch(self) -> None:
+    def test_interactive_start_accepts_dirty_tracked_named_local_branch(self) -> None:
         args = self.interactive_start_args()
-        (self.root / "tracked.txt").write_text(
-            "one\nDIRTY\nthree\nfour\n", encoding="utf-8"
-        )
+        tracked = self.root / "tracked.txt"
+        tracked.write_text("one\nSTAGED\nthree\nfour\n", encoding="utf-8")
+        git(self.root, "add", "tracked.txt")
+        tracked.write_text("one\nSTAGED\nUNSTAGED\nfour\n", encoding="utf-8")
+
         with (
-            mock.patch.object(cr, "ensure_remote_helper", return_value={"helper": "/helper"}),
+            mock.patch.object(
+                cr, "ensure_remote_helper", return_value={"helper": "/helper"}
+            ),
             mock.patch.object(
                 cr,
                 "remote_invoke",
@@ -1892,13 +1972,27 @@ class MiscellaneousTests(RepositoryTestCase):
             mock.patch.object(
                 cr, "remote_status", return_value={"task": {"state": "NONE"}}
             ),
-            mock.patch.object(cr, "local_current_path", return_value=self.base / "current.json"),
+            mock.patch.object(
+                cr, "local_current_path", return_value=self.base / "current.json"
+            ),
+            mock.patch.object(
+                cr,
+                "create_hidden_snapshot",
+                side_effect=RuntimeError("tracked-only snapshot requested"),
+            ) as snapshot,
         ):
-            with self.assertRaises(cr.CodexRemoteError) as caught:
+            with self.assertRaisesRegex(
+                RuntimeError, "tracked-only snapshot requested"
+            ):
                 cr.start_new_task(args, execution_mode="interactive", prompt=None)
-        self.assertEqual(caught.exception.code, "INTERACTIVE_REQUIRES_CLEAN_CHECKOUT")
 
-        git(self.root, "reset", "--hard", "HEAD")
+        self.assertTrue(snapshot.call_args.kwargs["include_untracked"] is False)
+        tracked_status = cr.tracked_status_porcelain(self.root)
+        self.assertIn("tracked.txt", tracked_status)
+        self.assertNotIn("??", tracked_status)
+
+    def test_interactive_start_requires_named_local_branch(self) -> None:
+        args = self.interactive_start_args()
         git(self.root, "checkout", "--detach")
         with (
             mock.patch.object(cr, "ensure_remote_helper", return_value={"helper": "/helper"}),
@@ -1915,6 +2009,39 @@ class MiscellaneousTests(RepositoryTestCase):
             with self.assertRaises(cr.CodexRemoteError) as caught:
                 cr.start_new_task(args, execution_mode="interactive", prompt=None)
         self.assertEqual(caught.exception.code, "INTERACTIVE_REQUIRES_BRANCH")
+
+    def test_interactive_start_ignores_untracked_files_entirely(self) -> None:
+        args = self.interactive_start_args()
+        untracked = {
+            ".env": "LOCAL_ONLY=1\n",
+            "codex_remote_smoke_test.txt": "local smoke output\n",
+            "reports/bootstrap-summary.md": "generated locally\n",
+        }
+        for relative, content in untracked.items():
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+        with mock.patch.object(
+            cr,
+            "ensure_remote_helper",
+            side_effect=RuntimeError("stop after local interactive preflight"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "stop after local interactive preflight"
+            ):
+                cr.start_new_task(args, execution_mode="interactive", prompt=None)
+
+        self.assertEqual(cr.tracked_status_porcelain(self.root), "")
+        status = cr.git_status_porcelain(self.root)
+        for relative in untracked:
+            self.assertIn(f"?? {relative}", status)
+        head = cr.current_head(self.root)
+        for relative in untracked:
+            self.assertNotEqual(
+                git(self.root, "cat-file", "-e", f"{head}:{relative}", check=False).returncode,
+                0,
+            )
 
     def remote_probe(self, helper_hash: str) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(
