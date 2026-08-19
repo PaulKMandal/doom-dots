@@ -798,6 +798,87 @@ class LiveCheckpointTests(RepositoryTestCase):
         self.assertEqual(result["job"]["run_id"], "run-1")
         self.assertFalse(response_file.exists())
 
+    def test_environment_request_waits_for_trusted_broker_response(self) -> None:
+        request_file = self.root / cr.ENV_REQUEST_RELATIVE
+        response_file = self.root / cr.ENV_RESPONSE_RELATIVE
+
+        def broker() -> None:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not request_file.exists():
+                time.sleep(0.01)
+            self.assertTrue(request_file.exists())
+            cr.atomic_write_json(
+                response_file,
+                {"ok": True, "action": "refresh", "finished_at": cr.utc_now()},
+            )
+
+        worker = threading.Thread(target=broker)
+        worker.start()
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_ENV_REQUEST_PATH": str(request_file)},
+            ):
+                result = cr.request_env_action_file(
+                    request_file,
+                    response_file,
+                    action="refresh",
+                    wait_seconds=3,
+                )
+        finally:
+            worker.join(timeout=3)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "refresh")
+        self.assertFalse(response_file.exists())
+
+    def test_trusted_environment_control_refreshes_and_tests_clean_checkpoint(self) -> None:
+        home = self.base / "environment-control-home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths, task, worktree = self.make_interactive_server_task(home)
+            task["bootstrap_cmd"] = (
+                'test "$UV_PROJECT_ENVIRONMENT" = "$PWD/.venv" && '
+                'test -n "$UV_CACHE_DIR" && '
+                "mkdir -p .venv/bin && printf ready > .venv/bin/environment-ready"
+            )
+            task["test_cmd"] = (
+                'test "$VIRTUAL_ENV" = "$PWD/.venv" && '
+                "test -f .venv/bin/environment-ready"
+            )
+            task["tools"]["nix"] = None
+            task["tools"]["uv"] = None
+            cr.save_server_task(paths, task)
+
+            result = cr.server_interactive_env_action(
+                str(task["project_id"]),
+                str(task["task_id"]),
+                {"action": "check"},
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["refresh"]["exit_code"], 0)
+            self.assertEqual(result["test"]["exit_code"], 0)
+            self.assertTrue((worktree / ".venv/bin/environment-ready").is_file())
+            self.assertTrue(Path(task["state_dir"], "codex-dev").is_file())
+
+    def test_trusted_environment_control_requires_committed_tracked_work(self) -> None:
+        home = self.base / "environment-dirty-home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            _paths, task, worktree = self.make_interactive_server_task(home)
+            task["bootstrap_cmd"] = "true"
+            (worktree / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.server_interactive_env_action(
+                    str(task["project_id"]),
+                    str(task["task_id"]),
+                    {"action": "refresh"},
+                )
+            self.assertEqual(
+                caught.exception.code,
+                "ENV_REQUIRES_COMMITTED_CHECKPOINT",
+            )
+
     def test_interactive_job_can_launch_from_unchanged_committed_input(self) -> None:
         home = self.base / "job-home"
         home.mkdir()
@@ -879,7 +960,7 @@ class ServerStartTests(RepositoryTestCase):
                 "codex": str(fake_codex),
             }
 
-            with mock.patch.object(cr, "login_which", side_effect=lambda name: tools[name]):
+            with mock.patch.object(cr, "login_which", side_effect=lambda name: tools.get(name)):
                 first = cr.server_start(project_id, task_id, payload)
                 second = cr.server_start(project_id, task_id, payload)
 
@@ -949,7 +1030,7 @@ class ServerStartTests(RepositoryTestCase):
                 "codex": str(fake_codex),
             }
 
-            with mock.patch.object(cr, "login_which", side_effect=lambda name: tools[name]):
+            with mock.patch.object(cr, "login_which", side_effect=lambda name: tools.get(name)):
                 started = cr.server_start(project_id, task_id, payload)
 
             task = started["task"]
@@ -1242,7 +1323,7 @@ class ServerRunnerTests(RepositoryTestCase):
         with mock.patch.dict(os.environ, {"HOME": str(home)}):
             project_id, task_id, paths = self.prepare_server_task(home, lock_change=True)
 
-            def cancel_bootstrap(_shell, _command, _cwd, _log_path, active):
+            def cancel_bootstrap(_shell, _command, _cwd, _log_path, active, **_kwargs):
                 active["cancelled"] = True
                 return 143
 
@@ -1315,6 +1396,85 @@ class ServerRunnerTests(RepositoryTestCase):
             self.assertTrue(finished["has_changes"])
             self.assertEqual(finished["tests"]["exit_code"], 0)
             self.assertFalse((Path(finished["state_dir"]) / "codex.jsonl").exists())
+
+    def test_interactive_runner_enters_nix_shell_and_bootstraps_uv_project(self) -> None:
+        (self.root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+        (self.root / "flake.nix").write_text("{}\n", encoding="utf-8")
+        (self.root / "pyproject.toml").write_text(
+            "[project]\nname='runner-env'\nversion='0.1.0'\n",
+            encoding="utf-8",
+        )
+        (self.root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+        commit_all(self.root, "add locked project environment")
+
+        home = self.base / "interactive-env-home"
+        home.mkdir()
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            project_id, task_id, paths = self.prepare_server_task(home)
+            task = cr.load_server_task(paths, task_id)
+            assert task is not None
+            task["execution_mode"] = "interactive"
+            task["prompt_path"] = None
+            task["model"] = cr.DEFAULT_INTERACTIVE_MODEL
+            task["reasoning_effort"] = cr.DEFAULT_INTERACTIVE_REASONING
+            task["approval_policy"] = cr.DEFAULT_INTERACTIVE_APPROVAL_POLICY
+            task["network_access"] = True
+            task["bootstrap_cmd"] = None
+            task["test_cmd"] = (
+                "test -x .venv/bin/uv && grep -q PROJECT_ENV interactive.txt"
+            )
+
+            fake_nix = home / "bin" / "nix"
+            python = str(Path(cr.sys.executable).resolve())
+            fake_nix.write_text(
+                f"#!{python}\n"
+                "import os, pathlib, subprocess, sys\n"
+                "args = sys.argv[1:]\n"
+                "marker = '--command' if '--command' in args else '-c'\n"
+                "index = args.index(marker)\n"
+                "command = args[index + 1:]\n"
+                "root = pathlib.Path.cwd()\n"
+                "if command[:3] == ['uv', 'sync', '--frozen']:\n"
+                "    assert os.environ.get('UV_PROJECT_ENVIRONMENT') == str(root / '.venv')\n"
+                "    assert 'tool-cache' in os.environ.get('UV_CACHE_DIR', '')\n"
+                "    binary = root / '.venv' / 'bin' / 'uv'\n"
+                "    binary.parent.mkdir(parents=True, exist_ok=True)\n"
+                "    binary.write_text('#!/bin/sh\\nexit 0\\n')\n"
+                "    binary.chmod(0o755)\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(subprocess.call(command, env=os.environ.copy()))\n",
+                encoding="utf-8",
+            )
+            fake_nix.chmod(0o755)
+            task["tools"]["nix"] = str(fake_nix)
+            task["tools"]["uv"] = None
+
+            fake_codex = Path(task["tools"]["codex"] )
+            fake_codex.write_text(
+                f"#!{python}\n"
+                "import os, pathlib, shutil\n"
+                "root = pathlib.Path.cwd()\n"
+                "assert os.environ.get('VIRTUAL_ENV') == str(root / '.venv')\n"
+                "assert shutil.which('uv') == str(root / '.venv' / 'bin' / 'uv')\n"
+                "(root / 'interactive.txt').write_text('PROJECT_ENV\\n')\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            cr.save_server_task(paths, task)
+            try:
+                cr.server_run(project_id, task_id)
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+
+            finished = cr.load_server_task(paths, task_id)
+            assert finished is not None
+            self.assertEqual(finished["state"], "READY")
+            self.assertTrue(finished["bootstrap_inferred"])
+            self.assertIn("nix develop", finished["interactive_environment"])
+            self.assertEqual(finished["tests"]["exit_code"], 0)
 
     def test_lockfile_change_refreshes_environment_before_tests(self) -> None:
         task = self.run_server_task(lock_change=True)
@@ -2205,11 +2365,7 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertIn("sandbox_workspace_write.network_access=true", value)
         self.assertIn("features.network_proxy.enabled=true", value)
         self.assertIn('features.network_proxy.domains={ "*" = "allow" }', value)
-        self.assertIn(
-            'features.network_proxy.unix_sockets={ '
-            '"/nix/var/nix/daemon-socket/socket" = "allow" }',
-            value,
-        )
+        self.assertFalse(any("network_proxy.unix_sockets" in item for item in value))
         self.assertIn("--search", value)
         self.assertIn("gpt-test", value)
         self.assertIn("server", value)
@@ -2244,18 +2400,44 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertEqual(env["XDG_CACHE_HOME"], str(cache))
         self.assertEqual(env["UV_CACHE_DIR"], str(cache / "uv"))
         self.assertEqual(env["PIP_CACHE_DIR"], str(cache / "pip"))
+        self.assertEqual(env["UV_PROJECT_ENVIRONMENT"], str(self.root / ".venv"))
+        self.assertEqual(env["PYTHONNOUSERSITE"], "1")
         self.assertEqual(env["GIT_AUTHOR_NAME"], "Codex Remote")
         self.assertEqual(env["GIT_AUTHOR_EMAIL"], "codex-remote@localhost")
         self.assertEqual(env["GIT_COMMITTER_NAME"], "Codex Remote")
         self.assertEqual(env["GIT_COMMITTER_EMAIL"], "codex-remote@localhost")
         self.assertTrue(cache.is_dir())
 
+    def test_filtered_dev_environment_excludes_credential_variables(self) -> None:
+        value = cr.filtered_dev_environment(
+            {
+                "PATH": "/nix/store/tools/bin",
+                "NIX_CFLAGS_COMPILE": "-isystem /nix/store/include",
+                "CARGO_HOME": "/tmp/cargo",
+                "RUSTFLAGS": "-C target-cpu=native",
+                "CARGO_REGISTRIES_PRIVATE_TOKEN": "do-not-copy",
+                "NIX_CONFIG": "access-tokens = github.com=do-not-copy",
+                "NIX_SSHOPTS": "-i /home/user/.ssh/id_ed25519",
+                "AWS_SECRET_ACCESS_KEY": "not-in-scope",
+            }
+        )
+        self.assertEqual(value["PATH"], "/nix/store/tools/bin")
+        self.assertIn("NIX_CFLAGS_COMPILE", value)
+        self.assertIn("CARGO_HOME", value)
+        self.assertIn("RUSTFLAGS", value)
+        self.assertNotIn("CARGO_REGISTRIES_PRIVATE_TOKEN", value)
+        self.assertNotIn("NIX_CONFIG", value)
+        self.assertNotIn("NIX_SSHOPTS", value)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", value)
+
     def test_codex_instructions_authorize_project_dependencies_not_host_activation(self) -> None:
         instructions = cr.codex_job_instructions(
             {"execution_mode": "interactive", "job_policy": "deny"}
         )
         self.assertIn("uv add", instructions)
-        self.assertIn("nix flake check", instructions)
+        self.assertIn("$CODEX_DEV", instructions)
+        self.assertIn("$CODEX_ENVCTL refresh", instructions)
+        self.assertIn("cannot contact the Nix daemon directly", instructions)
         self.assertIn("do not stop after merely proposing a plan", instructions)
         self.assertIn("Do not use sudo", instructions)
         self.assertIn("nixos-rebuild", instructions)
