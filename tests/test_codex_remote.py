@@ -1455,8 +1455,11 @@ class ExperimentJobTests(RepositoryTestCase):
             source_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
             git(self.root, "push", str(paths["broker"]), f"HEAD:refs/source/{source_sha}")
             fake_tmux = home / "tmux"
+            bash_path = shutil.which("bash")
+            if bash_path is None:
+                self.fail("bash is required for the fake tmux fixture")
             fake_tmux.write_text(
-                "#!/bin/bash\n"
+                f"#!{bash_path}\n"
                 "set -e\n"
                 "if [ \"${1:-}\" = new-session ]; then\n"
                 "  command=${!#}\n"
