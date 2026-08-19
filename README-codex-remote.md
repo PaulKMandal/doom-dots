@@ -262,9 +262,12 @@ runner before Codex starts. When the configured bootstrap or test command uses
 it tries the flake's default shell and then `.#server`. The runner captures the
 resulting toolchain environment and launches Codex with its `PATH`, Python,
 `uv`, compilers, and system-library variables available. An existing `.venv` is
-activated automatically. If a repository contains both `pyproject.toml` and
-`uv.lock` but has no configured bootstrap, the runner infers a conservative
-`uv sync --frozen`; it does not invent or update a missing lock file.
+activated automatically. Every trusted `nix develop` probe is made read-only
+with respect to flake locks: when `flake.lock` is absent,
+`--no-write-lock-file` permits an ephemeral resolution without creating a file;
+when a lock exists, `--no-update-lock-file --no-write-lock-file` keeps it pinned.
+If a repository contains both `pyproject.toml` and `uv.lock` but has no
+configured bootstrap, the runner infers a conservative `uv sync --frozen`.
 
 `XDG_CACHE_HOME`, `UV_CACHE_DIR`, and `PIP_CACHE_DIR` point to a task-private
 cache outside the Git worktree. Public dependency traffic is allowed through

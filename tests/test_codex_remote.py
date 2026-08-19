@@ -1432,10 +1432,13 @@ class ServerRunnerTests(RepositoryTestCase):
                 f"#!{python}\n"
                 "import os, pathlib, subprocess, sys\n"
                 "args = sys.argv[1:]\n"
+                "root = pathlib.Path.cwd()\n"
+                "# Real Nix writes a missing flake.lock by default.  Managed\n"
+                "# startup must explicitly suppress that side effect.\n"
+                "assert '--no-write-lock-file' in args, args\n"
                 "marker = '--command' if '--command' in args else '-c'\n"
                 "index = args.index(marker)\n"
                 "command = args[index + 1:]\n"
-                "root = pathlib.Path.cwd()\n"
                 "if command[:3] == ['uv', 'sync', '--frozen']:\n"
                 "    assert os.environ.get('UV_PROJECT_ENVIRONMENT') == str(root / '.venv')\n"
                 "    assert 'tool-cache' in os.environ.get('UV_CACHE_DIR', '')\n"
@@ -1475,6 +1478,38 @@ class ServerRunnerTests(RepositoryTestCase):
             self.assertTrue(finished["bootstrap_inferred"])
             self.assertIn("nix develop", finished["interactive_environment"])
             self.assertEqual(finished["tests"]["exit_code"], 0)
+            self.assertFalse((Path(finished["worktree"]) / "flake.lock").exists())
+
+    def test_nix_develop_environment_probe_never_writes_lock_files(self) -> None:
+        (self.root / "flake.nix").write_text("{}\n", encoding="utf-8")
+        task = {"tools": {"nix": "/nix/bin/nix"}, "bootstrap_cmd": None, "test_cmd": None}
+
+        without_lock = cr.interactive_nix_develop_candidates(task, self.root)
+        self.assertTrue(without_lock)
+        for candidate in without_lock:
+            self.assertIn("--no-write-lock-file", candidate)
+            self.assertNotIn("--no-update-lock-file", candidate)
+
+        (self.root / "flake.lock").write_text("{}\n", encoding="utf-8")
+        with_lock = cr.interactive_nix_develop_candidates(task, self.root)
+        self.assertTrue(with_lock)
+        for candidate in with_lock:
+            self.assertIn("--no-write-lock-file", candidate)
+            self.assertIn("--no-update-lock-file", candidate)
+
+    def test_configured_nix_bootstrap_is_guarded_against_lock_writes(self) -> None:
+        (self.root / "flake.nix").write_text("{}\n", encoding="utf-8")
+        task = {
+            "tools": {"nix": "/nix/bin/nix"},
+            "bootstrap_cmd": "nix develop .#server --command uv sync --frozen",
+        }
+        command, inferred = cr.inferred_interactive_bootstrap(task, self.root)
+        self.assertFalse(inferred)
+        assert command is not None
+        tokens = cr.shlex.split(command)
+        self.assertEqual(tokens[0], "/nix/bin/nix")
+        self.assertIn("--no-write-lock-file", tokens)
+        self.assertNotIn("--no-update-lock-file", tokens)
 
     def test_lockfile_change_refreshes_environment_before_tests(self) -> None:
         task = self.run_server_task(lock_change=True)
