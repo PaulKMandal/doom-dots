@@ -42,6 +42,9 @@ LOCAL_STATE_ROOT = Path.home() / ".local/state/codex-remote"
 PROJECT_CONFIG_RELATIVE = "codex-remote/config.json"
 JOB_REQUEST_RELATIVE = ".codex-job-request.json"
 JOB_RESPONSE_RELATIVE = ".codex-job-response.json"
+ENV_REQUEST_RELATIVE = ".codex-env-request.json"
+ENV_RESPONSE_RELATIVE = ".codex-env-response.json"
+ENV_ACTIONS = {"refresh", "test", "check"}
 JOB_POLICIES = {"deny", "prepare", "launch"}
 JOB_ACTIVE_STATES = {"STARTING", "BOOTSTRAPPING", "RUNNING", "STOP_REQUESTED"}
 GLOBAL_AGENTS_BEGIN = "<!-- BEGIN CODEX-REMOTE MANAGED INSTRUCTIONS -->"
@@ -81,6 +84,41 @@ DEFAULT_INTERACTIVE_REASONING = "xhigh"
 DEFAULT_INTERACTIVE_APPROVAL_POLICY = "never"
 EXECUTION_MODES = {"exec", "interactive"}
 INTERACTIVE_ATTACH_STATES = {"STARTING", "BOOTSTRAPPING", "RUNNING"}
+
+DEV_ENV_EXACT_NAMES = {
+    "AR",
+    "CC",
+    "CMAKE_PREFIX_PATH",
+    "CPATH",
+    "CPLUS_INCLUDE_PATH",
+    "C_INCLUDE_PATH",
+    "CUDA_HOME",
+    "CUDA_PATH",
+    "CXX",
+    "HIP_PATH",
+    "IN_NIX_SHELL",
+    "LD",
+    "LD_LIBRARY_PATH",
+    "LIBRARY_PATH",
+    "LOCALE_ARCHIVE",
+    "NIX_SSL_CERT_FILE",
+    "PATH",
+    "PKG_CONFIG_PATH",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "RANLIB",
+    "ROCM_PATH",
+    "RUSTDOCFLAGS",
+    "RUSTFLAGS",
+    "SSL_CERT_FILE",
+    "STRIP",
+}
+DEV_ENV_PREFIXES = ("NIX_", "CUDA_", "ROCM_", "HIP_", "CARGO_", "RUST_")
+DEV_ENV_EXCLUDED_NAMES = {"NIX_CONFIG", "NIX_SSHOPTS"}
+DEV_ENV_SECRET_NAME_RE = re.compile(
+    r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|API_KEY|"
+    r"PRIVATE_KEY|ACCESS_KEY|SESSION)(?:_|$)"
+)
 
 SECRET_BASENAMES = {
     ".env",
@@ -3259,6 +3297,93 @@ def validate_codex_configuration(payload: Mapping[str, Any]) -> None:
         )
 
 
+def normalized_env_request(value: Mapping[str, Any]) -> dict[str, Any]:
+    action = value.get("action")
+    if action not in ENV_ACTIONS:
+        raise CodexRemoteError(
+            "Environment action must be refresh, test, or check",
+            code="INVALID_ENV_REQUEST",
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "action": action,
+        "requested_at": value.get("requested_at") or utc_now(),
+    }
+
+
+def request_env_action_file(
+    request_file: Path,
+    response_file: Path,
+    *,
+    action: str,
+    wait_seconds: int,
+) -> dict[str, Any]:
+    """Request one trusted environment action from the live runner."""
+    if request_file.name != ENV_REQUEST_RELATIVE or response_file.name != ENV_RESPONSE_RELATIVE:
+        raise CodexRemoteError(
+            "Unexpected environment control path", code="INVALID_ENV_REQUEST"
+        )
+    expected_path = os.environ.get("CODEX_ENV_REQUEST_PATH")
+    if expected_path and request_file.resolve(strict=False) != Path(expected_path).resolve(strict=False):
+        raise CodexRemoteError(
+            "Environment request path does not match the runner-authorized worktree",
+            code="INVALID_ENV_REQUEST",
+        )
+    request = normalized_env_request({"action": action})
+    if request_file.exists() or request_file.is_symlink():
+        raise CodexRemoteError(
+            "An environment request is already pending", code="ENV_REQUEST_EXISTS"
+        )
+    with contextlib.suppress(FileNotFoundError):
+        response_file.unlink()
+    atomic_write_json(request_file, request)
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        response = read_json(response_file)
+        if response is not None:
+            with contextlib.suppress(FileNotFoundError):
+                response_file.unlink()
+            if not response.get("ok", False):
+                raise CodexRemoteError(
+                    str(response.get("error") or "The trusted environment action failed"),
+                    code=str(response.get("error_code") or "ENV_ACTION_FAILED"),
+                    details=response.get("details"),
+                )
+            return response
+        time.sleep(0.2)
+    raise CodexRemoteError(
+        "Timed out waiting for the trusted runner to process the environment request",
+        code="ENV_REQUEST_TIMEOUT",
+    )
+
+
+def consume_env_request(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    request_path = Path(task["worktree"]) / ENV_REQUEST_RELATIVE
+    if not request_path.exists() and not request_path.is_symlink():
+        return None
+    if request_path.is_symlink() or not request_path.is_file():
+        raise CodexRemoteError(
+            "The environment request is not a regular file",
+            code="INVALID_ENV_REQUEST",
+        )
+    if request_path.stat().st_size > 64 * 1024:
+        with contextlib.suppress(FileNotFoundError):
+            request_path.unlink()
+        raise CodexRemoteError(
+            "The environment request is too large", code="INVALID_ENV_REQUEST"
+        )
+    try:
+        value = read_json(request_path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            request_path.unlink()
+    if not isinstance(value, dict):
+        raise CodexRemoteError(
+            "The environment request is invalid JSON", code="INVALID_ENV_REQUEST"
+        )
+    return normalized_env_request(value)
+
+
 def normalized_job_request(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and normalize one frozen experiment launch request."""
     name = value.get("name")
@@ -3501,10 +3626,19 @@ def codex_job_instructions(task: Mapping[str, Any]) -> str:
             " When the user asks you to implement, build, fix, or change something, carry "
             "the in-scope task through inspection, editing, relevant non-destructive "
             "validation, failure diagnosis, and iteration; do not stop after merely "
-            "proposing a plan or ask for routine worktree actions. You may update project "
-            "dependency declarations and lock files when the task requires it, including "
-            "flake.nix, flake.lock, pyproject.toml, and uv.lock, and may run uv add, uv sync, "
-            "nix develop, nix build, and nix flake check. Do not use sudo, doas, su, "
+            "proposing a plan or ask for routine worktree actions. The trusted runner has "
+            "prepared the project development environment and exposes it through ordinary "
+            "PATH plus the stable $CODEX_DEV wrapper. You may run uv add, uv sync, uv run, "
+            "Python, Ruff, pytest, compilers, and other project-shell tools directly; use "
+            "$CODEX_DEV COMMAND ... whenever you want the latest refreshed environment. "
+            "You may update project dependency declarations and lock files when the task "
+            "requires it, including flake.nix, flake.lock, pyproject.toml, and uv.lock. "
+            "The Linux sandbox intentionally cannot contact the Nix daemon directly. After "
+            "committing dependency or lock-file changes, use $CODEX_ENVCTL refresh to rerun "
+            "the exact trusted bootstrap outside the sandbox, $CODEX_ENVCTL test to run the "
+            "configured trusted test command, or $CODEX_ENVCTL check to do both. Do not "
+            "retry direct nix daemon commands when they are sandbox-blocked. Do not use "
+            "sudo, doas, su, "
             "nixos-rebuild, home-manager switch, nix profile, nix-env, systemctl, or any "
             "other host activation or service-management command."
         )
@@ -3559,8 +3693,236 @@ def interactive_tool_cache_dir(task: Mapping[str, Any]) -> Path:
     return cache
 
 
+def nix_develop_prefix_from_command(
+    command: str | None, nix: str | None
+) -> list[str] | None:
+    """Extract a safe ``nix develop ... --command`` prefix from COMMAND."""
+    if not command or not nix:
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if len(tokens) < 2 or Path(tokens[0]).name != "nix" or tokens[1] != "develop":
+        return None
+    shell_operators = {"&&", "||", ";", "|", "&", ">", ">>", "<"}
+    for index, token in enumerate(tokens[2:], start=2):
+        if token in shell_operators:
+            return None
+        if token in {"--command", "-c"}:
+            return [nix, *tokens[1 : index + 1]]
+    return [nix, *tokens[1:], "--command"]
+
+
+def interactive_nix_develop_candidates(
+    task: Mapping[str, Any], worktree: Path
+) -> list[list[str]]:
+    """Return ordered Nix development-shell candidates for WORKTREE."""
+    tools = task.get("tools")
+    nix = tools.get("nix") if isinstance(tools, Mapping) else None
+    if not isinstance(nix, str) or not nix:
+        return []
+    candidates: list[list[str]] = []
+    for configured in (task.get("bootstrap_cmd"), task.get("test_cmd")):
+        prefix = nix_develop_prefix_from_command(
+            configured if isinstance(configured, str) else None,
+            nix,
+        )
+        if prefix and prefix not in candidates:
+            candidates.append(prefix)
+    if (worktree / "flake.nix").is_file():
+        for fallback in (
+            [nix, "develop", "--command"],
+            [nix, "develop", ".#server", "--command"],
+        ):
+            if fallback not in candidates:
+                candidates.append(fallback)
+    return candidates
+
+
+def filtered_dev_environment(value: Mapping[str, str]) -> dict[str, str]:
+    """Keep project-toolchain variables while excluding ambient credentials."""
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        upper = key.upper()
+        if upper in DEV_ENV_EXCLUDED_NAMES or DEV_ENV_SECRET_NAME_RE.search(upper):
+            continue
+        if key in DEV_ENV_EXACT_NAMES or key.startswith(DEV_ENV_PREFIXES):
+            if isinstance(item, str) and "\x00" not in item:
+                result[key] = item
+    return result
+
+
+def interactive_dev_environment_path(task: Mapping[str, Any]) -> Path:
+    return Path(task["state_dir"]) / "interactive-dev-environment.json"
+
+
+def interactive_dev_wrapper_path(task: Mapping[str, Any]) -> Path:
+    return Path(task["state_dir"]) / "codex-dev"
+
+
+def load_interactive_dev_environment(task: Mapping[str, Any]) -> dict[str, str]:
+    value = read_json(interactive_dev_environment_path(task))
+    if not isinstance(value, dict):
+        return {}
+    variables = value.get("variables")
+    if not isinstance(variables, dict):
+        return {}
+    return {
+        str(key): str(item)
+        for key, item in variables.items()
+        if isinstance(key, str) and isinstance(item, str) and "\x00" not in item
+    }
+
+
+def write_interactive_dev_wrapper(task: Mapping[str, Any]) -> Path:
+    """Create a sandbox-inherited command wrapper for the latest dev environment."""
+    wrapper = interactive_dev_wrapper_path(task)
+    python = str(task["tools"]["python3"])
+    env_path = interactive_dev_environment_path(task)
+    worktree = Path(task["worktree"])
+    wrapper.write_text(
+        f"#!{python}\n"
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import sys\n\n"
+        f"ENV_PATH = Path({str(env_path)!r})\n"
+        f"WORKTREE = Path({str(worktree)!r})\n\n"
+        "if len(sys.argv) < 2:\n"
+        "    print('usage: codex-dev COMMAND [ARG ...]', file=sys.stderr)\n"
+        "    raise SystemExit(2)\n"
+        "value = json.loads(ENV_PATH.read_text(encoding='utf-8'))\n"
+        "variables = value.get('variables', {})\n"
+        "env = os.environ.copy()\n"
+        "env.update({str(k): str(v) for k, v in variables.items()})\n"
+        "venv = WORKTREE / '.venv'\n"
+        "env['UV_PROJECT_ENVIRONMENT'] = str(venv)\n"
+        "env['PYTHONNOUSERSITE'] = '1'\n"
+        "venv_bin = venv / 'bin'\n"
+        "if venv_bin.is_dir():\n"
+        "    env['VIRTUAL_ENV'] = str(venv)\n"
+        "    env['PATH'] = str(venv_bin) + os.pathsep + env.get('PATH', '')\n"
+        "os.chdir(WORKTREE)\n"
+        "os.execvpe(sys.argv[1], sys.argv[1:], env)\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+    return wrapper
+
+
+def capture_interactive_dev_environment(
+    task: dict[str, Any], worktree: Path, log_path: Path
+) -> dict[str, Any]:
+    """Resolve a project development environment outside Codex's sandbox.
+
+    Nix daemon access happens here in the trusted runner.  The resulting
+    toolchain variables are saved for Codex and for ``$CODEX_DEV``; model-run
+    commands remain subject to Codex's workspace sandbox.
+    """
+    marker = "__CODEX_REMOTE_ENV_JSON__="
+    script = (
+        "import json, os; "
+        f"print({marker!r} + json.dumps(dict(os.environ), sort_keys=True))"
+    )
+    attempts: list[dict[str, Any]] = []
+    selected: list[str] | None = None
+    captured: dict[str, str] | None = None
+    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with log_path.open("a", encoding="utf-8") as log:
+        for prefix in interactive_nix_develop_candidates(task, worktree):
+            command = [*prefix, task["tools"]["python3"], "-c", script]
+            completed = run(command, cwd=worktree, check=False, timeout=1800)
+            attempt = {
+                "command": shlex.join(command),
+                "exit_code": completed.returncode,
+            }
+            attempts.append(attempt)
+            log.write(f"$ {attempt['command']}\n")
+            if completed.stderr:
+                log.write(completed.stderr)
+                if not completed.stderr.endswith("\n"):
+                    log.write("\n")
+            payload: str | None = None
+            for line in completed.stdout.splitlines():
+                if line.startswith(marker):
+                    payload = line[len(marker) :]
+                else:
+                    log.write(line + "\n")
+            log.flush()
+            if completed.returncode != 0 or payload is None:
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("PATH"), str):
+                captured = {
+                    str(key): str(item)
+                    for key, item in parsed.items()
+                    if isinstance(key, str) and isinstance(item, str)
+                }
+                selected = prefix
+                break
+
+    if captured is None:
+        captured = dict(os.environ)
+        source = "server login environment"
+    else:
+        source = shlex.join(selected[:-1] if selected else []) or "Nix development shell"
+
+    filtered = filtered_dev_environment(captured)
+    if "PATH" not in filtered:
+        filtered["PATH"] = os.environ.get("PATH", "")
+    record = {
+        "captured_at": utc_now(),
+        "source": source,
+        "nix_prefix": selected,
+        "variables": filtered,
+        "attempts": attempts,
+    }
+    path = interactive_dev_environment_path(task)
+    atomic_write_json(path, record)
+    path.chmod(0o600)
+    wrapper = write_interactive_dev_wrapper(task)
+    task["interactive_environment"] = source
+    task["interactive_nix_prefix"] = selected
+    task["interactive_dev_environment_path"] = str(path)
+    task["dev_wrapper_path"] = str(wrapper)
+    return record
+
+
+def inferred_interactive_bootstrap(
+    task: Mapping[str, Any], worktree: Path
+) -> tuple[str | None, bool]:
+    """Infer a locked uv bootstrap only when the project omitted one."""
+    configured = task.get("bootstrap_cmd")
+    if isinstance(configured, str) and configured.strip():
+        return configured, False
+    if not (worktree / "pyproject.toml").is_file() or not (worktree / "uv.lock").is_file():
+        return None, False
+    prefix = task.get("interactive_nix_prefix")
+    if isinstance(prefix, list) and all(isinstance(item, str) for item in prefix):
+        return shlex.join([*prefix, "uv", "sync", "--frozen"]), True
+    dev_env = load_interactive_dev_environment(task)
+    uv = shutil.which("uv", path=dev_env.get("PATH"))
+    if uv:
+        return shlex.join([uv, "sync", "--frozen"]), True
+    tools = task.get("tools")
+    uv = tools.get("uv") if isinstance(tools, Mapping) else None
+    if isinstance(uv, str) and uv:
+        return shlex.join([uv, "sync", "--frozen"]), True
+    raise CodexRemoteError(
+        "The project contains pyproject.toml and uv.lock, but neither its Nix "
+        "development shell nor the server login PATH provides uv",
+        code="INTERACTIVE_ENVIRONMENT_UNAVAILABLE",
+    )
+
+
 def codex_process_environment(task: Mapping[str, Any]) -> dict[str, str]:
     env = os.environ.copy()
+    if task_execution_mode(task) == "interactive":
+        env.update(load_interactive_dev_environment(task))
     env.update(
         {
             "CODEX_JOB_POLICY": str(task.get("job_policy", "deny")),
@@ -3568,15 +3930,24 @@ def codex_process_environment(task: Mapping[str, Any]) -> dict[str, str]:
             "CODEX_JOB_REQUEST_PATH": str(
                 Path(task["worktree"]) / JOB_REQUEST_RELATIVE
             ),
+            "CODEX_ENVCTL": str(task.get("envctl_path") or ""),
+            "CODEX_ENV_REQUEST_PATH": str(
+                Path(task["worktree"]) / ENV_REQUEST_RELATIVE
+            ),
+            "CODEX_DEV": str(task.get("dev_wrapper_path") or ""),
         }
     )
     if task_execution_mode(task) == "interactive":
         cache = interactive_tool_cache_dir(task)
+        worktree = Path(task["worktree"])
+        venv = worktree / ".venv"
         env.update(
             {
                 "XDG_CACHE_HOME": str(cache),
                 "UV_CACHE_DIR": str(cache / "uv"),
                 "PIP_CACHE_DIR": str(cache / "pip"),
+                "UV_PROJECT_ENVIRONMENT": str(venv),
+                "PYTHONNOUSERSITE": "1",
                 # Give server-created commits a stable, explicit identity without
                 # mutating the user's global or repository Git configuration.
                 "GIT_AUTHOR_NAME": "Codex Remote",
@@ -3585,6 +3956,10 @@ def codex_process_environment(task: Mapping[str, Any]) -> dict[str, str]:
                 "GIT_COMMITTER_EMAIL": "codex-remote@localhost",
             }
         )
+        venv_bin = venv / "bin"
+        if venv_bin.is_dir():
+            env["VIRTUAL_ENV"] = str(venv)
+            env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
     return env
 
 
@@ -3733,6 +4108,11 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
                 "Remote prerequisites missing: " + ", ".join(missing),
                 code="REMOTE_PREREQUISITES_MISSING",
             )
+        # Optional project-environment tools.  They are not universal remote
+        # prerequisites, but allow the trusted runner to prepare checked-in
+        # Nix/uv environments before the sandboxed Codex process starts.
+        tools["nix"] = login_which("nix")
+        tools["uv"] = login_which("uv")
         auth = command_version(tools["codex"], "login", "status")
         if not auth["ok"]:
             raise CodexRemoteError(
@@ -3758,8 +4138,11 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
         worktree = paths["worktrees"] / task_id_value
         worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         jobctl_path = state_dir / "codex-jobctl"
+        envctl_path = state_dir / "codex-envctl"
         request_path = worktree / JOB_REQUEST_RELATIVE
         response_path = worktree / JOB_RESPONSE_RELATIVE
+        env_request_path = worktree / ENV_REQUEST_RELATIVE
+        env_response_path = worktree / ENV_RESPONSE_RELATIVE
         jobctl_command = (
             f"exec {shlex.quote(str(Path(sys.executable).resolve()))} "
             f"{shlex.quote(str(runner_helper))} _job-request "
@@ -3789,6 +4172,22 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
         )
         jobctl_path.chmod(0o700)
 
+        envctl_path.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "case \"${1:-}\" in\n"
+            "  refresh|test|check) action=$1 ;;\n"
+            "  *) echo 'usage: codex-envctl {refresh|test|check}' >&2; exit 2 ;;\n"
+            "esac\n"
+            f"exec {shlex.quote(str(Path(sys.executable).resolve()))} "
+            f"{shlex.quote(str(runner_helper))} _env-request "
+            f"--request-file {shlex.quote(str(env_request_path))} "
+            f"--response-file {shlex.quote(str(env_response_path))} "
+            "--wait-seconds 1800 --action \"$action\"\n",
+            encoding="utf-8",
+        )
+        envctl_path.chmod(0o700)
+
         session_prefix = "codexi" if execution_mode == "interactive" else "codex"
         session = f"{session_prefix}-{project_id[-12:]}-{task_id_value[-8:]}"
         task = {
@@ -3814,6 +4213,7 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
             "runner_helper": str(runner_helper),
             "runner_helper_sha256": sha256_file(runner_helper),
             "jobctl_path": str(jobctl_path),
+            "envctl_path": str(envctl_path),
             "tmux_session": session,
             "lock_path": str(paths["lock"]),
             "bootstrap_cmd": payload.get("bootstrap_cmd"),
@@ -4054,13 +4454,21 @@ def foreground_child_process_group(process: subprocess.Popen[Any]):
 
 
 def run_shell_logged(
-    shell: str, command: str, cwd: Path, log_path: Path, active: dict[str, Any]
+    shell: str,
+    command: str,
+    cwd: Path,
+    log_path: Path,
+    active: dict[str, Any],
+    *,
+    env: Mapping[str, str] | None = None,
+    login_shell: bool = True,
 ) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with log_path.open("a", encoding="utf-8") as log:
         process = subprocess.Popen(
-            [shell, "-lc", command],
+            [shell, "-lc" if login_shell else "-c", command],
             cwd=cwd,
+            env=dict(env) if env is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -4076,6 +4484,42 @@ def run_shell_logged(
             print(line, end="", flush=True)
         process.stdout.close()
         return process.wait()
+
+
+def run_shell_quiet_logged(
+    shell: str,
+    command: str,
+    cwd: Path,
+    log_path: Path,
+    *,
+    timeout: int = 1800,
+    env: Mapping[str, str] | None = None,
+    login_shell: bool = True,
+) -> int:
+    """Run a trusted shell command without writing over an active Codex TUI."""
+    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"{utc_now()} $ {command}\n")
+        log.flush()
+        try:
+            completed = subprocess.run(
+                [shell, "-lc" if login_shell else "-c", command],
+                cwd=cwd,
+                env=dict(env) if env is not None else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+                text=True,
+            )
+        except subprocess.TimeoutExpired:
+            log.write(f"{utc_now()} timed out after {timeout} seconds\n")
+            log.flush()
+            return 124
+        log.write(f"{utc_now()} exit {completed.returncode}\n")
+        log.flush()
+        return completed.returncode
 
 
 def tee_stream(stream: Any, destination: Any, prefix: str = "") -> None:
@@ -4242,11 +4686,6 @@ def interactive_codex_command(task: Mapping[str, Any]) -> list[str]:
                 "features.network_proxy.enabled=true",
                 "--config",
                 'features.network_proxy.domains={ "*" = "allow" }',
-                "--config",
-                (
-                    'features.network_proxy.unix_sockets={ '
-                    '"/nix/var/nix/daemon-socket/socket" = "allow" }'
-                ),
             ]
         )
     if task.get("enable_search"):
@@ -4304,12 +4743,39 @@ def interactive_job_request_watcher(
     task_id_value: str,
     stop_event: threading.Event,
 ) -> None:
-    """Process one sandbox-written job request while the TUI remains active."""
+    """Broker trusted environment and job requests while the TUI is active."""
     paths = ensure_server_layout(project_id)
     while not stop_event.is_set():
         task = load_server_task(paths, task_id_value)
         if not task:
             return
+        env_request_path = Path(task["worktree"]) / ENV_REQUEST_RELATIVE
+        env_response_path = Path(task["worktree"]) / ENV_RESPONSE_RELATIVE
+        if env_request_path.exists() or env_request_path.is_symlink():
+            try:
+                request = consume_env_request(task)
+                if request is None:
+                    time.sleep(0.1)
+                    continue
+                response = server_interactive_env_action(
+                    project_id, task_id_value, request
+                )
+            except CodexRemoteError as exc:
+                response = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": exc.code,
+                    "details": exc.details,
+                }
+            except Exception as exc:  # defensive broker boundary
+                response = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": "UNEXPECTED_ENV_BROKER_ERROR",
+                    "details": traceback.format_exc(),
+                }
+            atomic_write_json(env_response_path, response)
+            continue
         request_path = Path(task["worktree"]) / JOB_REQUEST_RELATIVE
         response_path = Path(task["worktree"]) / JOB_RESPONSE_RELATIVE
         if request_path.exists() or request_path.is_symlink():
@@ -4334,8 +4800,120 @@ def interactive_job_request_watcher(
                     "details": traceback.format_exc(),
                 }
             atomic_write_json(response_path, response)
-            return
+            continue
         time.sleep(0.2)
+
+
+def server_interactive_env_action(
+    project_id: str,
+    task_id_value: str,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run a frozen, user-configured environment action outside the sandbox."""
+    paths = ensure_server_layout(project_id)
+    task = load_server_task(paths, task_id_value)
+    if not task:
+        raise CodexRemoteError("Task state not found", code="TASK_NOT_FOUND")
+    if task_execution_mode(task) != "interactive" or task.get("state") != "RUNNING":
+        raise CodexRemoteError(
+            "Environment control is available only while an interactive task is running",
+            code="ENV_CONTROL_NOT_RUNNING",
+        )
+    action = normalized_env_request(request)["action"]
+    worktree = Path(task["worktree"])
+    tracked = tracked_status_porcelain(worktree)
+    if tracked.strip():
+        raise CodexRemoteError(
+            "Commit the current tracked work before requesting a trusted environment refresh or test",
+            code="ENV_REQUIRES_COMMITTED_CHECKPOINT",
+            details={"status": tracked},
+        )
+
+    state_dir = Path(task["state_dir"])
+    result: dict[str, Any] = {
+        "ok": True,
+        "action": action,
+        "started_at": utc_now(),
+    }
+    if action in {"refresh", "check"}:
+        bootstrap = task.get("bootstrap_cmd")
+        if not isinstance(bootstrap, str) or not bootstrap.strip():
+            raise CodexRemoteError(
+                "No trusted bootstrap command is configured or inferable for this task",
+                code="ENV_REFRESH_NOT_CONFIGURED",
+            )
+        refresh_log = state_dir / "interactive-environment-refresh.log"
+        rc = run_shell_quiet_logged(
+            task["tools"]["bash"],
+            bootstrap,
+            worktree,
+            refresh_log,
+            env=codex_process_environment(task),
+            login_shell=False,
+        )
+        result["refresh"] = {
+            "command": bootstrap,
+            "exit_code": rc,
+            "log": str(refresh_log),
+        }
+        if rc != 0:
+            raise CodexRemoteError(
+                f"Trusted environment refresh exited {rc}",
+                code="ENV_REFRESH_FAILED",
+                details=result,
+            )
+        dirty = tracked_status_porcelain(worktree)
+        if dirty.strip():
+            raise CodexRemoteError(
+                "The trusted environment refresh changed tracked source files; inspect and commit them before retrying",
+                code="ENV_REFRESH_DIRTY",
+                details={**result, "status": dirty},
+            )
+        record = capture_interactive_dev_environment(
+            task, worktree, state_dir / "interactive-environment-probe.log"
+        )
+        result["refresh"]["environment"] = record.get("source")
+
+    if action in {"test", "check"}:
+        test_command = task.get("test_cmd")
+        if not isinstance(test_command, str) or not test_command.strip():
+            raise CodexRemoteError(
+                "No trusted test command is configured for this task",
+                code="ENV_TEST_NOT_CONFIGURED",
+                details=result,
+            )
+        test_log = state_dir / "interactive-trusted-tests.log"
+        rc = run_shell_quiet_logged(
+            task["tools"]["bash"],
+            test_command,
+            worktree,
+            test_log,
+            env=codex_process_environment(task),
+            login_shell=False,
+        )
+        result["test"] = {
+            "command": test_command,
+            "exit_code": rc,
+            "log": str(test_log),
+        }
+        dirty = tracked_status_porcelain(worktree)
+        if dirty.strip():
+            raise CodexRemoteError(
+                "The trusted test command changed tracked source files",
+                code="ENV_TEST_DIRTY",
+                details={**result, "status": dirty},
+            )
+        if rc != 0:
+            raise CodexRemoteError(
+                f"Trusted test command exited {rc}",
+                code="ENV_TEST_FAILED",
+                details=result,
+            )
+
+    result["finished_at"] = utc_now()
+    task["last_interactive_environment_action"] = result
+    save_server_task(paths, task)
+    return result
 
 
 def server_run(project_id: str, task_id_value: str) -> int:
@@ -4402,10 +4980,27 @@ def server_run(project_id: str, task_id_value: str) -> int:
             raise CodexRemoteError("Worktree no longer points at the input snapshot", code="WORKTREE_MISMATCH")
 
         bootstrap = task.get("bootstrap_cmd")
+        if task_execution_mode(task) == "interactive":
+            capture_interactive_dev_environment(
+                task,
+                worktree,
+                state_dir / "interactive-environment-probe.log",
+            )
+            bootstrap, inferred = inferred_interactive_bootstrap(task, worktree)
+            task["bootstrap_cmd"] = bootstrap
+            task["bootstrap_inferred"] = inferred
+            save_server_task(paths, task)
         if bootstrap:
             note(f"running bootstrap command: {bootstrap}")
+            interactive = task_execution_mode(task) == "interactive"
             rc = run_shell_logged(
-                task["tools"]["bash"], bootstrap, worktree, state_dir / "bootstrap.log", active
+                task["tools"]["bash"],
+                bootstrap,
+                worktree,
+                state_dir / "bootstrap.log",
+                active,
+                env=codex_process_environment(task) if interactive else None,
+                login_shell=not interactive,
             )
             task["bootstrap_exit_code"] = rc
             save_server_task(paths, task)
@@ -4426,6 +5021,14 @@ def server_run(project_id: str, task_id_value: str) -> int:
             save_server_task(paths, task)
             note("bootstrap left a dirty worktree; stopping before Codex")
             return 1
+
+        if task_execution_mode(task) == "interactive":
+            capture_interactive_dev_environment(
+                task,
+                worktree,
+                state_dir / "interactive-environment-probe.log",
+            )
+            save_server_task(paths, task)
 
         if finish_cancelled_noop("before Codex started"):
             return 0
@@ -4468,6 +5071,10 @@ def server_run(project_id: str, task_id_value: str) -> int:
                 note("trusted interactive job broker did not stop within 120 seconds")
             with contextlib.suppress(FileNotFoundError):
                 (worktree / JOB_RESPONSE_RELATIVE).unlink()
+            with contextlib.suppress(FileNotFoundError):
+                (worktree / ENV_RESPONSE_RELATIVE).unlink()
+            with contextlib.suppress(FileNotFoundError):
+                (worktree / ENV_REQUEST_RELATIVE).unlink()
         else:
             prompt_path = task.get("prompt_path")
             if not isinstance(prompt_path, str) or not prompt_path:
@@ -4555,12 +5162,15 @@ def server_run(project_id: str, task_id_value: str) -> int:
                     "lock files changed; refreshing the server environment with: "
                     + bootstrap
                 )
+                interactive = task_execution_mode(task) == "interactive"
                 refresh_rc = run_shell_logged(
                     task["tools"]["bash"],
                     bootstrap,
                     worktree,
                     state_dir / "environment-refresh.log",
                     active,
+                    env=codex_process_environment(task) if interactive else None,
+                    login_shell=not interactive,
                 )
                 active["process"] = None
                 refresh_dirty = git_status_porcelain(worktree)
@@ -4576,6 +5186,13 @@ def server_run(project_id: str, task_id_value: str) -> int:
                     environment_state = "READY_ENVIRONMENT_DIRTY"
                 elif refresh_rc != 0:
                     environment_state = "READY_ENVIRONMENT_FAILED"
+                elif task_execution_mode(task) == "interactive":
+                    record = capture_interactive_dev_environment(
+                        task,
+                        worktree,
+                        state_dir / "interactive-environment-probe.log",
+                    )
+                    task["environment_refresh"]["environment"] = record.get("source")
                 save_server_task(paths, task)
             else:
                 environment_state = "READY_ENVIRONMENT_UNVERIFIED"
@@ -4599,8 +5216,15 @@ def server_run(project_id: str, task_id_value: str) -> int:
             task["tests"] = {"command": test_command, "started_at": utc_now()}
             save_server_task(paths, task)
             note(f"running test command: {test_command}")
+            interactive = task_execution_mode(task) == "interactive"
             test_rc = run_shell_logged(
-                task["tools"]["bash"], test_command, worktree, state_dir / "tests.log", active
+                task["tools"]["bash"],
+                test_command,
+                worktree,
+                state_dir / "tests.log",
+                active,
+                env=codex_process_environment(task) if interactive else None,
+                login_shell=not interactive,
             )
             active["process"] = None
             remove_data_links(task)
@@ -6296,6 +6920,11 @@ def build_parser() -> argparse.ArgumentParser:
     job_request_parser.add_argument("--resume-command", default="")
     job_request_parser.add_argument("--metadata", action="append", default=[])
     job_request_parser.add_argument("job_command", nargs=argparse.REMAINDER)
+    env_request_parser = sub.add_parser("_env-request")
+    env_request_parser.add_argument("--request-file", required=True)
+    env_request_parser.add_argument("--response-file", required=True)
+    env_request_parser.add_argument("--wait-seconds", type=int, default=1800)
+    env_request_parser.add_argument("--action", choices=sorted(ENV_ACTIONS), required=True)
     server_job_request_parser = sub.add_parser("_server-request-job")
     server_job_request_parser.add_argument("--project-id", required=True)
     server_job_request_parser.add_argument("--task-id", required=True)
@@ -6397,6 +7026,13 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
             resume_command=args.resume_command,
             metadata_values=args.metadata,
             response_file=Path(args.response_file) if args.response_file else None,
+            wait_seconds=args.wait_seconds,
+        )
+    if args.command == "_env-request":
+        return request_env_action_file(
+            Path(args.request_file),
+            Path(args.response_file),
+            action=args.action,
             wait_seconds=args.wait_seconds,
         )
     if args.command == "_server-request-job":
