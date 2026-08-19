@@ -831,6 +831,87 @@ class LiveCheckpointTests(RepositoryTestCase):
         self.assertEqual(result["action"], "refresh")
         self.assertFalse(response_file.exists())
 
+    def test_commit_request_waits_for_trusted_broker_response(self) -> None:
+        request_file = self.root / cr.COMMIT_REQUEST_RELATIVE
+        response_file = self.root / cr.COMMIT_RESPONSE_RELATIVE
+
+        def broker() -> None:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not request_file.exists():
+                time.sleep(0.01)
+            self.assertTrue(request_file.exists())
+            request = cr.read_json(request_file)
+            assert request is not None
+            self.assertEqual(request["message"], "logical checkpoint")
+            self.assertEqual(request["paths"], ["tracked.txt"])
+            cr.atomic_write_json(
+                response_file,
+                {
+                    "ok": True,
+                    "commit": {"sha": "deadbeef", "message": request["message"]},
+                },
+            )
+
+        worker = threading.Thread(target=broker)
+        worker.start()
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_COMMIT_REQUEST_PATH": str(request_file)},
+            ):
+                result = cr.request_commit_file(
+                    request_file,
+                    response_file,
+                    message="logical checkpoint",
+                    paths=["tracked.txt"],
+                    wait_seconds=3,
+                )
+        finally:
+            worker.join(timeout=3)
+        self.assertEqual(result["commit"]["sha"], "deadbeef")
+        self.assertFalse(response_file.exists())
+
+    def test_trusted_commit_broker_preserves_selected_commit_boundary(self) -> None:
+        home = self.base / "commit-broker-home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths, task, worktree = self.make_interactive_server_task(home)
+            (worktree / "tracked.txt").write_text(
+                "one\ncommitted-unit\nthree\nfour\n", encoding="utf-8"
+            )
+            (worktree / "later.py").write_text("LATER = True\n", encoding="utf-8")
+
+            result = cr.server_interactive_commit_action(
+                str(task["project_id"]),
+                str(task["task_id"]),
+                {
+                    "message": "implement first logical unit",
+                    "paths": ["tracked.txt"],
+                },
+            )
+
+            commit_sha = result["commit"]["sha"]
+            self.assertEqual(cr.current_head(worktree), commit_sha)
+            self.assertEqual(
+                git(worktree, "log", "-1", "--format=%s").stdout.strip(),
+                "implement first logical unit",
+            )
+            self.assertEqual(result["commit"]["paths"], ["tracked.txt"])
+            self.assertEqual(result["checkpoint"]["sha"], commit_sha)
+            self.assertTrue((worktree / "later.py").is_file())
+            self.assertIn("?? later.py", git(worktree, "status", "--short").stdout)
+            self.assertNotIn(
+                "later.py",
+                git(worktree, "show", "--format=", "--name-only", commit_sha).stdout,
+            )
+
+    def test_trusted_commit_broker_rejects_paths_outside_worktree(self) -> None:
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.normalized_commit_request(
+                {"message": "bad path", "paths": ["../outside.txt"]}
+            )
+        self.assertEqual(caught.exception.code, "INVALID_COMMIT_REQUEST")
+
     def test_trusted_environment_control_refreshes_and_tests_clean_checkpoint(self) -> None:
         home = self.base / "environment-control-home"
         home.mkdir()
@@ -1048,6 +1129,10 @@ class ServerStartTests(RepositoryTestCase):
             jobctl = Path(task["jobctl_path"]).read_text(encoding="utf-8")
             self.assertIn("--response-file", jobctl)
             self.assertIn("--wait-seconds 900", jobctl)
+            commitctl = Path(task["commitctl_path"]).read_text(encoding="utf-8")
+            self.assertIn("_commit-request", commitctl)
+            self.assertIn("--wait-seconds 900", commitctl)
+            self.assertIn('"$@"', commitctl)
 
 
 class ServerCleanupTests(RepositoryTestCase):
@@ -2429,6 +2514,7 @@ class MiscellaneousTests(RepositoryTestCase):
             "state_dir": str(state_dir),
             "worktree": str(self.root),
             "job_policy": "deny",
+            "commitctl_path": str(state_dir / "codex-commit"),
         }
         env = cr.codex_process_environment(task)
         cache = state_dir / "tool-cache"
@@ -2441,6 +2527,11 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertEqual(env["GIT_AUTHOR_EMAIL"], "codex-remote@localhost")
         self.assertEqual(env["GIT_COMMITTER_NAME"], "Codex Remote")
         self.assertEqual(env["GIT_COMMITTER_EMAIL"], "codex-remote@localhost")
+        self.assertEqual(env["CODEX_COMMIT"], str(state_dir / "codex-commit"))
+        self.assertEqual(
+            env["CODEX_COMMIT_REQUEST_PATH"],
+            str(self.root / cr.COMMIT_REQUEST_RELATIVE),
+        )
         self.assertTrue(cache.is_dir())
 
     def test_filtered_dev_environment_excludes_credential_variables(self) -> None:
@@ -2472,6 +2563,8 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertIn("uv add", instructions)
         self.assertIn("$CODEX_DEV", instructions)
         self.assertIn("$CODEX_ENVCTL refresh", instructions)
+        self.assertIn("$CODEX_COMMIT", instructions)
+        self.assertIn("do not run git add", instructions)
         self.assertIn("cannot contact the Nix daemon directly", instructions)
         self.assertIn("do not stop after merely proposing a plan", instructions)
         self.assertIn("Do not use sudo", instructions)

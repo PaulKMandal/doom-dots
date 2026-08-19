@@ -84,17 +84,22 @@ job path.
 no frozen-job authorization. Closing its watcher does not cancel the task.
 
 `SPC r c i` is the persistent conversational mode. Starting a new interactive
-task requires a clean, named local branch because the server's real commit chain
-will later be integrated into that branch. Doom creates the isolated server
-worktree, launches Codex under durable `tmux`, and opens kitty. Running the same
-binding again reattaches to the existing TUI and conversation.
+task requires only a named local branch. Staged and unstaged tracked local work
+is captured in an invisible input snapshot, while untracked paths are ignored.
+Doom creates the isolated server worktree, launches Codex under durable `tmux`,
+and opens kitty. Running the same binding again reattaches to the existing TUI
+and conversation.
 
 Managed interactive sessions use GPT-5.6 Sol at extra-high reasoning, approval
 policy `never`, a `workspace-write` sandbox, public dependency-network access,
 a task-private Nix/uv/Python cache, and stable `Codex Remote` Git author and
-committer identity. Codex is instructed to commit each validated logical unit
-and never amend, rebase, reset, or otherwise rewrite a commit created in the
-managed session because the laptop may publish it at any time.
+committer identity. The Codex sandbox deliberately cannot write Git metadata.
+Instead, each interactive task exposes a narrow trusted `$CODEX_COMMIT` broker.
+Codex chooses the commit message and exact path set for each validated logical
+unit; the trusted runner stages only those paths, creates and safety-checks the
+commit outside the sandbox, and publishes it immediately. Codex is instructed
+never to amend, rebase, reset, or otherwise rewrite a brokered commit because
+the laptop may pull it at any time.
 
 Closing kitty, detaching with `C-b d`, losing SSH, or suspending the laptop only
 detaches. While Codex remains open, use the ordinary `SPC r` sync/run/test
@@ -285,7 +290,21 @@ $CODEX_ENVCTL test      # run the configured bounded trusted test command
 $CODEX_ENVCTL check     # refresh, then test
 ```
 
-Codex must commit tracked dependency changes before using those controls. The
+The Git metadata boundary has a similarly narrow trusted control:
+
+```sh
+$CODEX_COMMIT -m "Describe one logical unit" -- path/to/file another/path
+```
+
+Codex may use read-only Git commands such as `git status`, `git diff`, `git
+log`, and `git show`, but it does not run `git add` or `git commit` directly.
+The broker uses a private temporary index, so paths not named in the request
+remain uncommitted WIP. It rejects path traversal and `.git` access, validates
+the resulting commit with the normal result-safety scanner, advances the
+managed detached worktree only after validation, and publishes the new
+checkpoint immediately.
+
+Codex must broker-commit tracked dependency changes before using the environment controls. The
 stable `$CODEX_DEV COMMAND ...` wrapper always reads the newest captured project
 environment while the TUI remains open, so a refreshed `uv` environment or Nix
 toolchain can be used without ending the conversation. Plain `uv add`, `uv sync`,
@@ -354,7 +373,9 @@ the task is cancelled.
    snapshot. Every untracked path is ignored, is not uploaded, and does not need
    cleanup.
 2. Run `SPC r c i` and give Codex the implementation request in its TUI.
-3. Codex works in the isolated server checkout and creates coherent commits.
+3. Codex works in the isolated server checkout and creates coherent commits via
+   `$CODEX_COMMIT`; the sandbox never needs write access to `.git` or the shared
+   bare repository.
 4. Leave the TUI running. Whenever code should reach the laptop and normal
    experiment checkout, use the command you already intended to use:
    - `SPC r s` pulls and syncs;
@@ -646,8 +667,10 @@ A live checkpoint publishes only the server worktree's committed `HEAD`.
 Uncommitted edits remain server-side and the status view reports that the
 checkpoint is dirty. Every later checkpoint must descend from the last published
 commit; an amend, rebase, or reset is blocked instead of silently replacing commits
-already pulled to the laptop. Codex is therefore instructed never to rewrite commits
-created in the managed session because a laptop pull may publish them at any time. If Codex
+already pulled to the laptop. The sandbox does not receive Git-metadata write
+access; `$CODEX_COMMIT` is the only normal path for creating interactive
+commits. Codex is therefore instructed never to rewrite commits created in the
+managed session because a laptop pull may publish them at any time. If Codex
 exits with safe uncommitted files, the finalizer creates one clearly identifiable
 remainder commit as a recovery fallback, but the normal policy is for Codex to
 commit each validated logical unit itself.
