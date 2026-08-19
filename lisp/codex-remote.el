@@ -151,7 +151,7 @@ verifies that Codex did not replace them.")
           :profile my/codex-remote-profile
           :reasoning my/codex-remote-reasoning-effort
           :search my/codex-remote-enable-search
-          :job-policy "deny"
+          :job-policy "launch"
           :timeout my/codex-remote-timeout
           :max-untracked my/codex-remote-max-untracked-bytes)))
 
@@ -307,6 +307,7 @@ ON-ERROR with the parsed JSON object and process buffer."
           (equal (my/codex-remote--get task 'state) "NONE"))
       '("State: NONE" "No remote Codex task exists for this project.")
     (let* ((tests (my/codex-remote--get task 'tests))
+           (checkpoint (my/codex-remote--get task 'checkpoint))
            (tmux (my/codex-remote--get task 'tmux))
            (fields
             `(("State" . ,(my/codex-remote--get task 'state))
@@ -334,6 +335,16 @@ ON-ERROR with the parsed JSON object and process buffer."
               ("Lock held" . ,(my/codex-remote--get task 'lock_held))
               ("Codex thread" . ,(my/codex-remote--get task 'codex_thread_id))
               ("Codex exit" . ,(my/codex-remote--get task 'codex_exit_code))
+              ("Checkpoint" . ,(and checkpoint
+                                      (my/codex-remote--get checkpoint 'sha)))
+              ("Checkpoint commits" . ,(and checkpoint
+                                              (my/codex-remote--get
+                                               checkpoint 'commit_count)))
+              ("Checkpoint dirty" . ,(and checkpoint
+                                            (if (my/codex-remote--get
+                                                 checkpoint 'dirty)
+                                                "yes"
+                                              "no")))
               ("Result" . ,(my/codex-remote--get task 'result_sha))
               ("Lock files changed" . ,(my/codex-remote--get task 'lock_files_changed))
               ("Environment refresh" . ,(when-let ((refresh
@@ -792,9 +803,9 @@ its existing tmux session without resnapshotting or saving local buffers."
              mode state))))))))
 
 (defun my/codex-remote-interactive ()
-  "Start or reattach to managed interactive Codex without job authorization."
+  "Start or reattach to managed interactive Codex with frozen-job authorization."
   (interactive)
-  (my/codex-remote--interactive-with-policy "deny"))
+  (my/codex-remote--interactive-with-policy "launch"))
 
 (defun my/codex-remote-interactive-job ()
   "Start or reattach to interactive Codex with one frozen job authorized.
@@ -1200,6 +1211,81 @@ importable through `my/codex-remote-apply'."
                  (format " (imported from warning state %s)" source-state)
                ""))))
 
+(defun my/codex-remote--refresh-project-buffers (root)
+  "Revert unmodified visiting buffers below ROOT after a Git fast-forward."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (and buffer-file-name
+                 (not (buffer-modified-p))
+                 (file-exists-p buffer-file-name)
+                 (file-in-directory-p (file-truename buffer-file-name)
+                                      (file-truename root))
+                 (not (verify-visited-file-modtime buffer)))
+        (condition-case err
+            (revert-buffer :ignore-auto :noconfirm)
+          (error
+           (message "Could not refresh %s after Codex pull: %s"
+                    (buffer-name buffer)
+                    (error-message-string err))))))))
+
+(defun my/codex-remote--pull-success
+    (response buffer context &optional continuation)
+  "Handle committed-checkpoint RESPONSE and then call CONTINUATION.
+
+CONTEXT identifies the project whose unmodified visiting buffers should be
+refreshed after a successful fast-forward.  CONTINUATION receives RESPONSE and
+is used by the ordinary remote sync/run commands so pulling a live Codex
+checkpoint remains an invisible preflight."
+  (when (buffer-live-p buffer)
+    (kill-buffer buffer))
+  (let ((count (or (my/codex-remote--get response 'changed_commit_count) 0))
+        (message-text (my/codex-remote--get response 'message)))
+    (when (> count 0)
+      (my/codex-remote--refresh-project-buffers (plist-get context :root))
+      (when (fboundp 'magit-refresh-all)
+        (magit-refresh-all))
+      (message "%s" (or message-text
+                         (format "Pulled %d Codex commit(s)" count))))
+    (when continuation
+      (funcall continuation response))))
+
+(cl-defun my/codex-remote--run-pull (context &key continuation quiet)
+  "Pull committed interactive checkpoints for CONTEXT.
+
+When CONTINUATION is non-nil, invoke it after a successful pull/no-op.  Any
+real integration failure stops the pending sync/run command rather than
+running against an ambiguous mixture of local and Codex state."
+  (let ((command (my/codex-remote--common-args "pull" context)))
+    (my/codex-remote--run
+     "pull" command context
+     :quiet quiet
+     :on-success
+     (lambda (response buffer)
+       (my/codex-remote--pull-success response buffer context continuation))
+     :on-error
+     (lambda (response buffer)
+       (my/codex-remote--display-raw-error buffer response)
+       (message "Remote action stopped because live Codex commits could not be pulled")))))
+
+(defun my/codex-remote-pull ()
+  "Pull the latest committed interactive Codex checkpoint without stopping it."
+  (interactive)
+  (let* ((context (my/codex-remote--context))
+         (root (plist-get context :root)))
+    (my/codex-remote--save-project-buffers root)
+    (my/codex-remote--run-pull context)))
+
+(defun my/codex-remote-refresh-then (continuation)
+  "Pull any live Codex commits, then call CONTINUATION with the response.
+
+This is the bridge used by the normal `SPC r' commands.  A project without an
+interactive task produces a fast no-op response and continues normally."
+  (let* ((context (my/codex-remote--context))
+         (root (plist-get context :root)))
+    (my/codex-remote--save-project-buffers root)
+    (my/codex-remote--run-pull
+     context :continuation continuation :quiet t)))
+
 (defun my/codex-remote--run-apply (context &optional allow-branch-change
                                            preserve-local push-backup)
   "Run the backend import for CONTEXT with the requested recovery options."
@@ -1265,8 +1351,13 @@ importable through `my/codex-remote-apply'."
      ((member code '("INTEGRATION_CONFLICT"
                      "INTEGRATION_CONFLICT_PENDING"
                      "INTEGRATION_EXISTS"))
-      (run-at-time 0 nil #'my/codex-remote--prompt-conflict-action
-                   context response allow-branch-change)))))
+      (let* ((details (my/codex-remote--get response 'details))
+             (kind (my/codex-remote--get details 'integration_kind)))
+        (if (equal kind "commit-checkpoint")
+            (run-at-time 0 nil #'my/codex-remote--open-conflict-worktree
+                         response)
+          (run-at-time 0 nil #'my/codex-remote--prompt-conflict-action
+                       context response allow-branch-change)))))))
 
 (defun my/codex-remote--confirm-import-state
     (context allow-branch-change response buffer)
@@ -1278,9 +1369,7 @@ importable through `my/codex-remote-apply'."
     (cond
      ((and (equal mode "interactive")
            (member state my/codex-remote--active-states))
-      (message
-       "Interactive Codex is still %s; reattach with SPC r c i and exit with /exit or /quit before SPC r c f"
-       state))
+      (my/codex-remote--run-apply context allow-branch-change))
      ((member state my/codex-remote--warning-import-states)
       (run-at-time
        0 nil
@@ -1292,7 +1381,7 @@ importable through `my/codex-remote-apply'."
       (my/codex-remote--run-apply context allow-branch-change)))))
 
 (defun my/codex-remote-apply (&optional allow-branch-change)
-  "Fetch and apply a completed Codex delta as unstaged local changes.
+  "Pull interactive commits or apply a completed one-shot Codex delta.
 
 With prefix ALLOW-BRANCH-CHANGE, deliberately apply a task that started on a
 different branch to the currently checked-out branch.  Otherwise a branch
@@ -1369,41 +1458,5 @@ change is presented as an explicit prompt."
          (message "Discarded remote Codex task %s"
                   (my/codex-remote--get
                    (my/codex-remote--get response 'task) 'task_id)))))))
-
-(defconst my/codex-remote--importable-states
-  '("READY" "READY_TESTS_FAILED" "READY_CODEX_FAILED"
-    "READY_TESTS_DIRTY" "READY_ENVIRONMENT_FAILED"
-    "READY_ENVIRONMENT_DIRTY" "READY_ENVIRONMENT_UNVERIFIED"
-    "READY_RECOVERED_UNVERIFIED" "CANCELLED_READY"
-    "NOOP" "CANCELLED_NOOP")
-  "Remote states that have a result or acknowledged no-op ready for import.")
-
-(defun my/codex-remote--notify-after-sync (&rest _)
-  "Nonblockingly report a completed Codex task after ordinary `SPC r s'."
-  (condition-case nil
-      (let* ((context (my/codex-remote--context))
-             (command (my/codex-remote--common-args "status" context)))
-        (my/codex-remote--run
-         "sync-check" command context
-         :quiet t
-         :on-success
-         (lambda (response buffer)
-           (when (buffer-live-p buffer)
-             (kill-buffer buffer))
-           (let* ((task (my/codex-remote--get response 'task))
-                  (state (my/codex-remote--get task 'state)))
-             (when (member state my/codex-remote--importable-states)
-               (message "Remote Codex task is %s; use SPC r c f to import it before the next sync/run"
-                        state))))
-         :on-error
-         (lambda (_response buffer)
-           (when (buffer-live-p buffer)
-             (kill-buffer buffer)))))
-    (error nil)))
-
-(when (and (fboundp 'my/project-sync)
-           (not (advice-member-p #'my/codex-remote--notify-after-sync
-                                 #'my/project-sync)))
-  (advice-add #'my/project-sync :after #'my/codex-remote--notify-after-sync))
 
 (provide 'codex-remote)

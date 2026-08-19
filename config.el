@@ -68,7 +68,8 @@
         :desc "Show remote Codex status"      "t" #'my/codex-remote-status
         :desc "Monitor Codex tmux"            "a" #'my/codex-remote-attach
         :desc "Start/reattach managed Codex TUI" "i" #'my/codex-remote-interactive
-        :desc "Interactive Codex + frozen job" "I" #'my/codex-remote-interactive-job
+        :desc "Start/reattach Codex + job"       "I" #'my/codex-remote-interactive-job
+        :desc "Pull live Codex commits"          "p" #'my/codex-remote-pull
         :desc "Open one-shot Codex terminal"   "j" #'my/codex-remote-job
         :desc "Show remote Codex logs"        "l" #'my/codex-remote-logs
         :desc "Recover orphaned Codex work"   "r" #'my/codex-remote-recover

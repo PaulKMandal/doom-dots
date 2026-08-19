@@ -8,6 +8,7 @@
    (directory-file-name
     (file-name-directory (or load-file-name buffer-file-name)))))
 (defvar doom-user-dir (file-name-as-directory codex-remote-test-root))
+(load-file (expand-file-name "lisp/remote-dev.el" codex-remote-test-root))
 (load-file (expand-file-name "lisp/codex-remote.el" codex-remote-test-root))
 
 (ert-deftest codex-remote-safe-local-values ()
@@ -87,6 +88,72 @@
       (should (member "server" command))
       (should (member "high" command))
       (should (member "--enable-search" command)))))
+
+(ert-deftest codex-remote-pull-command-preserves-project-context ()
+  (let ((my/codex-remote-backend "/tmp/codex-remote")
+        (context '(:root "/tmp/project/"
+                   :host "rhel-test"
+                   :remote-dir "/srv/project"
+                   :timeout 5
+                   :max-untracked 2048)))
+    (should
+     (equal
+      (my/codex-remote--common-args "pull" context)
+      '("/tmp/codex-remote" "pull"
+        "--project-root" "/tmp/project/"
+        "--host" "rhel-test"
+        "--remote-dir" "/srv/project"
+        "--timeout" "5"
+        "--max-untracked-bytes" "2048")))))
+
+(ert-deftest codex-remote-refreshes-unmodified-project-buffers-after-pull ()
+  (let* ((root (make-temp-file "codex-remote-buffer-" t))
+         (file (expand-file-name "tracked.txt" root))
+         buffer)
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert "before\n"))
+          (setq buffer (find-file-noselect file))
+          (with-temp-file file (insert "after\n"))
+          ;; Ensure the visited-file timestamp cannot compare equal on a
+          ;; low-resolution filesystem.
+          (set-file-times file (time-add (current-time) 2))
+          (my/codex-remote--refresh-project-buffers root)
+          (with-current-buffer buffer
+            (should (equal (buffer-string) "after\n"))
+            (should-not (buffer-modified-p))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (delete-directory root t))))
+
+(ert-deftest codex-remote-interactive-entry-authorizes-frozen-jobs ()
+  (let (seen)
+    (cl-letf (((symbol-function 'my/codex-remote--interactive-with-policy)
+               (lambda (policy) (setq seen policy))))
+      (my/codex-remote-interactive))
+    (should (equal seen "launch"))))
+
+(ert-deftest remote-dev-lowercase-action-syncs-only-after-live-commit-pull ()
+  (let (compiled)
+    (cl-letf (((symbol-function 'my/remote--sync-command) (lambda () "SYNC"))
+              ((symbol-function 'my/remote--run-command) (lambda (_command) "RUN"))
+              ((symbol-function 'my/remote--compile)
+               (lambda (command &optional _buffer) (setq compiled command)))
+              ((symbol-function 'my/remote--refresh-then)
+               (lambda (continuation)
+                 (funcall continuation '((changed_commit_count . 2))))))
+      (my/remote--run-after-refresh "pytest" "*test*")
+      (should (equal compiled "SYNC && RUN")))
+    (setq compiled nil)
+    (cl-letf (((symbol-function 'my/remote--sync-command) (lambda () "SYNC"))
+              ((symbol-function 'my/remote--run-command) (lambda (_command) "RUN"))
+              ((symbol-function 'my/remote--compile)
+               (lambda (command &optional _buffer) (setq compiled command)))
+              ((symbol-function 'my/remote--refresh-then)
+               (lambda (continuation)
+                 (funcall continuation '((changed_commit_count . 0))))))
+      (my/remote--run-after-refresh "pytest" "*test*")
+      (should (equal compiled "RUN")))))
 
 (ert-deftest codex-remote-interactive-action-starts-attaches-or-blocks ()
   (should

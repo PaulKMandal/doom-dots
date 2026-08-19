@@ -1,3 +1,5 @@
+;;; lisp/remote-dev.el -*- lexical-binding: t; -*-
+
 (require 'seq)
 (require 'subr-x)
 
@@ -80,10 +82,8 @@ Set this in .dir-locals.el.  Nil means no excludes.")
           (shell-quote-argument my/remote-dir)
           command))
 
-(defun my/project-sync ()
-  "Rsync the current project to `my/remote-host':`my/remote-dir'."
-  (interactive)
-  (my/remote-check)
+(defun my/remote--sync-command ()
+  "Return the existing rsync command for the current project."
   (let* ((root (file-name-as-directory (expand-file-name (my/project-root))))
          (mkdir-cmd
           (my/remote--ssh-command
@@ -95,112 +95,121 @@ Set this in .dir-locals.el.  Nil means no excludes.")
            (shell-quote-argument root)
            (shell-quote-argument my/remote-host)
            (shell-quote-argument (file-name-as-directory my/remote-dir)))))
-    (compile (my/remote--shell-join (list mkdir-cmd rsync-cmd)))))
+    (my/remote--shell-join (list mkdir-cmd rsync-cmd))))
 
-(defun my/project-run-remote-command (command &optional buffer-name)
-  "Run COMMAND in `my/remote-dir' on `my/remote-host'."
-  (interactive "sRemote command: ")
-  (my/remote-check)
+(defun my/remote--run-command (command)
+  "Return the SSH command that runs COMMAND in the normal remote checkout."
+  (my/remote--ssh-command (my/remote--cd-command command)))
+
+(defun my/remote--compile (command &optional buffer-name)
+  "Compile COMMAND, optionally naming its compilation buffer BUFFER-NAME."
   (let ((compilation-buffer-name-function
          (when buffer-name
            (lambda (_mode) buffer-name))))
-    (compile
-     (my/remote--ssh-command
-      (my/remote--cd-command command)))))
+    (compile command)))
+
+(defun my/remote--codex-pulled-commits-p (response)
+  "Return non-nil when Codex refresh RESPONSE imported at least one commit."
+  (and response
+       (fboundp 'my/codex-remote--get)
+       (> (or (my/codex-remote--get response 'changed_commit_count) 0) 0)))
+
+(defun my/remote--refresh-then (continuation)
+  "Pull committed interactive Codex updates, then call CONTINUATION.
+
+CONTINUATION receives the backend response.  Without the Codex integration,
+run it immediately with nil so this module remains independently usable."
+  (if (fboundp 'my/codex-remote-refresh-then)
+      (my/codex-remote-refresh-then continuation)
+    (funcall continuation nil)))
+
+(defun my/remote--run-after-refresh
+    (remote-command buffer-name &optional always-sync)
+  "Run REMOTE-COMMAND after the live Codex refresh.
+
+When ALWAYS-SYNC is non-nil, preserve the existing uppercase sync+action
+semantics.  For lowercase commands, sync only when the refresh pulled new
+Codex commits; otherwise preserve the original no-sync behavior."
+  (let ((sync-command (my/remote--sync-command))
+        (run-command (my/remote--run-command remote-command)))
+    (my/remote--refresh-then
+     (lambda (response)
+       (my/remote--compile
+        (if (or always-sync
+                (my/remote--codex-pulled-commits-p response))
+            (my/remote--shell-join (list sync-command run-command))
+          run-command)
+        buffer-name)))))
+
+(defun my/project-sync ()
+  "Pull committed Codex checkpoints, then rsync the local project remotely."
+  (interactive)
+  (my/remote-check)
+  (let ((sync-command (my/remote--sync-command)))
+    (my/remote--refresh-then
+     (lambda (_response)
+       (my/remote--compile sync-command)))))
+
+(defun my/project-run-remote-command (command &optional buffer-name)
+  "Run COMMAND in `my/remote-dir' on `my/remote-host'.
+
+This low-level helper does not perform a Codex refresh; the user-facing remote
+commands below do so before invoking it."
+  (interactive "sRemote command: ")
+  (my/remote-check)
+  (my/remote--compile (my/remote--run-command command) buffer-name))
 
 (defun my/project-remote-setup ()
-  "Run `my/remote-setup-cmd' on the remote project."
+  "Refresh Codex commits, then run `my/remote-setup-cmd' remotely."
   (interactive)
   (my/remote-check)
   (unless my/remote-setup-cmd
     (user-error "Set my/remote-setup-cmd in .dir-locals.el"))
-  (my/project-run-remote-command my/remote-setup-cmd "*remote-setup*"))
+  (my/remote--run-after-refresh my/remote-setup-cmd "*remote-setup*"))
 
 (defun my/project-test-remote ()
-  "Run `my/remote-test-cmd' on the remote project."
+  "Refresh Codex commits, then run `my/remote-test-cmd' remotely."
   (interactive)
   (my/remote-check)
   (unless my/remote-test-cmd
     (user-error "Set my/remote-test-cmd in .dir-locals.el"))
-  (my/project-run-remote-command my/remote-test-cmd "*remote-test*"))
+  (my/remote--run-after-refresh my/remote-test-cmd "*remote-test*"))
 
 (defun my/project-smoke-remote ()
-  "Run `my/remote-smoke-cmd' on the remote project."
+  "Refresh Codex commits, then run `my/remote-smoke-cmd' remotely."
   (interactive)
   (my/remote-check)
   (unless my/remote-smoke-cmd
     (user-error "Set my/remote-smoke-cmd in .dir-locals.el"))
-  (my/project-run-remote-command my/remote-smoke-cmd "*remote-smoke*"))
+  (my/remote--run-after-refresh my/remote-smoke-cmd "*remote-smoke*"))
 
 (defun my/project-run-remote ()
-  "Run `my/remote-run-cmd' on the remote project."
+  "Refresh Codex commits, then run `my/remote-run-cmd' remotely."
   (interactive)
   (my/remote-check t)
-  (my/project-run-remote-command my/remote-run-cmd "*remote-run*"))
+  (my/remote--run-after-refresh my/remote-run-cmd "*remote-run*"))
 
 (defun my/project-sync-and-setup ()
-  "Sync the project and then run `my/remote-setup-cmd'."
+  "Refresh Codex commits, sync, then run `my/remote-setup-cmd'."
   (interactive)
   (my/remote-check)
   (unless my/remote-setup-cmd
     (user-error "Set my/remote-setup-cmd in .dir-locals.el"))
-  (let* ((root (file-name-as-directory (expand-file-name (my/project-root))))
-         (mkdir-cmd
-          (my/remote--ssh-command
-           (format "mkdir -p %s" (shell-quote-argument my/remote-dir))))
-         (rsync-cmd
-          (format
-           "rsync -az --delete %s %s %s:%s"
-           (my/remote--exclude-args)
-           (shell-quote-argument root)
-           (shell-quote-argument my/remote-host)
-           (shell-quote-argument (file-name-as-directory my/remote-dir))))
-         (run-cmd
-          (my/remote--ssh-command
-           (my/remote--cd-command my/remote-setup-cmd))))
-    (compile (my/remote--shell-join (list mkdir-cmd rsync-cmd run-cmd)))))
+  (my/remote--run-after-refresh my/remote-setup-cmd "*remote-setup*" t))
 
 (defun my/project-sync-and-smoke ()
-  "Sync the project and then run `my/remote-smoke-cmd'."
+  "Refresh Codex commits, sync, then run `my/remote-smoke-cmd'."
   (interactive)
   (my/remote-check)
   (unless my/remote-smoke-cmd
     (user-error "Set my/remote-smoke-cmd in .dir-locals.el"))
-  (let* ((root (file-name-as-directory (expand-file-name (my/project-root))))
-         (mkdir-cmd
-          (my/remote--ssh-command
-           (format "mkdir -p %s" (shell-quote-argument my/remote-dir))))
-         (rsync-cmd
-          (format
-           "rsync -az --delete %s %s %s:%s"
-           (my/remote--exclude-args)
-           (shell-quote-argument root)
-           (shell-quote-argument my/remote-host)
-           (shell-quote-argument (file-name-as-directory my/remote-dir))))
-         (run-cmd
-          (my/remote--ssh-command
-           (my/remote--cd-command my/remote-smoke-cmd))))
-    (compile (my/remote--shell-join (list mkdir-cmd rsync-cmd run-cmd)))))
+  (my/remote--run-after-refresh my/remote-smoke-cmd "*remote-smoke*" t))
 
 (defun my/project-sync-and-run ()
-  "Sync the project and then run `my/remote-run-cmd'."
+  "Refresh Codex commits, sync, then run `my/remote-run-cmd'."
   (interactive)
   (my/remote-check t)
-  (let* ((root (file-name-as-directory (expand-file-name (my/project-root))))
-         (mkdir-cmd
-          (my/remote--ssh-command
-           (format "mkdir -p %s" (shell-quote-argument my/remote-dir))))
-         (rsync-cmd
-          (format
-           "rsync -az --delete %s %s %s:%s"
-           (my/remote--exclude-args)
-           (shell-quote-argument root)
-           (shell-quote-argument my/remote-host)
-           (shell-quote-argument (file-name-as-directory my/remote-dir))))
-         (run-cmd
-          (my/remote--ssh-command
-           (my/remote--cd-command my/remote-run-cmd))))
-    (compile (my/remote--shell-join (list mkdir-cmd rsync-cmd run-cmd)))))
+  (my/remote--run-after-refresh my/remote-run-cmd "*remote-run*" t))
 
 (defun my/project-remote-terminal ()
   (interactive)
