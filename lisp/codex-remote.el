@@ -1252,9 +1252,10 @@ checkpoint remains an invisible preflight."
 (cl-defun my/codex-remote--run-pull (context &key continuation quiet)
   "Pull committed interactive checkpoints for CONTEXT.
 
-When CONTINUATION is non-nil, invoke it after a successful pull/no-op.  Any
-real integration failure stops the pending sync/run command rather than
-running against an ambiguous mixture of local and Codex state."
+When CONTINUATION is non-nil, invoke it after a successful pull/no-op.  A quiet
+automatic preflight defers `LOCAL_DIRTY_FOR_COMMIT_PULL' and lets the requested
+remote action retain its original behavior; explicit pulls and every other
+integration failure remain strict."
   (let ((command (my/codex-remote--common-args "pull" context)))
     (my/codex-remote--run
      "pull" command context
@@ -1264,8 +1265,24 @@ running against an ambiguous mixture of local and Codex state."
        (my/codex-remote--pull-success response buffer context continuation))
      :on-error
      (lambda (response buffer)
-       (my/codex-remote--display-raw-error buffer response)
-       (message "Remote action stopped because live Codex commits could not be pulled")))))
+       (if (and quiet
+                continuation
+                (equal (my/codex-remote--error-code response)
+                       "LOCAL_DIRTY_FOR_COMMIT_PULL"))
+           (progn
+             (when (buffer-live-p buffer)
+               (kill-buffer buffer))
+             (message
+              (concat
+               "Codex commits are waiting, but local tracked edits are still "
+               "in progress; continuing this remote action without importing them"))
+             (funcall continuation
+                      `((ok . t)
+                        (changed_commit_count . 0)
+                        (pull_deferred . t)
+                        (deferred_error . ,response))))
+         (my/codex-remote--display-raw-error buffer response)
+         (message "Remote action stopped because live Codex commits could not be pulled"))))))
 
 (defun my/codex-remote-pull ()
   "Pull the latest committed interactive Codex checkpoint without stopping it."

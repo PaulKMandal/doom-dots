@@ -155,6 +155,36 @@
       (my/remote--run-after-refresh "pytest" "*test*")
       (should (equal compiled "RUN")))))
 
+
+(ert-deftest codex-remote-automatic-refresh-defers-dirty-checkpoint-pull ()
+  (let ((process-buffer (generate-new-buffer " *codex-dirty-pull-test*"))
+        continued
+        displayed)
+    (unwind-protect
+        (cl-letf (((symbol-function 'my/codex-remote--common-args)
+                   (lambda (_action _context) '("codex-remote" "pull")))
+                  ((symbol-function 'my/codex-remote--display-raw-error)
+                   (lambda (&rest _args) (setq displayed t)))
+                  ((symbol-function 'my/codex-remote--run)
+                   (lambda (_action _command _context &rest options)
+                     (funcall
+                      (plist-get options :on-error)
+                      '((ok . nil)
+                        (error_code . "LOCAL_DIRTY_FOR_COMMIT_PULL")
+                        (error . "tracked edits are still in progress"))
+                      process-buffer))))
+          (my/codex-remote--run-pull
+           '(:root "/tmp/project/")
+           :quiet t
+           :continuation (lambda (response) (setq continued response))))
+      (when (buffer-live-p process-buffer)
+        (kill-buffer process-buffer)))
+    (should-not displayed)
+    (should continued)
+    (should (equal (my/codex-remote--get continued 'changed_commit_count) 0))
+    (should (my/codex-remote--get continued 'pull_deferred))
+    (should-not (buffer-live-p process-buffer))))
+
 (ert-deftest codex-remote-interactive-action-starts-attaches-or-blocks ()
   (should
    (eq (my/codex-remote--interactive-action
