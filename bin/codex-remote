@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from typing import Any, Mapping, Sequence
 
@@ -40,6 +41,7 @@ REMOTE_STATE_RELATIVE = Path(".local/state/codex-remote")
 LOCAL_STATE_ROOT = Path.home() / ".local/state/codex-remote"
 PROJECT_CONFIG_RELATIVE = "codex-remote/config.json"
 JOB_REQUEST_RELATIVE = ".codex-job-request.json"
+JOB_RESPONSE_RELATIVE = ".codex-job-response.json"
 JOB_POLICIES = {"deny", "prepare", "launch"}
 JOB_ACTIVE_STATES = {"STARTING", "BOOTSTRAPPING", "RUNNING", "STOP_REQUESTED"}
 GLOBAL_AGENTS_BEGIN = "<!-- BEGIN CODEX-REMOTE MANAGED INSTRUCTIONS -->"
@@ -1123,12 +1125,37 @@ def start_new_task(
     data_links = submitted_data_links(args)
     identifier = task_id()
     input_ref = f"refs/codex/{project_id}/input/{identifier}"
-    snapshot = create_hidden_snapshot(
-        root,
-        input_ref,
-        f"Codex remote {execution_mode} input snapshot {project_id}/{identifier}",
-    )
     local_branch = current_branch(root)
+    if execution_mode == "interactive" and not local_branch:
+        raise CodexRemoteError(
+            "Managed interactive Codex requires a named local branch so committed "
+            "checkpoints can be pulled back safely.",
+            code="INTERACTIVE_REQUIRES_BRANCH",
+        )
+    if execution_mode == "interactive":
+        status_text = git_status_porcelain(root)
+        if status_text.strip():
+            raise CodexRemoteError(
+                "Managed interactive Codex now preserves and incrementally imports real "
+                "commits. Commit or stash the local working tree before starting SPC r c i.",
+                code="INTERACTIVE_REQUIRES_CLEAN_CHECKOUT",
+                details={"status": status_text},
+            )
+        head = current_head(root)
+        tree = git(root, "rev-parse", f"{head}^{{tree}}").stdout.strip()
+        git(root, "update-ref", input_ref, head)
+        snapshot = {
+            "commit": head,
+            "tree": tree,
+            "head": head,
+            "index_tree": index_tree(root),
+        }
+    else:
+        snapshot = create_hidden_snapshot(
+            root,
+            input_ref,
+            f"Codex remote {execution_mode} input snapshot {project_id}/{identifier}",
+        )
     prompt_sha256 = (
         hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         if isinstance(prompt, str)
@@ -1709,10 +1736,502 @@ def integrate_result_into_worktree(
         if created and not preserve:
             remove_worktree(root, integration)
 
+
+def commit_integration_worktree_path(
+    project_id: str, task_id_value: str, state_dir: Path | None = None
+) -> Path:
+    base = state_dir if state_dir is not None else local_project_state_dir(project_id)
+    return base / "commit-integration" / validate_safe_id(task_id_value, "task id")
+
+
+def commit_integration_state_path(
+    project_id: str, state_dir: Path | None = None
+) -> Path:
+    base = state_dir if state_dir is not None else local_project_state_dir(project_id)
+    return base / "commit-integration-conflict.json"
+
+
+def ensure_clean_commit_pull_checkout(root: Path) -> tuple[str, str, str]:
+    """Require tracked cleanliness while preserving unrelated untracked files."""
+    ensure_git_idle(root)
+    branch = current_branch(root)
+    if not branch:
+        raise CodexRemoteError(
+            "Live Codex commits cannot be pulled onto a detached local HEAD",
+            code="LOCAL_BRANCH_REQUIRED",
+        )
+    tracked_status = git(
+        root, "status", "--porcelain=v1", "--untracked-files=no"
+    ).stdout
+    if tracked_status.strip():
+        raise CodexRemoteError(
+            "Codex has new committed work, but the local checkout has tracked changes. "
+            "Commit or stash them, then retry the sync/run command so the Codex commit "
+            "boundaries can be preserved. Untracked files may remain unless an incoming "
+            "commit would overwrite one of their paths.",
+            code="LOCAL_DIRTY_FOR_COMMIT_PULL",
+            details={"status": tracked_status},
+        )
+    return branch, current_head(root), git_status_porcelain(root)
+
+
+def commit_summaries(root: Path, old: str, new: str) -> list[dict[str, str]]:
+    completed = git(
+        root,
+        "log",
+        "--reverse",
+        "--format=%H%x00%an%x00%ae%x00%s%x00",
+        f"{old}..{new}",
+    )
+    fields = completed.stdout.split("\0")
+    result: list[dict[str, str]] = []
+    for index in range(0, len(fields) - 3, 4):
+        sha, author, email, subject = fields[index : index + 4]
+        if sha:
+            result.append(
+                {
+                    "sha": sha.strip(),
+                    "author": author,
+                    "email": email,
+                    "subject": subject.rstrip("\n"),
+                }
+            )
+    return result
+
+
+def finish_commit_integration(
+    root: Path,
+    project_id: str,
+    identifier: str,
+    integration: Path,
+    state_root: Path,
+    expected_branch: str,
+    expected_head: str,
+    expected_status: str,
+) -> dict[str, Any]:
+    status = git_status_porcelain(root)
+    if (
+        status != expected_status
+        or current_branch(root) != expected_branch
+        or current_head(root) != expected_head
+    ):
+        raise CodexRemoteError(
+            "The local checkout changed while Codex commits were being integrated; "
+            "the canonical branch was left untouched.",
+            code="LOCAL_STATE_CHANGED",
+            details={
+                "expected_branch": expected_branch,
+                "current_branch": current_branch(root),
+                "expected_head": expected_head,
+                "current_head": current_head(root),
+                "expected_status": expected_status,
+                "status": status,
+                "conflict_path": str(integration),
+            },
+        )
+    integrated_tip = current_head(integration)
+    commits = commit_summaries(integration, expected_head, integrated_tip)
+    merged = git(root, "merge", "--ff-only", integrated_tip, check=False)
+    if merged.returncode != 0:
+        after_head = current_head(root)
+        after_status = git_status_porcelain(root)
+        if after_head != expected_head or after_status != expected_status:
+            raise CodexRemoteError(
+                "The local checkout changed after a failed fast-forward attempt; inspect it "
+                "before retrying.",
+                code="POST_PULL_VERIFY_FAILED",
+                details={
+                    "expected_head": expected_head,
+                    "current_head": after_head,
+                    "expected_status": expected_status,
+                    "status": after_status,
+                    "stdout": merged.stdout,
+                    "stderr": merged.stderr,
+                },
+            )
+        raise CodexRemoteError(
+            "The Codex commits integrated cleanly, but Git could not fast-forward the local "
+            "checkout. An untracked path may be in the way; the canonical checkout was left "
+            "unchanged.",
+            code="LOCAL_CHECKOUT_BLOCKED",
+            details={"stdout": merged.stdout, "stderr": merged.stderr},
+        )
+    tracked_after = git(
+        root, "status", "--porcelain=v1", "--untracked-files=no"
+    ).stdout
+    if (
+        current_head(root) != integrated_tip
+        or tracked_after.strip()
+        or git_status_porcelain(root) != expected_status
+    ):
+        raise CodexRemoteError(
+            "Post-pull verification failed after fast-forwarding Codex commits",
+            code="POST_PULL_VERIFY_FAILED",
+        )
+    with contextlib.suppress(FileNotFoundError):
+        commit_integration_state_path(project_id, state_root).unlink()
+    remove_worktree(root, integration)
+    return {
+        "previous_local_head": expected_head,
+        "local_tip": integrated_tip,
+        "commits": commits,
+        "changed_commit_count": len(commits),
+    }
+
+
+def integrate_committed_checkpoint(
+    root: Path,
+    project_id: str,
+    task_id_value: str,
+    remote_base: str,
+    remote_tip: str,
+    *,
+    prior_local_tip: str | None = None,
+    state_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Replay only newly published Codex commits onto the current local branch."""
+    identifier = validate_safe_id(task_id_value, "task id")
+    if git(root, "merge-base", "--is-ancestor", remote_base, remote_tip, check=False).returncode != 0:
+        raise CodexRemoteError(
+            "Published Codex checkpoint is not descended from the previously pulled checkpoint",
+            code="CHECKPOINT_HISTORY_REWRITTEN",
+            details={"remote_base": remote_base, "remote_tip": remote_tip},
+        )
+    if remote_base == remote_tip:
+        return {
+            "previous_local_head": current_head(root),
+            "local_tip": current_head(root),
+            "commits": [],
+            "changed_commit_count": 0,
+        }
+
+    branch, local_head, local_status = ensure_clean_commit_pull_checkout(root)
+    if prior_local_tip and git(
+        root,
+        "merge-base",
+        "--is-ancestor",
+        prior_local_tip,
+        local_head,
+        check=False,
+    ).returncode != 0:
+        raise CodexRemoteError(
+            "The local branch no longer contains the previously imported Codex checkpoint. "
+            "Do not replay later checkpoints until the local history is reconciled.",
+            code="LOCAL_CHECKPOINT_HISTORY_DIVERGED",
+            details={"prior_local_tip": prior_local_tip, "current_head": local_head},
+        )
+
+    state_root = state_dir if state_dir is not None else local_project_state_dir(project_id)
+    integration = commit_integration_worktree_path(project_id, identifier, state_root)
+    conflict_path = commit_integration_state_path(project_id, state_root)
+    conflict = read_json(conflict_path)
+    if conflict:
+        if (
+            conflict.get("project_id") != project_id
+            or conflict.get("task_id") != identifier
+            or conflict.get("remote_base") != remote_base
+            or conflict.get("remote_tip") != remote_tip
+        ):
+            raise CodexRemoteError(
+                "A preserved live-checkpoint integration belongs to a different checkpoint",
+                code="INTEGRATION_STATE_MISMATCH",
+                details=conflict,
+            )
+        if not integration.is_dir():
+            raise CodexRemoteError(
+                "The preserved live-checkpoint integration worktree is missing",
+                code="INTEGRATION_WORKTREE_MISSING",
+                details=conflict,
+            )
+        if git(integration, "ls-files", "-u").stdout.strip() or rebase_in_progress(integration):
+            raise CodexRemoteError(
+                "The live-checkpoint rebase is still conflicted. Resolve it in the preserved "
+                "worktree, complete the rebase, then retry the pull.",
+                code="INTEGRATION_CONFLICT_PENDING",
+                details=conflict,
+            )
+        return finish_commit_integration(
+            root,
+            project_id,
+            identifier,
+            integration,
+            state_root,
+            str(conflict["local_branch"]),
+            str(conflict["local_head"]),
+            str(conflict.get("local_status") or ""),
+        )
+
+    integration.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if integration.exists():
+        raise CodexRemoteError(
+            f"A live-checkpoint integration worktree already exists at {integration}",
+            code="INTEGRATION_EXISTS",
+            details={"conflict_path": str(integration)},
+        )
+    env = os.environ.copy()
+    env.setdefault("GIT_COMMITTER_NAME", "Codex Remote")
+    env.setdefault("GIT_COMMITTER_EMAIL", "codex-remote@localhost")
+    created = False
+    preserve = False
+    try:
+        git(root, "worktree", "add", "--detach", str(integration), remote_tip, env=env)
+        created = True
+        rebase = git(
+            integration,
+            "rebase",
+            "--onto",
+            local_head,
+            remote_base,
+            remote_tip,
+            env=env,
+            check=False,
+        )
+        if rebase.returncode != 0:
+            preserve = True
+            conflict = {
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project_id,
+                "task_id": identifier,
+                "state": "CONFLICT",
+                "integration_kind": "commit-checkpoint",
+                "conflict_path": str(integration),
+                "remote_base": remote_base,
+                "remote_tip": remote_tip,
+                "local_branch": branch,
+                "local_head": local_head,
+                "local_status": local_status,
+                "created_at": utc_now(),
+                "rebase_stdout": rebase.stdout,
+                "rebase_stderr": rebase.stderr,
+            }
+            atomic_write_json(conflict_path, conflict)
+            raise CodexRemoteError(
+                "New Codex commits conflict with local commits. The canonical checkout was "
+                "not modified; resolve the preserved rebase and retry.",
+                code="INTEGRATION_CONFLICT",
+                details=conflict,
+            )
+        return finish_commit_integration(
+            root,
+            project_id,
+            identifier,
+            integration,
+            state_root,
+            branch,
+            local_head,
+            local_status,
+        )
+    finally:
+        if created and not preserve and integration.exists():
+            # ``finish_commit_integration`` normally removed it already.
+            remove_worktree(root, integration)
+
+
+def cmd_pull(args: argparse.Namespace) -> dict[str, Any]:
+    """Pull committed interactive checkpoints while leaving Codex running."""
+    root, host, _remote_dir, timeout, project_id, project_name = common_local_args(args)
+    context = ensure_remote_helper(host, timeout)
+    status = remote_status(context, project_id, timeout)
+    task = status.get("task", {})
+    state = str(task.get("state") or "NONE")
+    mode = task_execution_mode(task)
+
+    if state in {"NONE", "IMPORTED", "DISCARDED", "ARCHIVED"} or mode != "interactive":
+        return {
+            "ok": True,
+            "command": "pull",
+            "project_id": project_id,
+            "project_name": project_name,
+            "task": task,
+            "changed_commit_count": 0,
+            "commits": [],
+            "message": "No live interactive Codex commits are waiting to be pulled.",
+        }
+
+    local = reconcile_local_status(
+        project_id,
+        task,
+        read_json(local_current_path(project_id)),
+    ) or {}
+    identifier = validate_safe_id(str(task.get("task_id") or ""), "task id")
+
+    final = state in RESULT_READY_STATES | {"NOOP", "CANCELLED_NOOP"}
+    if state in ACTIVE_STATES:
+        published = remote_invoke(
+            context,
+            [
+                "_server-checkpoint",
+                "--project-id",
+                project_id,
+                "--task-id",
+                identifier,
+            ],
+            timeout=max(timeout + 60, 120),
+        )
+        checkpoint = published["checkpoint"]
+        remote_ref = str(checkpoint["ref"])
+        remote_tip_expected = str(checkpoint["sha"])
+    elif state in RESULT_READY_STATES:
+        remote_ref = str(task.get("result_ref") or "")
+        remote_tip_expected = str(task.get("result_sha") or "")
+        checkpoint = task.get("checkpoint") or {
+            "ref": remote_ref,
+            "sha": remote_tip_expected,
+            "dirty": False,
+        }
+    elif state in {"NOOP", "CANCELLED_NOOP"}:
+        marked = remote_invoke(
+            context,
+            ["_server-mark-imported", "--project-id", project_id, "--task-id", identifier],
+            timeout=timeout,
+        )
+        mark_local_imported(project_id, marked["task"], [])
+        return {
+            "ok": True,
+            "command": "pull",
+            "project_id": project_id,
+            "task": marked["task"],
+            "changed_commit_count": 0,
+            "commits": [],
+            "message": "Interactive Codex produced no commits; task marked imported.",
+        }
+    else:
+        raise CodexRemoteError(
+            f"Interactive task is not pullable in state {state}",
+            code="TASK_NOT_PULLABLE",
+            details=task,
+        )
+
+    input_ref = str(task.get("input_ref") or "")
+    input_sha = str(task.get("input_sha") or "")
+    if not input_ref or not input_sha or not remote_ref or not remote_tip_expected:
+        raise CodexRemoteError(
+            "Interactive task is missing checkpoint/ref metadata",
+            code="REMOTE_PROTOCOL_ERROR",
+            details=task,
+        )
+    local_input_ref = f"refs/codex/{project_id}/fetched-input/{identifier}"
+    local_checkpoint_ref = f"refs/codex/{project_id}/fetched-checkpoint/{identifier}"
+    remote_url = broker_url(host, str(task["broker"]))
+    git(
+        root,
+        "fetch",
+        "--no-tags",
+        remote_url,
+        f"+{input_ref}:{local_input_ref}",
+        f"+{remote_ref}:{local_checkpoint_ref}",
+        env=git_ssh_environment(timeout),
+        timeout=max(timeout + 30, 60),
+    )
+    if git(root, "rev-parse", local_input_ref).stdout.strip() != input_sha:
+        raise CodexRemoteError(
+            "Fetched interactive input ref does not match task metadata",
+            code="REF_MISMATCH",
+        )
+    remote_tip = git(root, "rev-parse", local_checkpoint_ref).stdout.strip()
+    if remote_tip != remote_tip_expected:
+        raise CodexRemoteError(
+            "Fetched interactive checkpoint does not match server metadata",
+            code="REF_MISMATCH",
+        )
+
+    same_task = local.get("task_id") == identifier
+    remote_base = (
+        str(local.get("last_checkpoint_remote_sha"))
+        if same_task and local.get("last_checkpoint_remote_sha")
+        else input_sha
+    )
+    prior_local_tip = (
+        str(local.get("last_checkpoint_local_sha"))
+        if same_task and local.get("last_checkpoint_local_sha")
+        else None
+    )
+    if remote_base != remote_tip:
+        expected_branch = (
+            str(local.get("checkpoint_local_branch"))
+            if same_task and local.get("checkpoint_local_branch")
+            else str(task.get("local_branch") or "")
+        )
+        active_branch = current_branch(root) or ""
+        allow_branch_change = bool(getattr(args, "allow_branch_change", False))
+        if expected_branch and active_branch != expected_branch and not allow_branch_change:
+            raise CodexRemoteError(
+                "This interactive task started (or was previously pulled) on branch "
+                f"{expected_branch!r}, but the current branch is {active_branch or '(detached)'!r}. "
+                "Switch back before running a normal remote command, or use the explicit "
+                "branch-change override when importing deliberately.",
+                code="TASK_BRANCH_CHANGED",
+                details={
+                    "expected_branch": expected_branch,
+                    "current_branch": active_branch or None,
+                },
+            )
+    integrated = integrate_committed_checkpoint(
+        root,
+        project_id,
+        identifier,
+        remote_base,
+        remote_tip,
+        prior_local_tip=prior_local_tip,
+    )
+    changed_count = int(integrated["changed_commit_count"])
+    updated = dict(local)
+    updated.update(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "project_id": project_id,
+            "project_name": project_name,
+            "task_id": identifier,
+            "state": state,
+            "execution_mode": "interactive",
+            "last_checkpoint_remote_sha": remote_tip,
+            "last_checkpoint_local_sha": integrated["local_tip"],
+            "checkpoint_local_branch": current_branch(root),
+            "last_checkpoint_pulled_at": utc_now(),
+            "last_checkpoint_commits": integrated["commits"],
+            "remote": task,
+        }
+    )
+    atomic_write_json(local_current_path(project_id), updated)
+
+    resulting_task = task
+    if final:
+        marked = remote_invoke(
+            context,
+            ["_server-mark-imported", "--project-id", project_id, "--task-id", identifier],
+            timeout=timeout,
+        )
+        resulting_task = marked["task"]
+        updated["state"] = "IMPORTED"
+        updated["imported_at"] = utc_now()
+        updated["remote"] = resulting_task
+        atomic_write_json(local_current_path(project_id), updated)
+
+    suffix = " Codex still has uncommitted server-side edits." if checkpoint.get("dirty") else ""
+    if changed_count:
+        message = f"Pulled {changed_count} committed Codex change(s) into {current_branch(root)}.{suffix}"
+    else:
+        message = "No new committed Codex changes were available." + suffix
+    return {
+        "ok": True,
+        "command": "pull",
+        "project_id": project_id,
+        "project_name": project_name,
+        "task": resulting_task,
+        "source_state": state,
+        "checkpoint": checkpoint,
+        "changed_commit_count": changed_count,
+        "commits": integrated["commits"],
+        "local_tip": integrated["local_tip"],
+        "final": final,
+        "message": message,
+    }
+
 def cleanup_local_refs(root: Path, project_id: str, task_id_value: str, task: Mapping[str, Any] | None) -> None:
     refs = {
         f"refs/codex/{project_id}/fetched-input/{task_id_value}",
         f"refs/codex/{project_id}/fetched-result/{task_id_value}",
+        f"refs/codex/{project_id}/fetched-checkpoint/{task_id_value}",
         f"refs/codex/{project_id}/current/{task_id_value}",
     }
     if task and isinstance(task.get("input_ref"), str):
@@ -1732,7 +2251,16 @@ def cleanup_local_integration(
     path = integration_worktree_path(project_id, task_id_value, state_root)
     if path.exists():
         remove_worktree(root, path)
-    for name in ("integration-conflict.json", "integration-failure.json"):
+    commit_path = commit_integration_worktree_path(
+        project_id, task_id_value, state_root
+    )
+    if commit_path.exists():
+        remove_worktree(root, commit_path)
+    for name in (
+        "integration-conflict.json",
+        "integration-failure.json",
+        "commit-integration-conflict.json",
+    ):
         with contextlib.suppress(FileNotFoundError):
             (state_root / name).unlink()
 
@@ -1979,6 +2507,16 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
     state = task.get("state", "NONE")
     local = read_json(local_current_path(project_id)) or {}
 
+    # Interactive tasks preserve Codex's individual commits and can be pulled
+    # incrementally while the TUI stays alive.  Keep `apply` as a compatibility
+    # entry point, but route it through the commit-preserving pull path.
+    if task_execution_mode(task) == "interactive" and (
+        state in ACTIVE_STATES
+        or state in RESULT_READY_STATES
+        or state in {"NOOP", "CANCELLED_NOOP"}
+    ):
+        return cmd_pull(args)
+
     if (
         local.get("task_id") == task.get("task_id")
         and local.get("state") == "APPLIED_PENDING_REMOTE_ACK"
@@ -2000,14 +2538,6 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
             "tests": task.get("tests"),
             "message": "Recovered the prior local import and acknowledged it on the server.",
         }
-
-    if state in ACTIVE_STATES and task_execution_mode(task) == "interactive":
-        raise CodexRemoteError(
-            "The managed interactive Codex session is still running. Reattach with SPC r c i, "
-            "then exit Codex with /exit or /quit before importing.",
-            code="INTERACTIVE_TASK_ACTIVE",
-            details=task,
-        )
 
     if state in {"NOOP", "CANCELLED_NOOP"}:
         marked = remote_invoke(
@@ -2366,6 +2896,164 @@ def save_server_task(paths: Mapping[str, Path], task: dict[str, Any]) -> dict[st
     return task
 
 
+def checkpoint_state_path(task: Mapping[str, Any]) -> Path:
+    """Return the state file used for a live interactive checkpoint.
+
+    Checkpoint metadata is deliberately separate from ``task.json``.  The
+    interactive runner updates ``task.json`` throughout its lifetime, while a
+    laptop pull may publish a committed checkpoint concurrently.  A separate
+    file avoids either writer accidentally overwriting the other's fields.
+    """
+    state_dir = task.get("state_dir")
+    if not isinstance(state_dir, str) or not state_dir:
+        raise CodexRemoteError(
+            "Task is missing its server state directory",
+            code="INVALID_TASK_STATE",
+        )
+    return Path(state_dir) / "checkpoint.json"
+
+
+def load_task_checkpoint(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    return read_json(checkpoint_state_path(task))
+
+
+def checkpoint_ref_name(task: Mapping[str, Any]) -> str:
+    return (
+        f"refs/codex/{validate_safe_id(str(task['project_id']), 'project id')}"
+        f"/checkpoint/{validate_safe_id(str(task['task_id']), 'task id')}"
+    )
+
+
+def live_job_state_path(task: Mapping[str, Any]) -> Path:
+    state_dir = task.get("state_dir")
+    if not isinstance(state_dir, str) or not state_dir:
+        raise CodexRemoteError(
+            "Task is missing its server state directory",
+            code="INVALID_TASK_STATE",
+        )
+    return Path(state_dir) / "live-job.json"
+
+
+def load_task_live_job(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    return read_json(live_job_state_path(task))
+
+
+def publish_task_checkpoint(
+    paths: Mapping[str, Path], task: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Publish the task's stable committed HEAD without stopping the TUI.
+
+    Uncommitted edits remain private to the server worktree.  Once a checkpoint
+    has been published, later checkpoints must descend from it; this makes a
+    history rewrite visible instead of silently changing commits already
+    imported by the laptop.
+    """
+    if task_execution_mode(task) != "interactive":
+        raise CodexRemoteError(
+            "Live checkpoints are available only for interactive Codex tasks",
+            code="CHECKPOINT_NOT_INTERACTIVE",
+            details=dict(task),
+        )
+    worktree_value = task.get("worktree")
+    if not isinstance(worktree_value, str) or not Path(worktree_value).is_dir():
+        raise CodexRemoteError(
+            "The interactive task worktree is missing",
+            code="CHECKPOINT_WORKTREE_MISSING",
+            details=dict(task),
+        )
+    worktree = Path(worktree_value)
+    input_sha = str(task.get("input_sha") or "")
+    if not input_sha:
+        raise CodexRemoteError(
+            "The interactive task is missing its input SHA",
+            code="INVALID_TASK_STATE",
+        )
+    state_path = checkpoint_state_path(task)
+    lock_path = state_path.with_name("checkpoint.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with lock_path.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        prior = load_task_checkpoint(task) or {}
+        prior_sha = str(prior.get("sha") or input_sha)
+        ref = checkpoint_ref_name(task)
+        for _attempt in range(5):
+            head = current_head(worktree)
+            if git(
+                worktree,
+                "merge-base",
+                "--is-ancestor",
+                input_sha,
+                head,
+                check=False,
+            ).returncode != 0:
+                raise CodexRemoteError(
+                    "Interactive Codex rewrote history outside the task input",
+                    code="INVALID_RESULT_HISTORY",
+                )
+            if git(
+                worktree,
+                "merge-base",
+                "--is-ancestor",
+                prior_sha,
+                head,
+                check=False,
+            ).returncode != 0:
+                raise CodexRemoteError(
+                    "Interactive Codex rewrote commits that were already published. "
+                    "Do not amend, rebase, or reset published checkpoints.",
+                    code="CHECKPOINT_HISTORY_REWRITTEN",
+                    details={"published_sha": prior_sha, "current_head": head},
+                )
+            check = git(
+                worktree,
+                "diff",
+                "--check",
+                input_sha,
+                head,
+                "--",
+                check=False,
+            )
+            if check.returncode != 0:
+                raise CodexRemoteError(
+                    "Committed checkpoint failed `git diff --check`:\n"
+                    + (check.stdout or check.stderr),
+                    code="RESULT_DIFF_CHECK_FAILED",
+                )
+            ensure_safe_result_delta(
+                worktree,
+                input_sha,
+                head,
+                int(task.get("max_untracked_bytes") or DEFAULT_MAX_UNTRACKED_BYTES),
+            )
+            # A commit may finish while validation is running.  Retry until the
+            # SHA we validated is still HEAD immediately before publication.
+            if current_head(worktree) != head:
+                continue
+            run(["git", "--git-dir", paths["broker"], "update-ref", ref, head])
+            commit_count = int(
+                git(worktree, "rev-list", "--count", f"{input_sha}..{head}")
+                .stdout.strip()
+                or "0"
+            )
+            checkpoint = {
+                "schema_version": SCHEMA_VERSION,
+                "project_id": task.get("project_id"),
+                "task_id": task.get("task_id"),
+                "ref": ref,
+                "sha": head,
+                "previous_sha": prior_sha,
+                "commit_count": commit_count,
+                "dirty": bool(git_status_porcelain(worktree).strip()),
+                "published_at": utc_now(),
+            }
+            atomic_write_json(state_path, checkpoint)
+            return checkpoint
+    raise CodexRemoteError(
+        "Interactive HEAD kept changing while a checkpoint was being validated; retry shortly",
+        code="CHECKPOINT_UNSTABLE",
+    )
+
+
 def login_which(program: str) -> str | None:
     script = f"type -P {shlex.quote(program)}"
     completed = run(["bash", "-lc", script], check=False)
@@ -2619,8 +3307,15 @@ def request_job_file(
     completion_marker: str = "",
     resume_command: str = "",
     metadata_values: Sequence[str] = (),
+    response_file: Path | None = None,
+    wait_seconds: int = 0,
 ) -> dict[str, Any]:
-    """Write the single job request consumed by the trusted runner."""
+    """Write the single job request consumed by the trusted runner.
+
+    Interactive jobctl calls may wait for an unsandboxed runner thread to
+    validate, freeze, and launch the job, then return its response while the
+    Codex TUI remains open.
+    """
     if request_file.name != JOB_REQUEST_RELATIVE:
         raise CodexRemoteError("Unexpected job request path", code="INVALID_JOB_REQUEST")
     expected_path = os.environ.get("CODEX_JOB_REQUEST_PATH")
@@ -2656,7 +3351,61 @@ def request_job_file(
             code="JOB_REQUEST_EXISTS",
         )
     atomic_write_json(request_file, request)
+    if response_file is not None and wait_seconds > 0:
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            response = read_json(response_file)
+            if response is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    response_file.unlink()
+                if not response.get("ok", False):
+                    raise CodexRemoteError(
+                        str(response.get("error") or "The trusted job launcher failed"),
+                        code=str(response.get("error_code") or "JOB_LAUNCH_FAILED"),
+                        details=response.get("details"),
+                    )
+                return response
+            time.sleep(0.2)
+        raise CodexRemoteError(
+            "Timed out waiting for the trusted runner to process the job request",
+            code="JOB_REQUEST_TIMEOUT",
+        )
     return {"ok": True, "request": request, "request_file": str(request_file)}
+
+
+def job_request_from_arguments(
+    *,
+    name: str,
+    command: Sequence[str],
+    gpus: str = "",
+    completion_marker: str = "",
+    resume_command: str = "",
+    metadata_values: Sequence[str] = (),
+) -> dict[str, Any]:
+    metadata: dict[str, str] = {}
+    for value in metadata_values:
+        if "=" not in value:
+            raise CodexRemoteError(
+                f"Job metadata must have KEY=VALUE form: {value}",
+                code="INVALID_JOB_REQUEST",
+            )
+        key, item = value.split("=", 1)
+        if key in metadata:
+            raise CodexRemoteError(
+                f"Duplicate job metadata key: {key}",
+                code="INVALID_JOB_REQUEST",
+            )
+        metadata[key] = item
+    return normalized_job_request(
+        {
+            "name": name,
+            "command": list(command),
+            "gpus": gpus,
+            "completion_marker": completion_marker,
+            "resume_command": resume_command,
+            "metadata": metadata,
+        }
+    )
 
 
 def consume_job_request(task: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -2696,13 +3445,18 @@ def codex_job_instructions(task: Mapping[str, Any]) -> str:
     """Return per-task launch rules injected as Codex developer instructions."""
     policy = task.get("job_policy", "deny")
     base = (
-        "This repository is managed by codex-remote. Do not commit, push, merge, "
-        "rebase, switch branches, edit outside the assigned worktree, or delete existing "
+        "This repository is managed by codex-remote. Do not push, merge, switch branches, "
+        "edit outside the assigned worktree, or delete existing "
         "result directories. Do not inspect unrelated repositories, SSH keys, credentials, "
         "tokens, or secret files. Run bounded foreground tests normally."
     )
     if task_execution_mode(task) == "interactive":
         base += (
+            " Create small, coherent Git commits whenever a logical unit is complete and "
+            "validated so the laptop can pull those commits while this session remains open. "
+            "Do not amend, rebase, reset, or otherwise rewrite commits created in this "
+            "session; the laptop may publish them at any time. Leave incomplete work "
+            "uncommitted until it forms a coherent checkpoint."
             " When the user asks you to implement, build, fix, or change something, carry "
             "the in-scope task through inspection, editing, relevant non-destructive "
             "validation, failure diagnosis, and iteration; do not stop after merely "
@@ -2713,17 +3467,32 @@ def codex_job_instructions(task: Mapping[str, Any]) -> str:
             "nixos-rebuild, home-manager switch, nix profile, nix-env, systemctl, or any "
             "other host activation or service-management command."
         )
+    else:
+        base += " Do not create commits; the trusted runner publishes one sanitized result commit."
     if policy == "launch":
+        if task_execution_mode(task) == "interactive":
+            return base + (
+                " One frozen long-running experiment launch is explicitly authorized, but you "
+                "must not start it directly with tmux, nohup, systemd, a scheduler, shell "
+                "backgrounding, or another detached mechanism. Commit the exact source revision "
+                "to run, complete reasonable foreground validation, then create exactly one request using: "
+                "\"$CODEX_JOBCTL\" request --name NAME [--gpus 0,1] "
+                "[--completion-marker RELATIVE_PATH] [--resume-command TEXT] "
+                "[--metadata KEY=VALUE] -- COMMAND ARG... . The trusted runner validates the "
+                "request, safety-checks and freezes the committed revision, and launches the "
+                "independent job immediately. The frozen job reruns the configured bootstrap and "
+                "test commands before its experiment command; this interactive TUI remains open."
+            )
         return base + (
             " One frozen long-running experiment launch is explicitly authorized, but you "
             "must not start it directly with tmux, nohup, systemd, a scheduler, shell "
             "backgrounding, or another detached mechanism. Finish the implementation and "
-            "smoke validation, then create exactly one request using: "
+            "foreground validation, then create exactly one request using: "
             "\"$CODEX_JOBCTL\" request --name NAME [--gpus 0,1] "
             "[--completion-marker RELATIVE_PATH] [--resume-command TEXT] "
-            "[--metadata KEY=VALUE] -- COMMAND ARG... . The trusted runner validates the "
-            "request, reruns the configured test command, freezes the result revision, and "
-            "launches the independent job only after you exit successfully."
+            "[--metadata KEY=VALUE] -- COMMAND ARG... . After you exit, the trusted runner "
+            "publishes the sanitized result, runs the configured tests, freezes that result, "
+            "and launches the independent job only when validation succeeds."
         )
     if policy == "prepare":
         return base + (
@@ -2767,6 +3536,12 @@ def codex_process_environment(task: Mapping[str, Any]) -> dict[str, str]:
                 "XDG_CACHE_HOME": str(cache),
                 "UV_CACHE_DIR": str(cache / "uv"),
                 "PIP_CACHE_DIR": str(cache / "pip"),
+                # Give server-created commits a stable, explicit identity without
+                # mutating the user's global or repository Git configuration.
+                "GIT_AUTHOR_NAME": "Codex Remote",
+                "GIT_AUTHOR_EMAIL": "codex-remote@localhost",
+                "GIT_COMMITTER_NAME": "Codex Remote",
+                "GIT_COMMITTER_EMAIL": "codex-remote@localhost",
             }
         )
     return env
@@ -2830,10 +3605,15 @@ def cleanup_server_task_artifacts(
         if tool_cache.exists():
             shutil.rmtree(tool_cache)
             task["tool_cache_cleaned_at"] = utc_now()
+    refs_to_remove: set[str] = set()
     for key in ("input_ref", "result_ref"):
         ref = task.get(key)
         if isinstance(ref, str) and ref.startswith("refs/codex/"):
-            run(["git", "--git-dir", paths["broker"], "update-ref", "-d", ref], check=False)
+            refs_to_remove.add(ref)
+    if task_execution_mode(task) == "interactive":
+        refs_to_remove.add(checkpoint_ref_name(task))
+    for ref in refs_to_remove:
+        run(["git", "--git-dir", paths["broker"], "update-ref", "-d", ref], check=False)
     task["state"] = "ARCHIVED" if action == "archive" else "DISCARDED"
     task[f"{action}ed_at"] = utc_now()
     return save_server_task(paths, task)
@@ -2938,6 +3718,22 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
         worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         jobctl_path = state_dir / "codex-jobctl"
         request_path = worktree / JOB_REQUEST_RELATIVE
+        response_path = worktree / JOB_RESPONSE_RELATIVE
+        jobctl_command = (
+            f"exec {shlex.quote(str(Path(sys.executable).resolve()))} "
+            f"{shlex.quote(str(runner_helper))} _job-request "
+            f"--request-file {shlex.quote(str(request_path))} "
+        )
+        if execution_mode == "interactive":
+            # The live broker consumes the request while Codex remains open and
+            # writes a response that the helper can report to the TUI.  One-shot
+            # tasks have no live broker: they must return immediately after
+            # writing the request so the enclosing runner can finalize and
+            # launch it after Codex exits.
+            jobctl_command += (
+                f"--response-file {shlex.quote(str(response_path))} "
+                f"--wait-seconds 900 "
+            )
         jobctl_path.write_text(
             "#!/bin/sh\n"
             "set -eu\n"
@@ -2946,9 +3742,8 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
             "  exit 2\n"
             "fi\n"
             "shift\n"
-            f"exec {shlex.quote(str(Path(sys.executable).resolve()))} "
-            f"{shlex.quote(str(runner_helper))} _job-request "
-            f"--request-file {shlex.quote(str(request_path))} \"$@\"\n",
+            + jobctl_command
+            + '"$@"\n',
             encoding="utf-8",
         )
         jobctl_path.chmod(0o700)
@@ -3283,13 +4078,35 @@ def commit_dirty_result(task: dict[str, Any], paths: Mapping[str, Path]) -> tupl
         )
     ensure_safe_result_delta(worktree, input_sha, codex_head, int(task["max_untracked_bytes"]))
 
-    # Publish a single sanitized result commit rather than Codex's original
-    # commit chain.  This keeps intermediate commits (and their messages or
-    # accidentally committed-and-reverted blobs) out of the fetched result.
+    checkpoint = load_task_checkpoint(task) if task_execution_mode(task) == "interactive" else None
+    if checkpoint:
+        published_sha = str(checkpoint.get("sha") or "")
+        if published_sha and git(
+            worktree,
+            "merge-base",
+            "--is-ancestor",
+            published_sha,
+            codex_head,
+            check=False,
+        ).returncode != 0:
+            raise CodexRemoteError(
+                "Interactive Codex rewrote commits that were already pulled from a live checkpoint",
+                code="CHECKPOINT_HISTORY_REWRITTEN",
+                details={"published_sha": published_sha, "current_head": codex_head},
+            )
+
     input_tree = git(worktree, "rev-parse", f"{input_sha}^{{tree}}").stdout.strip()
     result_tree = git(worktree, "rev-parse", f"{codex_head}^{{tree}}").stdout.strip()
     has_changes = result_tree != input_tree
-    if has_changes:
+    if task_execution_mode(task) == "interactive":
+        # Interactive sessions are expected to create small coherent commits.
+        # The safety scan above checks every committed state, so the original
+        # chain can be published without sacrificing the secret/generated-file
+        # protections used by one-shot tasks.
+        result = codex_head if has_changes else input_sha
+    elif has_changes:
+        # One-shot tasks retain the historical behavior: publish one sanitized
+        # commit so internal scratch commits never become user-facing history.
         env = os.environ.copy()
         env.setdefault("GIT_AUTHOR_NAME", "Codex Remote")
         env.setdefault("GIT_AUTHOR_EMAIL", "codex-remote@localhost")
@@ -3309,9 +4126,14 @@ def commit_dirty_result(task: dict[str, Any], paths: Mapping[str, Path]) -> tupl
     result_ref = f"refs/codex/{task['project_id']}/result/{task['task_id']}"
     run(["git", "--git-dir", paths["broker"], "update-ref", result_ref, result])
     task["codex_head_sha"] = codex_head
-    task["result_squashed"] = codex_head != result
+    task["result_squashed"] = task_execution_mode(task) != "interactive" and codex_head != result
+    task["result_preserves_commits"] = task_execution_mode(task) == "interactive"
     task["result_ref"] = result_ref
     task["result_sha"] = result
+    if task_execution_mode(task) == "interactive":
+        # Keep the live checkpoint ref at the final result as well, allowing a
+        # final pull to reuse the same incremental path.
+        publish_task_checkpoint(paths, task)
     return result, has_changes
 
 
@@ -3431,6 +4253,45 @@ def process_start_ticks(pid: int) -> int | None:
         return None
 
 
+def interactive_job_request_watcher(
+    project_id: str,
+    task_id_value: str,
+    stop_event: threading.Event,
+) -> None:
+    """Process one sandbox-written job request while the TUI remains active."""
+    paths = ensure_server_layout(project_id)
+    while not stop_event.is_set():
+        task = load_server_task(paths, task_id_value)
+        if not task:
+            return
+        request_path = Path(task["worktree"]) / JOB_REQUEST_RELATIVE
+        response_path = Path(task["worktree"]) / JOB_RESPONSE_RELATIVE
+        if request_path.exists() or request_path.is_symlink():
+            try:
+                request = consume_job_request(task)
+                if request is None:
+                    time.sleep(0.1)
+                    continue
+                response = server_request_job(project_id, task_id_value, request)
+            except CodexRemoteError as exc:
+                response = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": exc.code,
+                    "details": exc.details,
+                }
+            except Exception as exc:  # defensive broker boundary
+                response = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": "UNEXPECTED_JOB_BROKER_ERROR",
+                    "details": traceback.format_exc(),
+                }
+            atomic_write_json(response_path, response)
+            return
+        time.sleep(0.2)
+
+
 def server_run(project_id: str, task_id_value: str) -> int:
     paths = ensure_server_layout(project_id)
     task = load_server_task(paths, task_id_value)
@@ -3531,6 +4392,14 @@ def server_run(project_id: str, task_id_value: str) -> int:
         save_server_task(paths, task)
         execution_mode = task_execution_mode(task)
         if execution_mode == "interactive":
+            job_watcher_stop = threading.Event()
+            job_watcher = threading.Thread(
+                target=interactive_job_request_watcher,
+                args=(project_id, task_id_value, job_watcher_stop),
+                name=f"codex-job-broker-{task_id_value}",
+                daemon=True,
+            )
+            job_watcher.start()
             command = interactive_codex_command(task)
             note("launching interactive Codex TUI: " + shlex.join(command))
             process = subprocess.Popen(
@@ -3547,6 +4416,12 @@ def server_run(project_id: str, task_id_value: str) -> int:
                 terminate_child_process(process, process_group=True)
             with foreground_child_process_group(process):
                 codex_rc = process.wait()
+            job_watcher_stop.set()
+            job_watcher.join(timeout=120)
+            if job_watcher.is_alive():
+                note("trusted interactive job broker did not stop within 120 seconds")
+            with contextlib.suppress(FileNotFoundError):
+                (worktree / JOB_RESPONSE_RELATIVE).unlink()
         else:
             prompt_path = task.get("prompt_path")
             if not isinstance(prompt_path, str) or not prompt_path:
@@ -3838,6 +4713,13 @@ def server_status(project_id: str) -> dict[str, Any]:
     worktree = task.get("worktree")
     task["worktree_exists"] = bool(worktree and Path(worktree).exists())
     task["lock_held"] = lock_is_held(paths["lock"])
+    if task_execution_mode(task) == "interactive":
+        checkpoint = load_task_checkpoint(task)
+        if checkpoint:
+            task["checkpoint"] = checkpoint
+        live_job = load_task_live_job(task)
+        if live_job:
+            task["launched_job"] = live_job
     runner_missing = not pane.get("exists") and not task["lock_held"]
     if task.get("state") in ACTIVE_STATES and (pane.get("pane_dead") or runner_missing):
         task["state"] = "ORPHANED"
@@ -3850,6 +4732,27 @@ def server_status(project_id: str) -> dict[str, Any]:
             task["error"] = "tmux session and project lock disappeared while task state was active"
         save_server_task(paths, task)
     return {"ok": True, "task": task}
+
+
+def server_checkpoint(project_id: str, task_id_value: str) -> dict[str, Any]:
+    """Publish the latest committed interactive checkpoint while Codex runs."""
+    paths = ensure_server_layout(project_id)
+    task = load_server_task(paths)
+    if not task or task.get("task_id") != task_id_value:
+        raise CodexRemoteError(
+            "The requested interactive task is not current",
+            code="TASK_NOT_FOUND",
+            details=task,
+        )
+    state = str(task.get("state") or "NONE")
+    if state not in ACTIVE_STATES | RESULT_READY_STATES | {"NOOP", "CANCELLED_NOOP"}:
+        raise CodexRemoteError(
+            f"Task state {state} cannot publish a checkpoint",
+            code="CHECKPOINT_NOT_AVAILABLE",
+            details=task,
+        )
+    checkpoint = publish_task_checkpoint(paths, task)
+    return {"ok": True, "task": task, "checkpoint": checkpoint}
 
 
 def tail_file(path: Path, lines: int) -> str:
@@ -4111,7 +5014,11 @@ def job_completion_marker_path(worktree: Path, completion_marker: str) -> Path:
 
 
 def start_frozen_job(
-    paths: Mapping[str, Path], task: Mapping[str, Any], request: Mapping[str, Any]
+    paths: Mapping[str, Path],
+    task: Mapping[str, Any],
+    request: Mapping[str, Any],
+    *,
+    preflight_test_cmd: str = "",
 ) -> dict[str, Any]:
     """Launch REQUEST from an immutable result SHA, independently of Codex."""
     normalized = normalized_job_request(request)
@@ -4173,6 +5080,7 @@ def start_frozen_job(
             "environment_refresh": task.get("environment_refresh"),
             "tests": task.get("tests"),
         },
+        "preflight_test_cmd": preflight_test_cmd,
         "worktree": str(worktree),
         "state_dir": str(state_dir),
         "results_dir": str(state_dir / "results"),
@@ -4269,6 +5177,114 @@ def start_frozen_job(
         job["finished_at"] = utc_now()
         save_server_job(paths, job)
         raise
+
+
+def server_request_job(
+    project_id: str, task_id_value: str, request: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Freeze and launch a committed interactive checkpoint immediately.
+
+    The interactive TUI remains alive.  The job gets a separate immutable
+    worktree and performs its configured bootstrap/test preflight before the
+    experiment command begins.
+    """
+    paths = ensure_server_layout(project_id)
+    task = load_server_task(paths)
+    if not task or task.get("task_id") != task_id_value:
+        raise CodexRemoteError(
+            "The requesting interactive task is not current",
+            code="TASK_NOT_FOUND",
+            details=task,
+        )
+    if task_execution_mode(task) != "interactive":
+        raise CodexRemoteError(
+            "Only an interactive Codex task may launch a job while it remains open",
+            code="JOB_NOT_AUTHORIZED",
+            details=task,
+        )
+    if task.get("job_policy") not in {"launch", "prepare"}:
+        raise CodexRemoteError(
+            "This interactive task was not authorized to request an experiment job",
+            code="JOB_NOT_AUTHORIZED",
+            details=task,
+        )
+    if task.get("state") not in INTERACTIVE_ATTACH_STATES:
+        raise CodexRemoteError(
+            f"Interactive job requests require a live TUI; current state is {task.get('state')}",
+            code="TASK_NOT_ACTIVE",
+            details=task,
+        )
+    normalized = normalized_job_request(request)
+    state_path = live_job_state_path(task)
+    request_lock = state_path.with_name("live-job.lock")
+    request_lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with request_lock.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        existing = load_task_live_job(task)
+        if existing:
+            raise CodexRemoteError(
+                "This interactive Codex task has already requested a frozen job",
+                code="JOB_REQUEST_EXISTS",
+                details=existing,
+            )
+        worktree = Path(str(task["worktree"]))
+        status = git_status_porcelain(worktree)
+        if status.strip():
+            raise CodexRemoteError(
+                "Commit all source changes before requesting a frozen job. The job must "
+                "start from an exact committed checkpoint.",
+                code="JOB_SOURCE_DIRTY",
+                details={"status": status},
+            )
+        checkpoint = publish_task_checkpoint(paths, task)
+        if task.get("job_policy") == "prepare":
+            prepared = {
+                "schema_version": SCHEMA_VERSION,
+                "state": "PREPARED",
+                "request": normalized,
+                "source_sha": checkpoint["sha"],
+                "prepared_at": utc_now(),
+            }
+            atomic_write_json(state_path, prepared)
+            return {
+                "ok": True,
+                "task": task,
+                "checkpoint": checkpoint,
+                "prepared": prepared,
+                "message": "Prepared a frozen job request without launching it.",
+            }
+
+        source_task = dict(task)
+        source_task["result_sha"] = checkpoint["sha"]
+        source_task["result_lock_hashes"] = file_hashes(worktree)
+        job = start_frozen_job(
+            paths,
+            source_task,
+            normalized,
+            preflight_test_cmd=str(task.get("test_cmd") or ""),
+        )
+        record = {
+            "schema_version": SCHEMA_VERSION,
+            "state": "LAUNCHED",
+            "run_id": job.get("run_id"),
+            "name": job.get("name"),
+            "source_sha": checkpoint["sha"],
+            "requested_at": normalized.get("requested_at"),
+            "launched_at": utc_now(),
+            "job_state": job.get("state"),
+            "tmux_session": job.get("tmux_session"),
+        }
+        atomic_write_json(state_path, record)
+        return {
+            "ok": True,
+            "task": task,
+            "checkpoint": checkpoint,
+            "job": job,
+            "message": (
+                f"Launched frozen job {job.get('run_id')} from committed checkpoint "
+                f"{str(checkpoint['sha'])[:12]}; the interactive Codex session remains active."
+            ),
+        }
 
 
 def job_process_environment(job: Mapping[str, Any]) -> dict[str, str]:
@@ -4462,6 +5478,50 @@ def server_job_run(project_id: str, run_id: str) -> int:
         job = save_server_job(paths, job)
         if refresh_stop_request():
             return finish_before_command("STOPPED", 0, "Job was stopped before the experiment command started")
+
+        preflight = str(job.get("preflight_test_cmd") or "")
+        if preflight:
+            preflight_log = Path(job["state_dir"]) / "preflight-tests.log"
+            job["phase"] = "preflight-tests"
+            job["preflight_tests"] = {
+                "command": preflight,
+                "started_at": utc_now(),
+                "log": str(preflight_log),
+            }
+            job = save_server_job(paths, job)
+            save_note("running frozen-source preflight tests: " + preflight)
+            preflight_rc = run_job_process(
+                [job["tools"]["bash"], "-lc", preflight], preflight_log
+            )
+            preflight_status = git_status_porcelain(Path(job["worktree"]))
+            preflight_integrity = inspect_job_source(job)
+            job["preflight_tests"].update(
+                {
+                    "exit_code": preflight_rc,
+                    "finished_at": utc_now(),
+                    "dirty_after_tests": bool(preflight_status.strip()),
+                    "source_integrity": preflight_integrity,
+                }
+            )
+            if preflight_status.strip():
+                job["preflight_tests"]["dirty_status"] = preflight_status
+            job = save_server_job(paths, job)
+            if refresh_stop_request():
+                return finish_before_command(
+                    "STOPPED", preflight_rc, "Job was stopped during preflight tests"
+                )
+            if preflight_rc != 0:
+                return finish_before_command(
+                    "FAILED",
+                    preflight_rc,
+                    f"Frozen-source preflight test command exited {preflight_rc}",
+                )
+            if preflight_status.strip() or not preflight_integrity["tracked_clean"]:
+                return finish_before_command(
+                    "FAILED",
+                    preflight_rc,
+                    "Frozen-source preflight tests changed the pinned source checkout",
+                )
 
         job["phase"] = "command"
         job["command_started_at"] = utc_now()
@@ -5027,7 +6087,8 @@ def server_discard_stale(project_id: str, task_id_value: str) -> dict[str, Any]:
     run(["git", "--git-dir", paths["broker"], "worktree", "prune"], check=False)
     input_ref = f"refs/codex/{project_id}/input/{task_id_value}"
     result_ref = f"refs/codex/{project_id}/result/{task_id_value}"
-    for ref in (input_ref, result_ref):
+    checkpoint_ref = f"refs/codex/{project_id}/checkpoint/{task_id_value}"
+    for ref in (input_ref, result_ref, checkpoint_ref):
         run(["git", "--git-dir", paths["broker"], "update-ref", "-d", ref], check=False)
     state_dir = paths["project_state"] / task_id_value
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -5108,6 +6169,13 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument("--push-backup", action="store_true")
     apply_parser.add_argument("--backup-remote", default="origin")
 
+    pull_parser = sub.add_parser(
+        "pull",
+        help="pull committed interactive checkpoints without stopping Codex",
+    )
+    add_common(pull_parser)
+    pull_parser.add_argument("--allow-branch-change", action="store_true")
+
     cancel = sub.add_parser("cancel", help="request cancellation while preserving work")
     add_common(cancel)
 
@@ -5154,6 +6222,10 @@ def build_parser() -> argparse.ArgumentParser:
     server_init_parser = sub.add_parser("_server-init", parents=[internal_parser()])
     server_doctor_parser = sub.add_parser("_server-doctor", parents=[internal_parser()])
     server_status_parser = sub.add_parser("_server-status", parents=[internal_parser()])
+    server_checkpoint_parser = sub.add_parser(
+        "_server-checkpoint", parents=[internal_parser()]
+    )
+    server_checkpoint_parser.add_argument("--task-id", required=True)
     server_logs_parser = sub.add_parser("_server-logs", parents=[internal_parser()])
     server_logs_parser.add_argument("--tail", type=int, default=300)
     server_start_parser = sub.add_parser("_server-start", parents=[internal_parser()])
@@ -5170,12 +6242,23 @@ def build_parser() -> argparse.ArgumentParser:
     server_stale_parser.add_argument("--task-id", required=True)
     job_request_parser = sub.add_parser("_job-request")
     job_request_parser.add_argument("--request-file", required=True)
+    job_request_parser.add_argument("--response-file", default="")
+    job_request_parser.add_argument("--wait-seconds", type=int, default=0)
     job_request_parser.add_argument("--name", required=True)
     job_request_parser.add_argument("--gpus", default="")
     job_request_parser.add_argument("--completion-marker", default="")
     job_request_parser.add_argument("--resume-command", default="")
     job_request_parser.add_argument("--metadata", action="append", default=[])
     job_request_parser.add_argument("job_command", nargs=argparse.REMAINDER)
+    server_job_request_parser = sub.add_parser("_server-request-job")
+    server_job_request_parser.add_argument("--project-id", required=True)
+    server_job_request_parser.add_argument("--task-id", required=True)
+    server_job_request_parser.add_argument("--name", required=True)
+    server_job_request_parser.add_argument("--gpus", default="")
+    server_job_request_parser.add_argument("--completion-marker", default="")
+    server_job_request_parser.add_argument("--resume-command", default="")
+    server_job_request_parser.add_argument("--metadata", action="append", default=[])
+    server_job_request_parser.add_argument("job_command", nargs=argparse.REMAINDER)
     sub.add_parser("_server-jobs", parents=[internal_parser()])
     internal_job_status = sub.add_parser("_server-job-status", parents=[internal_parser()])
     internal_job_status.add_argument("--run-id", required=True)
@@ -5209,6 +6292,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
         return cmd_logs(args)
     if args.command == "apply":
         return cmd_apply(args)
+    if args.command == "pull":
+        return cmd_pull(args)
     if args.command == "cancel":
         return cmd_cancel(args)
     if args.command == "recover":
@@ -5235,6 +6320,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
         return server_doctor(args.project_id)
     if args.command == "_server-status":
         return server_status(args.project_id)
+    if args.command == "_server-checkpoint":
+        return server_checkpoint(args.project_id, args.task_id)
     if args.command == "_server-logs":
         return server_logs(args.project_id, args.tail)
     if args.command == "_server-start":
@@ -5263,7 +6350,22 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
             completion_marker=args.completion_marker,
             resume_command=args.resume_command,
             metadata_values=args.metadata,
+            response_file=Path(args.response_file) if args.response_file else None,
+            wait_seconds=args.wait_seconds,
         )
+    if args.command == "_server-request-job":
+        command = list(args.job_command)
+        if command and command[0] == "--":
+            command.pop(0)
+        request = job_request_from_arguments(
+            name=args.name,
+            command=command,
+            gpus=args.gpus,
+            completion_marker=args.completion_marker,
+            resume_command=args.resume_command,
+            metadata_values=args.metadata,
+        )
+        return server_request_job(args.project_id, args.task_id, request)
     if args.command == "_server-jobs":
         return server_jobs(args.project_id)
     if args.command == "_server-job-status":

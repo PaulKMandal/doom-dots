@@ -12,6 +12,8 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -440,6 +442,319 @@ class IntegrationTests(RepositoryTestCase):
         self.assertEqual(len(branches), 1)
 
 
+class LiveCheckpointTests(RepositoryTestCase):
+    def make_interactive_server_task(
+        self, home: Path, *, project_id: str = "checkpoint-project", task_id: str = "task-live"
+    ) -> tuple[dict[str, Path], dict[str, object], Path]:
+        paths = cr.ensure_server_layout(project_id)
+        input_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        input_ref = f"refs/codex/{project_id}/input/{task_id}"
+        git(self.root, "push", str(paths["broker"]), f"HEAD:{input_ref}")
+        worktree = paths["worktrees"] / task_id
+        command(
+            "git",
+            "--git-dir",
+            paths["broker"],
+            "worktree",
+            "add",
+            "--detach",
+            worktree,
+            input_sha,
+        )
+        configure_repo(worktree)
+        state_dir = paths["project_state"] / task_id
+        state_dir.mkdir(parents=True, exist_ok=True)
+        task: dict[str, object] = {
+            "schema_version": cr.SCHEMA_VERSION,
+            "project_id": project_id,
+            "project_name": "checkpoint",
+            "task_id": task_id,
+            "state": "RUNNING",
+            "execution_mode": "interactive",
+            "input_ref": input_ref,
+            "input_sha": input_sha,
+            "local_head": input_sha,
+            "local_branch": "main",
+            "broker": str(paths["broker"]),
+            "worktree": str(worktree),
+            "state_dir": str(state_dir),
+            "max_untracked_bytes": 1024 * 1024,
+            "job_policy": "launch",
+            "test_cmd": "python -m unittest",
+            "tools": {
+                "bash": shutil.which("bash"),
+                "git": shutil.which("git"),
+                "tmux": shutil.which("true"),
+                "python3": shutil.which("python3"),
+            },
+        }
+        cr.save_server_task(paths, task)
+        return paths, task, worktree
+
+    def test_live_checkpoint_publishes_commits_and_rejects_history_rewrite(self) -> None:
+        home = self.base / "checkpoint-home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths, task, worktree = self.make_interactive_server_task(home)
+            (worktree / "tracked.txt").write_text(
+                "one\ncheckpoint-one\nthree\nfour\n", encoding="utf-8"
+            )
+            first = commit_all(worktree, "checkpoint one")
+            (worktree / "checkpoint.py").write_text("VALUE = 2\n", encoding="utf-8")
+            second = commit_all(worktree, "checkpoint two")
+
+            checkpoint = cr.publish_task_checkpoint(paths, task)
+            self.assertEqual(checkpoint["sha"], second)
+            self.assertEqual(checkpoint["commit_count"], 2)
+            self.assertFalse(checkpoint["dirty"])
+            self.assertEqual(
+                command(
+                    "git",
+                    "--git-dir",
+                    paths["broker"],
+                    "rev-parse",
+                    checkpoint["ref"],
+                ).stdout.strip(),
+                second,
+            )
+
+            git(worktree, "reset", "--hard", first)
+            (worktree / "checkpoint.py").write_text("VALUE = 3\n", encoding="utf-8")
+            commit_all(worktree, "rewritten checkpoint two")
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.publish_task_checkpoint(paths, task)
+            self.assertEqual(caught.exception.code, "CHECKPOINT_HISTORY_REWRITTEN")
+
+    def test_interactive_result_preserves_codex_commit_chain(self) -> None:
+        home = self.base / "result-home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths, task, worktree = self.make_interactive_server_task(home)
+            (worktree / "tracked.txt").write_text(
+                "one\nfirst\nthree\nfour\n", encoding="utf-8"
+            )
+            first = commit_all(worktree, "first logical unit")
+            (worktree / "second.py").write_text("SECOND = True\n", encoding="utf-8")
+            second = commit_all(worktree, "second logical unit")
+
+            result_sha, changed = cr.commit_dirty_result(task, paths)
+            self.assertTrue(changed)
+            self.assertEqual(result_sha, second)
+            self.assertEqual(task["result_sha"], second)
+            self.assertEqual(task["codex_head_sha"], second)
+            self.assertFalse(task["result_squashed"])
+            self.assertTrue(task["result_preserves_commits"])
+            self.assertEqual(git(worktree, "rev-parse", f"{second}^").stdout.strip(), first)
+            self.assertEqual(
+                command(
+                    "git",
+                    "--git-dir",
+                    paths["broker"],
+                    "rev-parse",
+                    task["result_ref"],
+                ).stdout.strip(),
+                second,
+            )
+
+    def test_incremental_checkpoint_pull_preserves_commit_boundaries(self) -> None:
+        input_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        remote = self.add_detached_worktree(input_sha, "live-remote")
+        (remote / "tracked.txt").write_text(
+            "one\nremote-one\nthree\nfour\n", encoding="utf-8"
+        )
+        first_remote = commit_all(remote, "remote logical unit one")
+        (remote / "remote.py").write_text("VALUE = 2\n", encoding="utf-8")
+        second_remote = commit_all(remote, "remote logical unit two")
+        state_dir = self.base / "live-pull-state"
+
+        first_pull = cr.integrate_committed_checkpoint(
+            self.root,
+            "live-project",
+            "task-live",
+            input_sha,
+            second_remote,
+            state_dir=state_dir,
+        )
+        first_local_tip = cr.current_head(self.root)
+        self.assertEqual(first_pull["changed_commit_count"], 2)
+        self.assertEqual(
+            [item["subject"] for item in first_pull["commits"]],
+            ["remote logical unit one", "remote logical unit two"],
+        )
+        self.assertEqual(
+            git(self.root, "log", "--format=%s", "-2").stdout.splitlines(),
+            ["remote logical unit two", "remote logical unit one"],
+        )
+        self.assertFalse(git(self.root, "status", "--porcelain").stdout.strip())
+
+        (remote / "third.py").write_text("THIRD = 3\n", encoding="utf-8")
+        third_remote = commit_all(remote, "remote logical unit three")
+        second_pull = cr.integrate_committed_checkpoint(
+            self.root,
+            "live-project",
+            "task-live",
+            second_remote,
+            third_remote,
+            prior_local_tip=first_local_tip,
+            state_dir=state_dir,
+        )
+        self.assertEqual(second_pull["changed_commit_count"], 1)
+        self.assertEqual(
+            [item["subject"] for item in second_pull["commits"]],
+            ["remote logical unit three"],
+        )
+        self.assertEqual(git(self.root, "log", "-1", "--format=%s").stdout.strip(),
+                         "remote logical unit three")
+        self.assertTrue((self.root / "third.py").is_file())
+
+    def test_checkpoint_pull_preserves_unrelated_untracked_files(self) -> None:
+        input_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        remote = self.add_detached_worktree(input_sha, "untracked-live-remote")
+        (remote / "tracked.txt").write_text(
+            "one\nremote-update\nthree\nfour\n", encoding="utf-8"
+        )
+        remote_tip = commit_all(remote, "remote update with local untracked file")
+        untracked = self.root / "local-notes.txt"
+        untracked.write_text("keep this local\n", encoding="utf-8")
+
+        result = cr.integrate_committed_checkpoint(
+            self.root,
+            "live-project",
+            "task-untracked",
+            input_sha,
+            remote_tip,
+            state_dir=self.base / "live-untracked-state",
+        )
+
+        self.assertEqual(result["changed_commit_count"], 1)
+        self.assertEqual(untracked.read_text(encoding="utf-8"), "keep this local\n")
+        self.assertIn("?? local-notes.txt", git(self.root, "status", "--porcelain").stdout)
+        self.assertEqual(
+            git(self.root, "log", "-1", "--format=%s").stdout.strip(),
+            "remote update with local untracked file",
+        )
+
+    def test_checkpoint_pull_blocks_untracked_path_overwrite(self) -> None:
+        input_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        remote = self.add_detached_worktree(input_sha, "untracked-collision-remote")
+        (remote / "collision.txt").write_text("from Codex\n", encoding="utf-8")
+        remote_tip = commit_all(remote, "add collision path")
+        collision = self.root / "collision.txt"
+        collision.write_text("local untracked content\n", encoding="utf-8")
+        before_head = cr.current_head(self.root)
+        before_status = cr.git_status_porcelain(self.root)
+
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.integrate_committed_checkpoint(
+                self.root,
+                "live-project",
+                "task-untracked-collision",
+                input_sha,
+                remote_tip,
+                state_dir=self.base / "live-untracked-collision-state",
+            )
+
+        self.assertEqual(caught.exception.code, "LOCAL_CHECKOUT_BLOCKED")
+        self.assertEqual(cr.current_head(self.root), before_head)
+        self.assertEqual(cr.git_status_porcelain(self.root), before_status)
+        self.assertEqual(
+            collision.read_text(encoding="utf-8"), "local untracked content\n"
+        )
+
+    def test_checkpoint_conflict_keeps_canonical_checkout_untouched(self) -> None:
+        input_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        remote = self.add_detached_worktree(input_sha, "conflicting-live-remote")
+        (remote / "tracked.txt").write_text(
+            "one\nREMOTE\nthree\nfour\n", encoding="utf-8"
+        )
+        remote_tip = commit_all(remote, "remote conflicting change")
+        (self.root / "tracked.txt").write_text(
+            "one\nLOCAL\nthree\nfour\n", encoding="utf-8"
+        )
+        commit_all(self.root, "local conflicting change")
+        before = visible_state(self.root)
+        content = (self.root / "tracked.txt").read_bytes()
+        state_dir = self.base / "live-conflict-state"
+
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.integrate_committed_checkpoint(
+                self.root,
+                "live-project",
+                "task-conflict",
+                input_sha,
+                remote_tip,
+                state_dir=state_dir,
+            )
+        self.assertEqual(caught.exception.code, "INTEGRATION_CONFLICT")
+        self.assertEqual(before, visible_state(self.root))
+        self.assertEqual(content, (self.root / "tracked.txt").read_bytes())
+        conflict_path = Path(caught.exception.details["conflict_path"])
+        self.assertTrue(conflict_path.is_dir())
+        self.assertTrue(git(conflict_path, "ls-files", "-u").stdout.strip())
+        cr.remove_worktree(self.root, conflict_path)
+
+    def test_job_request_waits_for_trusted_broker_response(self) -> None:
+        request_file = self.root / cr.JOB_REQUEST_RELATIVE
+        response_file = self.root / cr.JOB_RESPONSE_RELATIVE
+
+        def broker() -> None:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not request_file.exists():
+                time.sleep(0.01)
+            self.assertTrue(request_file.exists())
+            cr.atomic_write_json(
+                response_file,
+                {"ok": True, "message": "launched", "job": {"run_id": "run-1"}},
+            )
+
+        worker = threading.Thread(target=broker)
+        worker.start()
+        try:
+            result = cr.request_job_file(
+                request_file,
+                name="live experiment",
+                command=["python", "train.py"],
+                response_file=response_file,
+                wait_seconds=3,
+            )
+        finally:
+            worker.join(timeout=3)
+        self.assertEqual(result["job"]["run_id"], "run-1")
+        self.assertFalse(response_file.exists())
+
+    def test_interactive_job_can_launch_from_unchanged_committed_input(self) -> None:
+        home = self.base / "job-home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths, task, _worktree = self.make_interactive_server_task(home)
+            expected_job = {
+                "run_id": "run-baseline",
+                "name": "baseline job",
+                "state": "STARTING",
+                "tmux_session": "job-baseline",
+            }
+            with mock.patch.object(cr, "start_frozen_job", return_value=expected_job) as launch:
+                result = cr.server_request_job(
+                    str(task["project_id"]),
+                    str(task["task_id"]),
+                    {
+                        "name": "baseline job",
+                        "command": ["python", "train.py"],
+                    },
+                )
+            self.assertEqual(result["job"], expected_job)
+            self.assertEqual(result["checkpoint"]["sha"], task["input_sha"])
+            source_task = launch.call_args.args[1]
+            self.assertEqual(source_task["result_sha"], task["input_sha"])
+            self.assertEqual(
+                launch.call_args.kwargs["preflight_test_cmd"], task["test_cmd"]
+            )
+            record = cr.load_task_live_job(task)
+            assert record is not None
+            self.assertEqual(record["run_id"], "run-baseline")
+
+
+
 class ServerStartTests(RepositoryTestCase):
     def test_server_start_is_idempotent_and_freezes_the_runner_helper(self) -> None:
         home = self.base / "server-home"
@@ -504,6 +819,10 @@ class ServerStartTests(RepositoryTestCase):
             self.assertIn("flock", task["runner_command"])
             self.assertEqual(task["state"], "STARTING")
             self.assertEqual(task["execution_mode"], "exec")
+            jobctl = Path(task["jobctl_path"]).read_text(encoding="utf-8")
+            self.assertIn("_job-request", jobctl)
+            self.assertNotIn("--response-file", jobctl)
+            self.assertNotIn("--wait-seconds", jobctl)
 
     def test_server_start_accepts_interactive_task_without_prompt(self) -> None:
         home = self.base / "interactive-server-home"
@@ -569,6 +888,9 @@ class ServerStartTests(RepositoryTestCase):
                 task["approval_policy"], cr.DEFAULT_INTERACTIVE_APPROVAL_POLICY
             )
             self.assertTrue(task["network_access"])
+            jobctl = Path(task["jobctl_path"]).read_text(encoding="utf-8")
+            self.assertIn("--response-file", jobctl)
+            self.assertIn("--wait-seconds 900", jobctl)
 
 
 class ServerCleanupTests(RepositoryTestCase):
@@ -1535,6 +1857,62 @@ class PromptInputTests(RepositoryTestCase):
 
 
 class MiscellaneousTests(RepositoryTestCase):
+    def interactive_start_args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            project_root=str(self.root),
+            host="rhel-test",
+            remote_dir="/srv/repo",
+            timeout=5,
+            max_untracked_bytes=1024 * 1024,
+            bootstrap_cmd="",
+            test_cmd="",
+            data_link=[],
+            model="",
+            profile="",
+            reasoning_effort="",
+            enable_search=False,
+            job_policy="launch",
+        )
+
+    def test_interactive_start_requires_clean_named_local_branch(self) -> None:
+        args = self.interactive_start_args()
+        (self.root / "tracked.txt").write_text(
+            "one\nDIRTY\nthree\nfour\n", encoding="utf-8"
+        )
+        with (
+            mock.patch.object(cr, "ensure_remote_helper", return_value={"helper": "/helper"}),
+            mock.patch.object(
+                cr,
+                "remote_invoke",
+                return_value={"remote": {"broker": "/tmp/broker"}},
+            ),
+            mock.patch.object(
+                cr, "remote_status", return_value={"task": {"state": "NONE"}}
+            ),
+            mock.patch.object(cr, "local_current_path", return_value=self.base / "current.json"),
+        ):
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.start_new_task(args, execution_mode="interactive", prompt=None)
+        self.assertEqual(caught.exception.code, "INTERACTIVE_REQUIRES_CLEAN_CHECKOUT")
+
+        git(self.root, "reset", "--hard", "HEAD")
+        git(self.root, "checkout", "--detach")
+        with (
+            mock.patch.object(cr, "ensure_remote_helper", return_value={"helper": "/helper"}),
+            mock.patch.object(
+                cr,
+                "remote_invoke",
+                return_value={"remote": {"broker": "/tmp/broker"}},
+            ),
+            mock.patch.object(
+                cr, "remote_status", return_value={"task": {"state": "NONE"}}
+            ),
+            mock.patch.object(cr, "local_current_path", return_value=self.base / "current.json"),
+        ):
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.start_new_task(args, execution_mode="interactive", prompt=None)
+        self.assertEqual(caught.exception.code, "INTERACTIVE_REQUIRES_BRANCH")
+
     def remote_probe(self, helper_hash: str) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(
             args=[],
@@ -1736,6 +2114,10 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertEqual(env["XDG_CACHE_HOME"], str(cache))
         self.assertEqual(env["UV_CACHE_DIR"], str(cache / "uv"))
         self.assertEqual(env["PIP_CACHE_DIR"], str(cache / "pip"))
+        self.assertEqual(env["GIT_AUTHOR_NAME"], "Codex Remote")
+        self.assertEqual(env["GIT_AUTHOR_EMAIL"], "codex-remote@localhost")
+        self.assertEqual(env["GIT_COMMITTER_NAME"], "Codex Remote")
+        self.assertEqual(env["GIT_COMMITTER_EMAIL"], "codex-remote@localhost")
         self.assertTrue(cache.is_dir())
 
     def test_codex_instructions_authorize_project_dependencies_not_host_activation(self) -> None:
@@ -1852,13 +2234,14 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertIs(caught.exception.details, existing)
 
 
-    def test_apply_refuses_live_interactive_session(self) -> None:
+    def test_apply_routes_live_interactive_session_through_commit_pull(self) -> None:
         args = argparse.Namespace(max_untracked_bytes=1024)
         task = {
             "task_id": "task-interactive",
             "state": "RUNNING",
             "execution_mode": "interactive",
         }
+        expected = {"ok": True, "command": "pull", "changed_commit_count": 2}
         with (
             mock.patch.object(
                 cr,
@@ -1869,12 +2252,12 @@ class MiscellaneousTests(RepositoryTestCase):
             mock.patch.object(cr, "remote_status", return_value={"task": task}),
             mock.patch.object(cr, "local_current_path", return_value=self.base / "current.json"),
             mock.patch.object(cr, "read_json", return_value=None),
+            mock.patch.object(cr, "cmd_pull", return_value=expected) as pull,
         ):
-            with self.assertRaises(cr.CodexRemoteError) as caught:
-                cr.cmd_apply(args)
+            result = cr.cmd_apply(args)
 
-        self.assertEqual(caught.exception.code, "INTERACTIVE_TASK_ACTIVE")
-        self.assertIn("/exit or /quit", str(caught.exception))
+        self.assertEqual(result, expected)
+        pull.assert_called_once_with(args)
 
     def test_project_configuration_is_persisted_for_terminal_frontend(self) -> None:
         args = argparse.Namespace(
