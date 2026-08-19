@@ -3714,10 +3714,50 @@ def nix_develop_prefix_from_command(
     return [nix, *tokens[1:], "--command"]
 
 
+def nonmutating_nix_develop_prefix(
+    prefix: Sequence[str], worktree: Path
+) -> list[str]:
+    """Prevent trusted environment discovery from mutating ``flake.lock``.
+
+    ``nix develop`` writes a newly generated lock file by default and may update
+    an existing one.  Managed Codex startup must be observational: a missing
+    lock file may be resolved ephemerally, while an existing committed lock must
+    be used as-is.
+    """
+    value = list(prefix)
+    if len(value) < 2 or Path(value[0]).name != "nix" or value[1] != "develop":
+        return value
+    flags = ["--no-write-lock-file"]
+    if (worktree / "flake.lock").is_file():
+        flags.insert(0, "--no-update-lock-file")
+    existing = set(value[2:])
+    guarded = [flag for flag in flags if flag not in existing]
+    return [*value[:2], *guarded, *value[2:]]
+
+
+def nonmutating_nix_develop_command(
+    command: str | None, worktree: Path, nix: str | None
+) -> str | None:
+    """Guard a simple configured ``nix develop`` command against lock writes."""
+    if not command or not nix:
+        return command
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return command
+    if len(tokens) < 2 or Path(tokens[0]).name != "nix" or tokens[1] != "develop":
+        return command
+    shell_operators = {"&&", "||", ";", "|", "&", ">", ">>", "<"}
+    if any(token in shell_operators for token in tokens[2:]):
+        return command
+    tokens[0] = nix
+    return shlex.join(nonmutating_nix_develop_prefix(tokens, worktree))
+
+
 def interactive_nix_develop_candidates(
     task: Mapping[str, Any], worktree: Path
 ) -> list[list[str]]:
-    """Return ordered Nix development-shell candidates for WORKTREE."""
+    """Return ordered, non-mutating Nix development-shell candidates."""
     tools = task.get("tools")
     nix = tools.get("nix") if isinstance(tools, Mapping) else None
     if not isinstance(nix, str) or not nix:
@@ -3728,6 +3768,8 @@ def interactive_nix_develop_candidates(
             configured if isinstance(configured, str) else None,
             nix,
         )
+        if prefix:
+            prefix = nonmutating_nix_develop_prefix(prefix, worktree)
         if prefix and prefix not in candidates:
             candidates.append(prefix)
     if (worktree / "flake.nix").is_file():
@@ -3735,6 +3777,7 @@ def interactive_nix_develop_candidates(
             [nix, "develop", "--command"],
             [nix, "develop", ".#server", "--command"],
         ):
+            fallback = nonmutating_nix_develop_prefix(fallback, worktree)
             if fallback not in candidates:
                 candidates.append(fallback)
     return candidates
@@ -3898,7 +3941,12 @@ def inferred_interactive_bootstrap(
     """Infer a locked uv bootstrap only when the project omitted one."""
     configured = task.get("bootstrap_cmd")
     if isinstance(configured, str) and configured.strip():
-        return configured, False
+        tools = task.get("tools")
+        nix = tools.get("nix") if isinstance(tools, Mapping) else None
+        protected = nonmutating_nix_develop_command(
+            configured, worktree, nix if isinstance(nix, str) else None
+        )
+        return protected or configured, False
     if not (worktree / "pyproject.toml").is_file() or not (worktree / "uv.lock").is_file():
         return None, False
     prefix = task.get("interactive_nix_prefix")
