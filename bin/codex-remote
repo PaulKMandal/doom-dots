@@ -3779,6 +3779,61 @@ def consume_job_request(task: Mapping[str, Any]) -> dict[str, Any] | None:
     return request
 
 
+def codex_data_write_directories(task: Mapping[str, Any]) -> list[str]:
+    """Return explicit persistent data directories Codex may write.
+
+    Data links are the only server paths a project deliberately exposes inside
+    an isolated worktree.  Directory-valued links are therefore safe candidates
+    for Codex's ``--add-dir`` writable roots: the exact source path came from the
+    project configuration, was submitted explicitly, and was validated by the
+    trusted server before the task was created.  File-valued links remain
+    readable through their worktree symlink but are not broadened to a writable
+    parent directory.
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in task.get("data_links") or []:
+        if not isinstance(item, Mapping):
+            continue
+        source_value = item.get("source")
+        if not isinstance(source_value, str) or not source_value:
+            continue
+        source = Path(source_value)
+        if not source.is_dir():
+            continue
+        value = str(source)
+        if value not in seen:
+            result.append(value)
+            seen.add(value)
+    return result
+
+
+def codex_persistent_data_instructions(task: Mapping[str, Any]) -> str:
+    """Describe configured persistent data mappings to the Codex agent."""
+    mappings: list[str] = []
+    writable = set(codex_data_write_directories(task))
+    for item in task.get("data_links") or []:
+        if not isinstance(item, Mapping):
+            continue
+        source = item.get("source")
+        target = item.get("target")
+        if not isinstance(source, str) or not isinstance(target, str):
+            continue
+        access = "writable persistent directory" if source in writable else "external data link"
+        mappings.append(f"{target} -> {source} ({access})")
+    if not mappings:
+        return ""
+    return (
+        " Configured data-link targets point to persistent server storage outside this "
+        "ephemeral worktree: " + "; ".join(mappings) + ". "
+        "When the user asks you to download, acquire, preprocess, or otherwise create "
+        "durable dataset content, place it under an appropriate configured writable "
+        "data-link target (normally data/) rather than another worktree-local directory. "
+        "Files written there survive task cleanup. Do not unlink, replace, rename, or "
+        "repoint the configured data-link symlinks themselves."
+    )
+
+
 def codex_job_instructions(task: Mapping[str, Any]) -> str:
     """Return per-task launch rules injected as Codex developer instructions."""
     policy = task.get("job_policy", "deny")
@@ -3788,6 +3843,7 @@ def codex_job_instructions(task: Mapping[str, Any]) -> str:
         "result directories. Do not inspect unrelated repositories, SSH keys, credentials, "
         "tokens, or secret files. Run bounded foreground tests normally."
     )
+    base += codex_persistent_data_instructions(task)
     if task_execution_mode(task) == "interactive":
         base += (
             " Create small, coherent Git commits whenever a logical unit is complete and "
@@ -4886,6 +4942,8 @@ def codex_command(task: Mapping[str, Any]) -> list[str]:
         "--ask-for-approval",
         "never",
     ]
+    for directory in codex_data_write_directories(task):
+        command.extend(["--add-dir", directory])
     if task.get("enable_search"):
         command.append("--search")
     command.extend([
@@ -4924,6 +4982,8 @@ def interactive_codex_command(task: Mapping[str, Any]) -> list[str]:
         "--add-dir",
         str(cache),
     ]
+    for directory in codex_data_write_directories(task):
+        command.extend(["--add-dir", directory])
     if task.get("network_access"):
         command.extend(
             [

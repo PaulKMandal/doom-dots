@@ -58,11 +58,13 @@ must leave all nonignored repository files unchanged.")
 When nil, `my/remote-test-cmd' is used.")
 
 (defvar-local my/codex-remote-data-links nil
-  "Remote data links exposed inside the isolated Codex worktree.
+  "Persistent remote data links exposed inside the isolated Codex worktree.
 
 Each entry has the form REMOTE-ABSOLUTE-PATH=WORKTREE-RELATIVE-PATH.  The
 backend creates temporary symlinks, excludes them from the result commit, and
-verifies that Codex did not replace them.")
+verifies that Codex did not replace them.  Directory-valued sources are also
+given to Codex as explicit writable roots, so downloads written through the
+worktree-relative path persist outside the ephemeral task worktree.")
 
 (defvar-local my/codex-remote-model nil
   "Optional Codex model override for this project.")
@@ -301,6 +303,20 @@ ON-ERROR with the parsed JSON object and process buffer."
    ((my/codex-remote--get tmux 'running) "running")
    (t "present (state unknown)")))
 
+(defun my/codex-remote--data-links-label (task)
+  "Return a compact persistent-data mapping label for TASK."
+  (when-let ((links (my/codex-remote--get task 'data_links)))
+    (string-join
+     (delq nil
+           (mapcar
+            (lambda (link)
+              (let ((source (my/codex-remote--get link 'source))
+                    (target (my/codex-remote--get link 'target)))
+                (when (and source target)
+                  (format "%s -> %s" target source))))
+            links))
+     ", ")))
+
 (defun my/codex-remote--task-lines (task)
   "Return human-readable status lines for TASK."
   (if (or (null task)
@@ -328,6 +344,7 @@ ON-ERROR with the parsed JSON object and process buffer."
                                        task 'bootstrap_inferred)
                                       "automatic locked uv sync"
                                     "project configuration")))
+              ("Data links" . ,(my/codex-remote--data-links-label task))
               ("Task" . ,(my/codex-remote--get task 'task_id))
               ("Project" . ,(my/codex-remote--get task 'project_name))
               ("Started" . ,(or (my/codex-remote--get task 'codex_started_at)

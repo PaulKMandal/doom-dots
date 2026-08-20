@@ -8,6 +8,12 @@
 - Never silently substitute a model, dataset, checkpoint, control, metric, or evaluation panel.
 - Separate implementation changes, smoke validation, full experiment launch, and result interpretation.
 
+## Data and persistent storage
+
+- When codex-remote exposes a configured persistent data-link target such as `data/`, put newly downloaded datasets and other durable large data under that target rather than another worktree-local directory.
+- Do not unlink, replace, rename, or repoint configured data-link symlinks.
+- Do not commit datasets, checkpoints, caches, or other large generated data unless the repository explicitly requires that artifact in Git.
+
 ## Validation and jobs
 
 - Commit a coherent, validated source checkpoint before requesting a long job.
