@@ -363,6 +363,8 @@
                  (reasoning_effort . "xhigh")
                  (approval_policy . "never")
                  (network_access . t)
+                 (data_links . (((source . "/home/rhel/Data/MalLogic")
+                                  (target . "data"))))
                  (result_sha . "abc123")
                  (tests . ((command . "pytest") (exit_code . 1)))))
          (text (string-join (my/codex-remote--task-lines task) "\n")))
@@ -373,6 +375,7 @@
     (should (string-match-p "xhigh" text))
     (should (string-match-p "never" text))
     (should (string-match-p "enabled in sandbox" text))
+    (should (string-match-p "data -> /home/rhel/Data/MalLogic" text))
     (should (string-match-p "abc123" text))
     (should (string-match-p "pytest" text))))
 

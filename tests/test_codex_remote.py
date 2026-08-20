@@ -2492,6 +2492,41 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertIn('model_reasoning_effort="high"', value)
         self.assertTrue(any("developer_instructions=" in item for item in value))
 
+    def test_codex_commands_grant_data_link_directories_write_access(self) -> None:
+        persistent = self.base / "persistent-data"
+        persistent.mkdir()
+        file_link = self.base / "manifest.json"
+        file_link.write_text("{}\n", encoding="utf-8")
+        task = {
+            "tools": {"codex": "/opt/codex"},
+            "state_dir": str(self.base / "persistent-data-state"),
+            "execution_mode": "interactive",
+            "approval_policy": "never",
+            "network_access": True,
+            "enable_search": False,
+            "data_links": [
+                {"source": str(persistent), "target": "data"},
+                {"source": str(file_link), "target": "metadata/manifest.json"},
+            ],
+        }
+
+        interactive = cr.interactive_codex_command(task)
+        noninteractive = cr.codex_command(task)
+
+        self.assertIn(str(persistent), interactive)
+        self.assertIn(str(persistent), noninteractive)
+        self.assertEqual(
+            interactive[interactive.index(str(persistent)) - 1],
+            "--add-dir",
+        )
+        self.assertEqual(
+            noninteractive[noninteractive.index(str(persistent)) - 1],
+            "--add-dir",
+        )
+        self.assertNotIn(str(file_link.parent), cr.codex_data_write_directories(task))
+        self.assertNotIn(str(file_link), interactive)
+        self.assertLess(noninteractive.index(str(persistent)), noninteractive.index("exec"))
+
     def test_interactive_codex_command_defaults_to_sol_and_xhigh(self) -> None:
         task = {
             "tools": {"codex": "/opt/codex"},
@@ -2570,6 +2605,24 @@ class MiscellaneousTests(RepositoryTestCase):
         self.assertIn("Do not use sudo", instructions)
         self.assertIn("nixos-rebuild", instructions)
         self.assertIn("systemctl", instructions)
+
+    def test_codex_instructions_route_durable_downloads_to_data_links(self) -> None:
+        persistent = self.base / "persistent-data-instructions"
+        persistent.mkdir()
+        instructions = cr.codex_job_instructions(
+            {
+                "execution_mode": "interactive",
+                "job_policy": "deny",
+                "data_links": [
+                    {"source": str(persistent), "target": "data"},
+                ],
+            }
+        )
+        self.assertIn(f"data -> {persistent}", instructions)
+        self.assertIn("persistent server storage", instructions)
+        self.assertIn("download", instructions)
+        self.assertIn("survive task cleanup", instructions)
+        self.assertIn("Do not unlink, replace, rename, or repoint", instructions)
 
     def test_interactive_command_reuses_active_interactive_task(self) -> None:
         args = argparse.Namespace(max_untracked_bytes=1024)
