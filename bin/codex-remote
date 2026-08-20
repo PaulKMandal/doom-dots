@@ -5999,7 +5999,7 @@ def server_recover(project_id: str) -> dict[str, Any]:
     task = load_server_task(paths)
     if not task:
         raise CodexRemoteError("No task exists", code="TASK_NOT_FOUND")
-    if task.get("state") not in {"ORPHANED", "FAILED"}:
+    if task.get("state") not in {"ORPHANED", "FAILED", "BLOCKED_UNSAFE_RESULT"}:
         raise CodexRemoteError(
             f"Task is not recoverable; current state is {task.get('state')}",
             code="TASK_NOT_RECOVERABLE",
