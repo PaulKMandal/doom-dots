@@ -211,8 +211,10 @@ The following optional variables specialize the isolated Codex worktree:
   nil, `my/remote-setup-cmd` is used.
 - `my/codex-remote-test-cmd`: test command run after Codex. When nil,
   `my/remote-test-cmd` is used.
-- `my/codex-remote-data-links`: explicit server paths temporarily symlinked
-  inside the isolated worktree, expressed as `SOURCE=RELATIVE_TARGET`.
+- `my/codex-remote-data-links`: persistent server paths temporarily symlinked
+  inside the isolated worktree, expressed as `SOURCE=RELATIVE_TARGET`. Directory
+  sources are granted to Codex as explicit additional writable roots, so a
+  download written through the relative target survives worktree cleanup.
 - `my/codex-remote-model`: optional model override. Interactive tasks default to
   `gpt-5.6-sol` when this is nil.
 - `my/codex-remote-profile`: optional server-side Codex profile.
@@ -329,11 +331,31 @@ approve their exact values.
 
 Data links are explicit because ignored datasets and checkpoints are not part of
 the hidden Git snapshot. Do not link credentials or unrelated private server
-content. Codex can read linked content, and trusted project test commands run
-outside the Codex command sandbox. A symlink does not make its source read-only;
-source ownership and permissions must enforce read-only access when required.
-The backend rejects symlinked target parents so a configured link cannot be
-redirected outside the isolated worktree.
+content. Directory-valued data-link sources are passed to Codex with `--add-dir`,
+which the Codex CLI defines as an additional writable directory. This means a
+project can make a persistent server directory appear at a familiar worktree path
+such as `data/`: downloads to that path write directly to the persistent server
+directory and survive task archive/discard. File-valued links are not broadened
+to a writable parent directory. Trusted project test commands and frozen jobs run
+outside the Codex command sandbox, so source ownership and permissions must still
+enforce read-only access when a link is intended to be read-only. The backend
+rejects symlinked target parents so a configured link cannot be redirected
+outside the isolated worktree.
+
+For MalLogic after creating `/home/rhel/Data/MalLogic`, use this project-local
+setting:
+
+```elisp
+(my/codex-remote-data-links
+ . ("/home/rhel/Data/MalLogic=data"))
+```
+
+A new managed task will then see `data/...` in its worktree, while the actual
+bytes live under `/home/rhel/Data/MalLogic/...`. The runner also tells Codex to
+place user-requested durable dataset downloads under configured writable data-link
+targets rather than elsewhere in the ephemeral worktree. Existing tasks keep the
+launch configuration they started with and must be replaced to gain the writable
+root.
 
 Run `SPC r c g` once per server account to install the managed global working
 agreement in `~/.codex/AGENTS.md`. The command preserves content outside its
