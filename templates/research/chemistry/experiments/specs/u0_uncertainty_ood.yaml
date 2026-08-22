@@ -1,0 +1,61 @@
+id: u0_uncertainty_ood_audit
+status: proposed
+claims: [C-003, C-004, C-005, C-006]
+design:
+  role: uncertainty_overlay_not_fifth_task
+  reaction_slice_per_task: [100, 500]
+  intervention_pairs: 100
+  seeds: 3
+  matched_generated_proposals: 32
+  equivalent_smiles_encodings: 16
+  bootstrap_replicates: 10000
+
+factors:
+  task:
+    - forward_endpoint
+    - forward_elementary_step
+    - forward_pathway_search
+    - retro_single_step
+  shift:
+    - iid
+    - patent_temporal
+    - transformation_disjoint
+    - scaffold_disjoint
+    - condition_or_mechanism_branch
+  uncertainty_component:
+    - model_and_representation
+    - predictive_mechanism
+    - score
+    - aggregation
+
+required_checks:
+  - score direction and units are declared
+  - calibration and thresholds use validation only
+  - native and calibrated results remain separate
+  - OOD and correctness labels remain separate
+  - deployable OOD scores use input-only information
+  - candidates are canonicalized and deduplicated before confidence
+  - summed scores have length-normalized and maximum or top-quantile sensitivity analyses
+  - raw token entropy is not compared across tokenizers or output spaces
+  - ensemble members use the same training split
+  - proposal and model-forward budgets are matched and reported
+  - pair, source-family, scaffold, split, and calibrator hashes are sealed
+
+primary_outputs:
+  - uncertainty-observations.jsonl
+  - candidate-sets.jsonl
+  - calibration.json
+  - detection-metrics.json
+  - risk-coverage.json
+  - ranking-overlap.json
+  - method-by-shift-interactions.json
+  - intervention-pairs.jsonl
+  - intervention-metrics.json
+  - evidence-manifest.json
+
+interpretation_rules:
+  - no pooled uncertainty ranking across tasks or applications
+  - OOD detection performance does not imply failure detection performance
+  - an aleatoric or epistemic label requires empirical validation
+  - rank reversals and low uncertain-set overlap are results, not evaluator failures
+  - exact-match disagreement receives equivalence-aware review before error labeling

@@ -146,6 +146,16 @@ class ResearchRepoTests(unittest.TestCase):
         )
         project = (root / "research/PROJECT.md").read_text(encoding="utf-8")
         self.assertIn("split before augmentation", project)
+        self.assertTrue((root / "research/UNCERTAINTY-OOD-STUDY.md").is_file())
+        self.assertTrue(
+            (root / "configs/uncertainty/uncertainty_ood_variation.yaml").is_file()
+        )
+        self.assertTrue((root / "configs/splits/condition_intervention.yaml").is_file())
+        uncertainty = (root / "research/UNCERTAINTY-OOD-STUDY.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("not a fifth task", uncertainty)
+        self.assertIn("OOD detection and failure detection", uncertainty)
 
     def test_federated_scaffold_has_bridge_and_staleness_kill_tests(self) -> None:
         root, _ = self.init("federated")

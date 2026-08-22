@@ -7,11 +7,15 @@ Controlled benchmark of reaction representations, graph methods, and mechanistic
 3. forward pathway search: unmapped initial reactants to a recorded endpoint through recursive steps;
 4. single-step retrosynthesis: product to precursor multiset.
 
+An uncertainty/OOD study overlays these task contracts. It asks whether confidence responds to unfamiliar chemistry, prediction failure, genuine ambiguity, or only serialization and sequence length. It never turns uncertainty into a fifth task or pools all applications into one score.
+
 Multistep retrosynthetic route planning is deliberately deferred from phase 1. The current retro lane does not evaluate search trees, route diversity, route cost, solved-route rate, or termination at a pinned purchasable-building-block catalog; do not label its single-step results as a route-planning benchmark.
 
 FlowER belongs in the forward-mechanism lane. R-SMILES (root-aligned SMILES) is a representation evaluated with a matched Transformer in forward and retro lanes. It is not treated as an independent architecture.
 
 The first milestone is an evaluator contract on 100–500 reactions, not a full leaderboard. A method cannot enter the full matrix until its adapter passes canonicalization, split-leakage, candidate-deduplication, inference-budget, and artifact-completeness tests.
+
+The first uncertainty milestone is phase U0: the same 100–500 reaction slice per task, plus 100 held-out condition-intervention pairs (200 reactions). Read `research/UNCERTAINTY-OOD-STUDY.md`, `configs/uncertainty/uncertainty_ood_variation.yaml`, and `experiments/specs/u0_uncertainty_ood.yaml` before producing confidence results.
 
 ## Initial matrix
 
@@ -25,9 +29,12 @@ Primary sources and unresolved revisions live in `manifests/`. No dataset or mod
 
 All tables keep scratch-trained, released-checkpoint reproduction, and local-adaptation lanes separate. Published Graph2SMILES tasks are endpoint prediction and single-step retro; its mechanism benchmark is a FlowER-study adaptation. Published R-SMILES tasks are forward endpoint and retro; any mechanism use must be labeled a new local adaptation.
 
+Uncertainty tables likewise keep task, shift, application, score, and aggregation explicit. OOD detection is not a synonym for failure detection. Raw token likelihoods are not comparable across different tokenizations/output spaces, and entropy over a retained beam is reported as retained-candidate entropy rather than full predictive entropy.
+
 ## Frozen-run output contract
 
 - Write tables, predictions, figures, machine-readable dataset/split identity, expected/observed counts, and the run card under `$CODEX_RESULTS_DIR`.
 - Write resumable model state only under `$CODEX_CHECKPOINTS_DIR`.
 - The configured worktree completion marker is marker-only; never place evidence beside it.
 - An audit is incomplete unless the sealed results include dataset and split hashes, reaction IDs or sufficient nonidentifying membership evidence, counts, adapter/model identity, and inference-budget totals.
+- Uncertainty audits additionally seal calibrator/intervention-set hashes, score direction and aggregation, correctness definition, candidate counts, and model-forward totals.

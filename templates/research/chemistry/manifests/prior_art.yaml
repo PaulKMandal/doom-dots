@@ -1,0 +1,54 @@
+schema_version: 1
+references:
+  values:
+    title: "ValUES: A Framework for Systematic Validation of Uncertainty Estimation in Semantic Segmentation"
+    authors:
+      - Kim-Celine Kahl
+      - Carsten T. Lueth
+      - Maximilian Zenk
+      - Klaus Maier-Hein
+      - Paul F. Jaeger
+    venue: ICLR 2024 oral
+    arxiv: "2401.08501"
+    url: https://arxiv.org/abs/2401.08501
+    role: component-wise uncertainty validation framework adapted to chemistry
+    transferable_findings:
+      - uncertainty applications require separate evaluation
+      - aggregation can change method rankings
+      - theoretical uncertainty-type separation may not hold on real data
+  molecular_transformer:
+    title: "Molecular Transformer - A Model for Uncertainty-Calibrated Chemical Reaction Prediction"
+    authors:
+      - Philippe Schwaller
+      - Teodoro Laino
+      - Theophile Gaudin
+      - Peter Bolgar
+      - Costas Bekas
+      - Alpha A. Lee
+    venue: ACS Central Science 2019
+    doi: 10.1021/acscentsci.9b00576
+    arxiv: "1811.02633"
+    url: https://arxiv.org/abs/1811.02633
+    role: native sequence confidence baseline for forward reaction prediction
+    limitation_for_this_study: published confidence result does not replace shift-specific and aggregation-sensitive validation
+  ovadia_dataset_shift:
+    title: "Can You Trust Your Model's Uncertainty? Evaluating Predictive Uncertainty Under Dataset Shift"
+    authors:
+      - Yaniv Ovadia
+      - Emily Fertig
+      - Jie Ren
+      - Zachary Nado
+      - D. Sculley
+      - Sebastian Nowozin
+      - Joshua V. Dillon
+      - Balaji Lakshminarayanan
+      - Jasper Snoek
+    venue: NeurIPS 2019
+    url: https://proceedings.neurips.cc/paper/2019/hash/8558cb408c1d76621371888657d2eb1d-Abstract.html
+    role: dataset-shift calibration and predictive-uncertainty benchmark
+    transferable_finding: calibration and method rankings must be re-evaluated under increasing shift
+
+study_specific_prior_art_policy:
+  pin_revision_or_doi_before_execution: true
+  separate_published_claims_from_local_adaptations: true
+  copy_published_metrics_without_recomputation: false

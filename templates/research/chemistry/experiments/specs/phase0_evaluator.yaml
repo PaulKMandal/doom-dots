@@ -10,6 +10,7 @@ checks:
   - candidate deduplication occurs before top-k
   - declared inference/model-call budget is enforced
   - predictions, failures, metrics, resources, and environment artifacts are complete
+  - confidence records declare score direction, aggregation, calibration status, and correctness definition
   - all evidence is under CODEX_RESULTS_DIR and checkpoints under CODEX_CHECKPOINTS_DIR
   - sealed evidence manifest records dataset/split hashes, membership evidence, counts, model/adapter identity, and compute totals
 outputs:

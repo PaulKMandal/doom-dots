@@ -1,0 +1,110 @@
+schema_version: 1
+study_id: chemistry_uncertainty_ood_variation_v1
+status: proposed
+scope:
+  design: overlay_on_existing_task_contracts
+  tasks:
+    - forward_endpoint
+    - forward_elementary_step
+    - forward_pathway_search
+    - retro_single_step
+  pooled_uncertainty_leaderboard: false
+
+components:
+  c0_model_and_representation:
+    - transformer_canonical_smiles
+    - transformer_randomized_smiles
+    - transformer_r_smiles
+    - graph_endpoint_model
+    - flower
+    - g2s
+    - g2s_explicit_h
+  c1_predictive_mechanism:
+    - deterministic
+    - deep_ensemble_same_training_split
+    - randomized_smiles_tta
+    - stochastic_candidate_generation
+  c2_score:
+    - native_sequence_nll
+    - length_normalized_sequence_nll
+    - beam_margin
+    - retained_candidate_entropy
+    - proposal_self_consistency
+    - ensemble_disagreement
+    - serialization_disagreement
+    - input_support_distance
+    - validation_fit_hybrid_risk
+    - structured_validity_signal
+  c3_aggregation:
+    - sum
+    - length_normalized_mean
+    - maximum
+    - top_quantile_mean
+    - pathway_step_mean
+    - pathway_step_maximum
+
+applications:
+  - failure_detection
+  - ood_detection
+  - selective_prediction
+  - calibration
+  - ambiguity_modeling
+
+shift_panels:
+  - iid
+  - patent_temporal
+  - patent_family_or_source
+  - transformation_disjoint
+  - reactant_scaffold_disjoint
+  - held_out_reaction_family
+  - condition_or_mechanism_branch
+diagnostic_perturbations:
+  - equivalent_smiles_serialization
+  - atom_map_noise
+
+ood_support_vector:
+  deployable_input_only:
+    - reactant_or_scaffold_support
+    - reagent_and_condition_cooccurrence_support
+    - temporal_distance_from_training_cutoff
+  analysis_only_target_derived:
+    - transformation_signature_novelty
+    - mechanism_step_or_sequence_novelty
+
+primary_metrics:
+  calibration: [brier, nll, calibration_slope, calibration_intercept]
+  detection: [auroc, auprc]
+  selective_prediction: [aurc, excess_aurc, risk_at_80pct_coverage, risk_at_90pct_coverage]
+  ranking_variation: [spearman, kendall, top_1pct_jaccard, top_5pct_jaccard, top_10pct_jaccard]
+  representation_instability: [prediction_flip_rate, confidence_range, candidate_js_divergence, uncertainty_rank_stability]
+  ambiguity: [equivalence_aware_topk_coverage, accepted_set_probability_mass]
+  intervention: [both_members_correct, correct_branch_switch, reference_probability_shift, confident_shortcut_failure]
+
+budgets:
+  primary_generated_proposals_per_input: 32
+  equivalent_smiles_encodings_per_input: 16
+  model_calls_and_state_expansions_reported: true
+  candidate_deduplication_before_confidence: true
+
+calibration:
+  fit_split: validation
+  native_and_calibrated_reported_separately: true
+  score_orientation_fixed_before_test: true
+  operating_threshold_fixed_before_test: true
+  test_or_ood_labels_used_for_fitting: false
+
+statistics:
+  bootstrap_replicates: 10000
+  cluster_units: [patent_family, reaction_family, mechanism_sequence, intervention_pair]
+  seeds_are_repeated_measures: true
+  report_method_by_shift_interactions: true
+  report_rank_reversals: true
+  confirmatory_multiple_testing: holm_within_preregistered_hypotheses
+  exploratory_multiple_testing: benjamini_hochberg_within_task_application
+
+guardrails:
+  deployable_ood_score_uses_input_only_features: true
+  raw_token_entropy_compared_across_tokenizers: false
+  retained_beam_entropy_named_predictive_entropy: false
+  cross_validation_members_used_as_epistemic_ensemble: false
+  aleatoric_epistemic_labels_assumed_from_method_name: false

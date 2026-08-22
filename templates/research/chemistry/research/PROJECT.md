@@ -1,8 +1,8 @@
 # {{PROJECT_NAME}} research charter
 
 - Initialized: {{CREATED_DATE}}
-- Primary question: How do representation alignment, graph structure, and mechanistic conservation change accuracy, validity, and out-of-distribution robustness under leakage-resistant, compute-matched evaluation?
-- Primary contribution: a controlled benchmark across reaction direction and mechanism level, with matched inference budgets and patent/transformation-disjoint stress tests.
+- Primary question: How do representation alignment, graph structure, and mechanistic conservation change accuracy, validity, calibrated reliability, and out-of-distribution behavior under leakage-resistant, compute-matched evaluation?
+- Primary contribution: a controlled benchmark across reaction direction and mechanism level, with matched inference budgets, patent/transformation-disjoint stress tests, and component-wise uncertainty validation.
 - Unit of analysis: an overall reaction for endpoint/retro, an elementary transition for step evaluation, and an overall reaction endpoint for pathway recovery.
 - Primary lanes: scratch-trained, released-checkpoint reproduction, and pretrained/open-book, never pooled silently.
 - Go criterion: phase-0 adapters agree on record identity/canonicalization and reproduce a small published slice within a predeclared tolerance.
@@ -21,6 +21,10 @@
 - Store all evidence under `$CODEX_RESULTS_DIR`, checkpoints under `$CODEX_CHECKPOINTS_DIR`, and only the completion sentinel at its worktree marker path.
 - Exact match recovers the recorded answer, not every chemically valid answer; stratified expert review is required for non-exact predictions.
 - Phase 1 retro is single-step only. A later multistep route-planning task must separately pin the building-block catalog and date, search budget, route-cost function, solved-route criterion, and tree/route-diversity metrics before it can enter any retrosynthesis-planning claim.
+- Treat uncertainty as a four-factor record—model/representation, predictive mechanism, score, and aggregation—and report each application separately.
+- Fit calibration, score orientation, and operating thresholds on validation only. Target-derived novelty labels are analysis strata and cannot enter deployable OOD scores.
+- Compare summed token/step uncertainty with length-normalized, maximum, and top-quantile variants; do not let sequence or pathway length silently determine the result.
+- Keep all members of each condition-intervention pair in one held-out group, and keep that group disjoint by scaffold, source family, and normalized reaction family.
 
 ## First decisive hypotheses
 
@@ -28,3 +32,5 @@
 2. R-SMILES gains shrink when architecture, optimizer updates, augmentation, and total inference calls are matched.
 3. Method rankings change materially under patent-temporal and transformation-disjoint splits.
 4. Forward and retro rankings correlate weakly, and round-trip metrics inflate when forward/retro systems share data or representation bias.
+5. Uncertainty method rankings and top-uncertain reaction sets change across tasks, shifts, and aggregation rules.
+6. Paired condition interventions expose confident shortcut failures that IID exact-match averages hide.

@@ -1,0 +1,78 @@
+schema_version: 1
+split_id: condition_intervention_pairs_v1
+status: proposed
+unit: intervention_pair
+target:
+  pairs: 100
+  reactions: 200
+  endpoint_changing_pairs: 40
+  same_endpoint_different_mechanism_pairs: 30
+  outcome_preserving_control_pairs: 30
+
+pair_record_requires:
+  - pair_id
+  - member_a_reaction_id
+  - member_b_reaction_id
+  - source_ids
+  - intervention_dimension
+  - condition_a
+  - condition_b
+  - accepted_endpoint_sets
+  - accepted_mechanism_classes
+  - expected_relation
+  - substrate_or_scaffold_group
+  - patent_or_source_family
+  - annotator_decisions
+  - adjudication_status
+
+expected_relations:
+  - endpoint_changes
+  - endpoint_same_mechanism_changes
+  - outcome_preserving_control
+
+families_to_sample:
+  - substitution_elimination_competition
+  - regioselectivity
+  - chemoselectivity
+  - stereochemical_branch
+  - redox_state
+  - protecting_group_behavior
+  - catalyst_solvent_or_base_effect
+
+assignment:
+  keep_pair_members_together: true
+  group_by:
+    - substrate_or_scaffold_group
+    - patent_or_source_family
+    - normalized_reaction_family
+  holdout_partition: test_contrast
+  train_on_pair_members: false
+  calibrate_on_pair_members: false
+
+annotation:
+  blinded_experts: 2
+  adjudication_required_on_disagreement: true
+  source_evidence_required: true
+  equivalence_classes_recorded: true
+  frozen_outcome_classes:
+    - recorded_product_exact
+    - chemically_equivalent_product
+    - plausible_alternative_or_side_product
+    - chemically_incorrect
+    - structurally_invalid
+    - mechanistically_equivalent_path
+
+leakage_checks:
+  exact_pair: required
+  scaffold_group: required
+  patent_or_source_family: required
+  normalized_reaction_family: required
+  condition_agnostic_control_model: required
+
+primary_metrics:
+  - both_members_correct
+  - correct_endpoint_or_mechanism_switch
+  - probability_shift_toward_intervened_reference
+  - confident_shortcut_failure
+  - outcome_preserving_invariance
+  - chemical_sensitivity_to_serialization_noise_ratio
