@@ -5508,6 +5508,35 @@ def terminate_process_group_with_escalation(
     return True, True
 
 
+def terminate_process_identity_with_escalation(
+    pid: Any,
+    boot_id: Any,
+    start_ticks: Any,
+    *,
+    grace_seconds: float = JOB_STOP_GRACE_SECONDS,
+) -> tuple[bool, bool]:
+    """Stop one identity-checked process without signalling an unrelated group."""
+    if not process_identity_alive(pid, boot_id, start_ticks):
+        return False, False
+    process_id = int(pid)
+    try:
+        os.kill(process_id, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return False, False
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while time.monotonic() < deadline:
+        if not process_identity_alive(pid, boot_id, start_ticks):
+            return True, False
+        time.sleep(0.05)
+    if not process_identity_alive(pid, boot_id, start_ticks):
+        return True, False
+    try:
+        os.kill(process_id, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        return True, False
+    return True, True
+
+
 @contextlib.contextmanager
 def foreground_child_process_group(process: subprocess.Popen[Any]):
     """Give PROCESS's group the tmux pane while preserving the runner parent.
@@ -8107,16 +8136,31 @@ def server_job_stop(project_id: str, run_id: str) -> dict[str, Any]:
         latest["stop_signal"] = "SIGKILL" if escalated else "SIGTERM"
         latest["stop_escalated"] = escalated
         job = save_server_job(paths, latest)
-    elif not pid:
+    else:
+        # A recorded child PID can be stale after a crash or a narrow
+        # launch/exit race.  Never leave STOP_REQUESTED wedged merely because
+        # the truthy PID failed its boot/start-tick identity check.  Stop the
+        # exact runner when it is still alive, then terminalize any state the
+        # runner did not finish itself.
+        runner_signalled, runner_escalated = terminate_process_identity_with_escalation(
+            job.get("runner_pid"),
+            job.get("server_boot_id"),
+            job.get("runner_start_ticks"),
+        )
         tmux = job.get("tools", {}).get("tmux") or login_which("tmux")
         if tmux and job.get("tmux_session"):
             run([tmux, "kill-session", "-t", job["tmux_session"]], check=False)
-        job = finalize_job_terminal(
-            paths,
-            job,
-            "STOPPED",
-            error="Job was stopped before a child experiment process was active",
-        )
+        latest = load_server_job(paths, run_id) or job
+        if latest.get("state") in JOB_ACTIVE_STATES:
+            detail = (
+                "The recorded experiment process identity was stale; the trusted runner "
+                + ("was stopped" if runner_signalled else "was already absent")
+            )
+            if runner_escalated:
+                detail += " with SIGKILL escalation"
+            job = finalize_job_terminal(paths, latest, "STOPPED", error=detail)
+        else:
+            job = latest
     return {"ok": True, "job": job}
 
 

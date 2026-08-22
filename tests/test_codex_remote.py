@@ -1853,6 +1853,45 @@ class ExperimentJobTests(RepositoryTestCase):
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=3)
 
+    def test_stop_terminalizes_stale_recorded_child_pid(self) -> None:
+        home = self.base / "stale-stop-home"
+        home.mkdir()
+        project_id = "stale-stop-project"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            state_dir = paths["jobs_state"] / "run-stale-stop"
+            (state_dir / "results").mkdir(parents=True)
+            (state_dir / "checkpoints").mkdir()
+            job = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "run_id": "run-stale-stop",
+                "name": "stale stop",
+                "state": "RUNNING",
+                "created_at": cr.utc_now(),
+                "state_dir": str(state_dir),
+                "worktree": str(self.root),
+                "results_dir": str(state_dir / "results"),
+                "checkpoints_dir": str(state_dir / "checkpoints"),
+                "source_sha": git(self.root, "rev-parse", "HEAD").stdout.strip(),
+                "process_pid": os.getpid(),
+                "process_start_ticks": -1,
+                "runner_pid": os.getpid(),
+                "runner_start_ticks": -1,
+                "server_boot_id": cr.linux_boot_id(),
+                "tmux_session": "run-stale-stop",
+                "tools": {"tmux": "/bin/true"},
+                "data_links": [],
+                "data_links_active": False,
+            }
+            cr.save_server_job(paths, job)
+            with mock.patch.object(cr, "job_with_runtime_status", return_value=job):
+                stopped = cr.server_job_stop(project_id, "run-stale-stop")["job"]
+        self.assertEqual(stopped["state"], "STOPPED")
+        self.assertTrue(stopped["stop_requested"])
+        self.assertIn("identity was stale", stopped["error"])
+        self.assertTrue((state_dir / "artifacts.manifest.json").is_file())
+
     def test_managed_state_file_helpers_reject_symlinks(self) -> None:
         target = self.base / "state-target"
         target.write_text("do not overwrite\n", encoding="utf-8")
