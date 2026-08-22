@@ -338,10 +338,10 @@ links expose the named server content to Codex.
 
 For compatibility with the existing workflow, a nil Codex-specific bootstrap
 or test value inherits `my/remote-setup-cmd` or `my/remote-test-cmd`. The
-preexisting `remote-dev.el` marks those older variables safe when they are
-single-line strings. Therefore, start Codex only from project repositories
-whose `.dir-locals.el` you trust, or set explicit Codex-specific overrides and
-approve their exact values.
+legacy `my/remote-*` host, directory, and shell-command variables also require
+exact-value approval; loading `remote-dev.el` clears weaker predicates left by
+an older long-running Emacs instance. Start Codex only from project repositories
+whose `.dir-locals.el` you trust and approve each exact execution value.
 
 Data links are explicit because ignored datasets and checkpoints are not part of
 the hidden Git snapshot. Do not link credentials or unrelated private server
