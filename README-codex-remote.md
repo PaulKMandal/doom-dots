@@ -42,8 +42,10 @@ new commits. When a live checkpoint is imported, the same keypress automatically
 rsyncs before running so the normal server checkout cannot lag behind the newly
 advanced laptop branch.
 
-The Codex worktree is never placed in `my/remote-dir`, so `rsync --delete`
-cannot erase unfinished interactive work.
+The Codex worktree is never placed in `my/remote-dir`, so normal sync cannot
+erase unfinished interactive work. Normal rsync also excludes Git metadata and
+generated research storage, rejects root/home/shallow destinations, delays
+deletion, and stops at the configured deletion limit.
 
 ## Added bindings
 
@@ -58,6 +60,10 @@ The Codex commands are under `SPC r c`:
 | `SPC r c S` | start one-shot Codex with authorization to request one frozen experiment job |
 | `SPC r c t` | show task, live-checkpoint, and local orchestration status |
 | `SPC r c a` | monitor a live Codex task read-only inside Emacs |
+| `SPC r c e` | start or reattach to the managed read/write Codex TUI inside Emacs vterm |
+| `SPC r c v` | paste the selected region into the embedded Codex composer without submitting |
+| `SPC r c n` | initialize a generic, chemistry, or federated research repository scaffold |
+| `SPC r c b` | create a secret-aware code/config/documentation review bundle |
 | `SPC r c i` | start or reattach to autonomous interactive Codex; one frozen job is authorized |
 | `SPC r c I` | compatibility alias for the same job-enabled interactive workflow |
 | `SPC r c p` | manually pull the latest committed interactive checkpoint without ending the TUI |
@@ -87,8 +93,9 @@ no frozen-job authorization. Closing its watcher does not cancel the task.
 task requires only a named local branch. Staged and unstaged tracked local work
 is captured in an invisible input snapshot, while untracked paths are ignored.
 Doom creates the isolated server worktree, launches Codex under durable `tmux`,
-and opens kitty. Running the same binding again reattaches to the existing TUI
-and conversation.
+and opens kitty. `SPC r c e` opens the same read/write tmux session inside
+Emacs instead. Running either binding again reattaches to the existing TUI and
+conversation.
 
 Managed interactive sessions use GPT-5.6 Sol at extra-high reasoning, approval
 policy `never`, a `workspace-write` sandbox, public dependency-network access,
@@ -116,6 +123,11 @@ The `s`, `S`, `j`, `i`, and `I` entry points still share one outstanding Codex
 task per project. Frozen experiment jobs are separate and can continue after the
 source Codex task is imported or archived.
 
+While an interactive TUI remains open, its trusted `$CODEX_JOBCTL` also accepts
+`list`, `status RUN_ID`, `logs RUN_ID`, `artifacts RUN_ID`, `analyze RUN_ID`, and
+`analysis RUN_ID`. This keeps launch, evidence verification, and interpretation
+inside the same research conversation rather than forcing a separate upload.
+
 ### Frozen experiment-job commands
 
 Experiment-job commands are under `SPC r j`:
@@ -129,6 +141,8 @@ Experiment-job commands are under `SPC r j`:
 | `SPC r j x` | select and stop an active job after confirmation |
 | `SPC r j i` | start a read-only Codex interpretation of a finished job |
 | `SPC r j r` | show the latest structured interpretation as Markdown |
+| `SPC r j p` | pull the verified report/small-result profile into the local repository |
+| `SPC r j P` | confirm and pull the complete results/checkpoints profile |
 
 These commands select from the project-scoped run registry. They do not require
 the source Codex editing task to remain active.
@@ -363,11 +377,27 @@ marked managed block, so personal server-wide instructions can coexist with the
 Doom-managed policy.
 
 Run `SPC r c A` in each research repository to create or open a checked-in
-project `AGENTS.md`. The supplied template covers immutable results, frozen
-panels and splits, seeds, model/control substitutions, smoke tests, job requests,
-and read-only interpretation. Tailor it to include the repository's exact Nix or
-uv commands, generated-file policy, experiment constraints, protected paths, and
-read-only data locations, then review and commit it normally.
+project `AGENTS.md`. The supplied template adds an experimental contract,
+end-to-end semantic audit, evidence classification, alternative explanations,
+bounded decisive follow-ups, future directions, reusable contributions, and
+explicit kill criteria to the integrity rules. Tailor it to include the
+repository's exact Nix or uv commands, generated-file policy, experiment
+constraints, protected paths, and read-only data locations, then review and
+commit it normally.
+
+For a new project, `SPC r c n` runs the versioned `bin/research-repo init`
+helper. It refuses to overwrite differing files and creates the AGENTS policy,
+research charter/claim/decision/run ledgers, experiment-spec template,
+`.dir-locals.el`, generated-data exclusions, and the selected generic,
+chemistry, or federated benchmark overlay. `bin/research-repo doctor` checks the
+contract. `SPC r c b`/`bin/research-repo bundle-code` packages current tracked
+and vetted untracked source bytes with a hash manifest while excluding results,
+reports, data, weights, caches, environments, and common secrets.
+
+Initialization is idempotent and conflict-safe for managed files, but it is not
+an all-or-nothing filesystem transaction: `git init` and any files accepted
+before an unexpected operating-system failure can remain. Re-running the same
+command is safe; a differing pre-existing managed file is never overwritten.
 
 A frozen-job launch requires a nonempty `my/codex-remote-test-cmd` or inherited
 `my/remote-test-cmd`. The command should be a bounded unit/smoke validation, not
@@ -529,6 +559,9 @@ The server run directory contains:
 ├── run.log
 ├── checkpoints/
 ├── results/
+├── artifacts.manifest.json     # after terminal sealing
+├── audit-schema.json           # after interpretation starts
+├── audit.json / audit.jsonl / audit.stderr.log / audit.md
 ├── analysis-schema.json        # after interpretation starts
 ├── analysis.json               # structured Codex result
 ├── analysis.jsonl              # Codex event stream
@@ -559,6 +592,7 @@ CODEX_RUN_DIR
 CODEX_RESULTS_DIR
 CODEX_CHECKPOINTS_DIR
 CODEX_SOURCE_SHA
+CODEX_COMPLETION_MARKER         # absolute marker path, or empty
 CUDA_VISIBLE_DEVICES            # only when --gpus was supplied
 ```
 
@@ -568,24 +602,44 @@ completed outputs, and support resume by missing group/shard when practical.
 The optional completion marker is relative to the frozen worktree, must be
 absent before launch and remain absent through bootstrap, must not traverse a
 symlink parent, and must finish as a regular non-symlink file. It is checked in
-addition to the process exit code.
+addition to the process exit code. Without a marker, at least one regular file
+must be created under `CODEX_RESULTS_DIR` or `CODEX_CHECKPOINTS_DIR`; otherwise a
+zero exit remains incomplete.
 
 Job states are `STARTING`, `BOOTSTRAPPING`, `RUNNING`, and `STOP_REQUESTED`
 while active; `SUCCEEDED`, `FAILED`, `INCOMPLETE`, `SOURCE_DIRTY`, `STOPPED`, or `ORPHANED`
 when terminal. Exit code zero without newly created completion evidence is
 `INCOMPLETE`, not success. A command that moves `HEAD` or changes tracked files
-relative to the recorded source SHA is `SOURCE_DIRTY`; untracked worktree
-artifacts are recorded in the manifest even when the run otherwise succeeds.
+relative to the recorded source SHA is `SOURCE_DIRTY`. Every terminal run seals
+an `artifacts.manifest.json` containing result/checkpoint roles, sizes, and
+SHA-256 hashes. Report/full export refuses if those artifacts later change.
+The runner terminates ordinary descendants left in the launched process group
+before sealing. This is an operational guard for normal research commands, not
+a hostile-process sandbox: a deliberately daemonized `setsid`/double-fork child
+under the same Unix account can escape that group and must be prevented with a
+server-level cgroup/scheduler policy when adversarial isolation matters.
 
 ### Read-only interpretation
 
-After a job is terminal, `SPC r j i` starts a separate Codex process with
-read-only sandboxing and no approvals. It is required to inspect the manifest,
-exit status, completion marker, expected groups/rows/shards, malformed or
-zero-byte artifacts, metrics and uncertainty, anomalies, and supported versus
-unsupported conclusions. A JSON Schema constrains the final result; the runner
-also renders it to `analysis.md`. `SPC r j r` displays that Markdown report.
-Interpretation cannot repair, relaunch, stop, or delete the run.
+After a job is terminal, `SPC r j i` starts two separate Codex processes with
+read-only sandboxing and no approvals. The independent audit first traces the
+actual config/data/split/implementation/model/decoding/metric path and classifies
+the run as invalid, incomplete, or auditable. Interpretation must read that
+audit, then classifies evidence as invalid, incomplete, valid negative, mixed,
+or positive and reports uncertainty, alternatives, decisive follow-ups, future
+directions, reusable contributions, and the stopping-criterion assessment.
+Separate JSON Schemas constrain both results; the runner renders `audit.md` and
+`analysis.md`. `SPC r j r` displays the latter. Neither pass can repair,
+relaunch, stop, or delete the run.
+
+`SPC r j p` downloads a report profile containing provenance, status,
+environment, logs, audit/analysis, figures/tables, and bounded report-like result
+files. `SPC r j P` is the explicit full results/checkpoints transfer. Modern
+runs verify every selected report artifact; full pulls verify the complete
+sealed set. Pre-upgrade report pulls are metadata-only with an explicit warning,
+and a pre-upgrade full pull is marked as post-hoc sealing. Downloads are safely
+extracted inside the canonical local project, reuse an unchanged verified local
+snapshot, and choose a versioned sibling rather than overwrite a differing one.
 
 ### Persistence and reboot behavior
 
@@ -850,8 +904,10 @@ PYTHONDONTWRITEBYTECODE=1 \
 python3 -m py_compile \
   bin/codex-remote \
   bin/codex-remote-job \
+  bin/research-repo \
   tests/test_codex_remote.py \
-  tests/test_codex_remote_job.py
+  tests/test_codex_remote_job.py \
+  tests/test_research_repo.py
 
 git diff --check
 ```
@@ -864,7 +920,7 @@ emacs --batch -Q \
   -f ert-run-tests-batch-and-exit
 ```
 
-The Python suite currently contains 69 tests. It covers hidden dirty snapshots,
+The Python suite covers hidden dirty snapshots,
 visible Git-state preservation, file modes and symlinks, unsafe-file filtering,
 one-shot delta imports, incremental interactive checkpoint publication, history-
 rewrite rejection, commit-preserving pulls, repeated pulls, unrelated-untracked-file preservation,
@@ -875,8 +931,11 @@ chain publication, trusted live job-request/response brokering, unchanged-input
 job launches, one-shot nonblocking job requests, frozen-worktree bootstrap and
 preflight tests, source-integrity checks, run manifests and state transitions,
 cancellation and recovery, terminal-job configuration and log following,
-read-only structured analysis, global `AGENTS.md` managed-block replacement, and
-the Doom command-construction/status helpers.
+two-pass implementation/method auditing and structured interpretation, sealed
+artifact inventories and verified report/full exports, safe local extraction,
+research-repository initialization and code-only review bundles, global
+`AGENTS.md` managed-block replacement, and the Doom command-construction/status
+helpers.
 
 A real acceptance test still requires the actual SSH alias, authenticated server,
 kitty, tmux, and Codex account. For an interactive smoke test, start from a
@@ -895,13 +954,17 @@ The feature is isolated to:
 
 - `bin/codex-remote`
 - `bin/codex-remote-job`
+- `bin/research-repo`
 - `lisp/codex-remote.el`
+- `lisp/remote-dev.el`
 - `templates/codex/global-AGENTS.md`
 - `templates/codex/research-AGENTS.md`
+- `templates/research/`
 - the `load!`, keybindings, and popup rule added to `config.el`
-- tests and this documentation
+- `RESEARCH-WORKFLOW-REDESIGN.md`, tests, and this documentation
 
-Reverting the supplied patch removes the feature without changing
-`lisp/remote-dev.el` or any preexisting remote binding. Remote task state is not
+Reverting the supplied patch removes the feature. It also reverts the new rsync
+safety defaults in `lisp/remote-dev.el`; the existing meanings of `SPC r s`,
+`SPC r r`, and `SPC r R` are otherwise preserved. Remote task state is not
 automatically deleted when code is reverted; archive or discard active tasks
 first, or retain the state directories for manual recovery.
