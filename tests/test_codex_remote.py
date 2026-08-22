@@ -11,6 +11,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tarfile
 import tempfile
 import threading
 import time
@@ -831,6 +832,55 @@ class LiveCheckpointTests(RepositoryTestCase):
         self.assertEqual(result["action"], "refresh")
         self.assertFalse(response_file.exists())
 
+    def test_job_control_request_waits_for_trusted_broker_response(self) -> None:
+        request_file = self.root / cr.JOB_CONTROL_REQUEST_RELATIVE
+        response_file = self.base / "trusted-state" / cr.JOB_CONTROL_RESPONSE_RELATIVE
+
+        def broker() -> None:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not request_file.exists():
+                time.sleep(0.01)
+            self.assertTrue(request_file.exists())
+            request = cr.read_json(request_file)
+            assert request is not None
+            self.assertEqual(request["action"], "status")
+            self.assertEqual(request["run_id"], "run-1")
+            request_file.unlink()
+            response_for_nonce = response_file.with_name(
+                f"{response_file.name}.{request['request_nonce']}"
+            )
+            cr.atomic_write_json(
+                response_for_nonce,
+                {
+                    "ok": True,
+                    "request_nonce": request["request_nonce"],
+                    "job": {"run_id": "run-1", "state": "SUCCEEDED"},
+                },
+            )
+
+        worker = threading.Thread(target=broker)
+        worker.start()
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_JOB_CONTROL_REQUEST_PATH": str(request_file),
+                    "CODEX_JOB_CONTROL_RESPONSE_PATH": str(response_file),
+                },
+            ):
+                result = cr.request_job_control_file(
+                    request_file,
+                    response_file,
+                    action="status",
+                    run_id="run-1",
+                    wait_seconds=3,
+                )
+        finally:
+            worker.join(timeout=3)
+        self.assertEqual(result["job"]["state"], "SUCCEEDED")
+        self.assertEqual(list(response_file.parent.glob(f"{response_file.name}.*")), [])
+        self.assertEqual(cr.git_status_porcelain(self.root), "")
+
     def test_commit_request_waits_for_trusted_broker_response(self) -> None:
         request_file = self.root / cr.COMMIT_REQUEST_RELATIVE
         response_file = self.root / cr.COMMIT_RESPONSE_RELATIVE
@@ -991,6 +1041,23 @@ class LiveCheckpointTests(RepositoryTestCase):
             assert record is not None
             self.assertEqual(record["run_id"], "run-baseline")
 
+    def test_interactive_job_launch_requires_configured_preflight_test(self) -> None:
+        home = self.base / "job-no-test-home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths, task, _worktree = self.make_interactive_server_task(home)
+            task["test_cmd"] = ""
+            cr.save_server_task(paths, task)
+            with mock.patch.object(cr, "start_frozen_job") as launch, \
+                 self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.server_request_job(
+                    str(task["project_id"]),
+                    str(task["task_id"]),
+                    {"name": "unsafe", "command": ["python", "train.py"]},
+                )
+        self.assertEqual(caught.exception.code, "JOB_PREFLIGHT_REQUIRED")
+        launch.assert_not_called()
+
 
 
 class ServerStartTests(RepositoryTestCase):
@@ -1129,6 +1196,11 @@ class ServerStartTests(RepositoryTestCase):
             jobctl = Path(task["jobctl_path"]).read_text(encoding="utf-8")
             self.assertIn("--response-file", jobctl)
             self.assertIn("--wait-seconds 900", jobctl)
+            self.assertIn("_job-control", jobctl)
+            self.assertNotIn("_server-job", jobctl)
+            self.assertIn(cr.JOB_CONTROL_REQUEST_RELATIVE, jobctl)
+            self.assertIn(cr.JOB_CONTROL_RESPONSE_RELATIVE, jobctl)
+            command("sh", "-n", task["jobctl_path"])
             commitctl = Path(task["commitctl_path"]).read_text(encoding="utf-8")
             self.assertIn("_commit-request", commitctl)
             self.assertIn("--wait-seconds 900", commitctl)
@@ -1662,6 +1734,144 @@ class ExperimentJobTests(RepositoryTestCase):
         self.assertEqual(caught.exception.code, "JOB_NOT_AUTHORIZED")
         self.assertFalse(request_path.exists())
 
+    def test_orphaned_job_is_cleaned_and_sealed(self) -> None:
+        home = self.base / "orphan-job-home"
+        home.mkdir()
+        project_id = "orphan-job-project"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            state_dir = paths["jobs_state"] / "run-orphan"
+            (state_dir / "results").mkdir(parents=True)
+            (state_dir / "checkpoints").mkdir()
+            (state_dir / "results/partial.json").write_text("{}\n", encoding="utf-8")
+            job = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "run_id": "run-orphan",
+                "name": "orphan",
+                "state": "RUNNING",
+                "created_at": cr.utc_now(),
+                "state_dir": str(state_dir),
+                "worktree": str(self.root),
+                "results_dir": str(state_dir / "results"),
+                "checkpoints_dir": str(state_dir / "checkpoints"),
+                "source_sha": git(self.root, "rev-parse", "HEAD").stdout.strip(),
+                "tools": {"tmux": "/bin/false"},
+                "data_links": [],
+                "data_links_active": False,
+            }
+            cr.save_server_job(paths, job)
+            status = cr.server_job_status(project_id, "run-orphan")["job"]
+        self.assertEqual(status["state"], "ORPHANED")
+        self.assertTrue((state_dir / "artifacts.manifest.json").is_file())
+        self.assertIn("results/partial.json", status["artifact_evidence"])
+
+    def test_stop_before_child_process_is_cleaned_and_sealed(self) -> None:
+        home = self.base / "early-stop-home"
+        home.mkdir()
+        project_id = "early-stop-project"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            state_dir = paths["jobs_state"] / "run-stop"
+            (state_dir / "results").mkdir(parents=True)
+            (state_dir / "checkpoints").mkdir()
+            job = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "run_id": "run-stop",
+                "name": "stop",
+                "state": "STARTING",
+                "created_at": cr.utc_now(),
+                "state_dir": str(state_dir),
+                "worktree": str(self.root),
+                "results_dir": str(state_dir / "results"),
+                "checkpoints_dir": str(state_dir / "checkpoints"),
+                "source_sha": git(self.root, "rev-parse", "HEAD").stdout.strip(),
+                "tmux_session": "run-stop",
+                "tools": {"tmux": "/bin/true"},
+                "data_links": [],
+                "data_links_active": False,
+            }
+            cr.save_server_job(paths, job)
+            with mock.patch.object(cr, "job_with_runtime_status", return_value=job):
+                stopped = cr.server_job_stop(project_id, "run-stop")["job"]
+        self.assertEqual(stopped["state"], "STOPPED")
+        self.assertTrue((state_dir / "artifacts.manifest.json").is_file())
+
+    def test_stop_escalates_for_sigterm_ignoring_process(self) -> None:
+        home = self.base / "term-ignore-home"
+        home.mkdir()
+        process = subprocess.Popen(
+            [
+                cr.sys.executable,
+                "-c",
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print('ready', flush=True); time.sleep(60)",
+            ],
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdout is not None
+        self.assertEqual(process.stdout.readline().strip(), "ready")
+        project_id = "term-ignore-project"
+        try:
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                paths = cr.ensure_server_layout(project_id)
+                state_dir = paths["jobs_state"] / "run-term-ignore"
+                (state_dir / "results").mkdir(parents=True)
+                (state_dir / "checkpoints").mkdir()
+                job = {
+                    "schema_version": cr.SCHEMA_VERSION,
+                    "project_id": project_id,
+                    "run_id": "run-term-ignore",
+                    "name": "term ignore",
+                    "state": "RUNNING",
+                    "created_at": cr.utc_now(),
+                    "state_dir": str(state_dir),
+                    "worktree": str(self.root),
+                    "results_dir": str(state_dir / "results"),
+                    "checkpoints_dir": str(state_dir / "checkpoints"),
+                    "source_sha": git(self.root, "rev-parse", "HEAD").stdout.strip(),
+                    "process_pid": process.pid,
+                    "process_start_ticks": cr.process_start_ticks(process.pid),
+                    "server_boot_id": cr.linux_boot_id(),
+                    "tools": {"tmux": "/bin/true"},
+                    "data_links": [],
+                    "data_links_active": False,
+                }
+                cr.save_server_job(paths, job)
+                with mock.patch.object(cr, "job_with_runtime_status", return_value=job):
+                    stopped = cr.server_job_stop(project_id, "run-term-ignore")["job"]
+            self.assertTrue(stopped["stop_requested"])
+            self.assertTrue(stopped["stop_escalated"])
+            self.assertEqual(stopped["stop_signal"], "SIGKILL")
+            self.assertEqual(process.wait(timeout=3), -signal.SIGKILL)
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=3)
+
+    def test_managed_state_file_helpers_reject_symlinks(self) -> None:
+        target = self.base / "state-target"
+        target.write_text("do not overwrite\n", encoding="utf-8")
+        link = self.base / "managed.log"
+        link.symlink_to(target)
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.open_regular_nofollow(link, append=True)
+        self.assertEqual(caught.exception.code, "UNSAFE_STATE_FILE")
+        with self.assertRaises(cr.CodexRemoteError):
+            cr.tail_file(link, 20)
+        self.assertEqual(target.read_text(encoding="utf-8"), "do not overwrite\n")
+
+        hardlink = self.base / "managed-hardlink.log"
+        os.link(target, hardlink)
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.open_regular_nofollow(hardlink, truncate=True)
+        self.assertEqual(caught.exception.code, "UNSAFE_STATE_FILE")
+        self.assertEqual(target.read_text(encoding="utf-8"), "do not overwrite\n")
+
     def test_frozen_job_records_manifest_and_runs_independently(self) -> None:
         home = self.base / "job-home"
         home.mkdir()
@@ -1737,6 +1947,133 @@ class ExperimentJobTests(RepositoryTestCase):
             )
             self.assertEqual(result["run"], finished["run_id"])
             self.assertEqual(result["source"], source_sha)
+            artifact_manifest = cr.read_json(state_dir / "artifacts.manifest.json")
+            assert artifact_manifest is not None
+            self.assertEqual(
+                {item["path"] for item in artifact_manifest["artifacts"]},
+                {"results/result.json", "checkpoints/checkpoint.txt"},
+            )
+            report_export = cr.server_job_export(project_id, job["run_id"], "report")
+            full_export = cr.server_job_export(project_id, job["run_id"], "full")
+            with tarfile.open(report_export["archive"], "r:gz") as archive:
+                report_names = set(archive.getnames())
+            with tarfile.open(full_export["archive"], "r:gz") as archive:
+                full_names = set(archive.getnames())
+            prefix = finished["run_id"]
+            self.assertIn(f"{prefix}/results/result.json", report_names)
+            self.assertNotIn(f"{prefix}/checkpoints/checkpoint.txt", report_names)
+            self.assertIn(f"{prefix}/checkpoints/checkpoint.txt", full_names)
+
+            (state_dir / "results/result.json").write_text("tampered\n", encoding="utf-8")
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.server_job_export(project_id, job["run_id"], "report")
+            self.assertEqual(caught.exception.code, "ARTIFACT_MANIFEST_MISMATCH")
+            summarized = cr.server_job_summarize(project_id, job["run_id"])
+            self.assertEqual(summarized["analysis"]["state"], "STARTING")
+
+    def test_zero_exit_without_marker_or_artifact_is_incomplete(self) -> None:
+        home = self.base / "no-evidence-home"
+        home.mkdir()
+        project_id = "no-evidence-project"
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            source_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+            git(self.root, "push", str(paths["broker"]), f"HEAD:refs/source/{source_sha}")
+            task = {
+                "project_id": project_id,
+                "project_name": "no-evidence",
+                "task_id": "task-source",
+                "input_sha": source_sha,
+                "result_sha": source_sha,
+                "data_links": [],
+                "tools": {
+                    "bash": shutil.which("bash"),
+                    "git": shutil.which("git"),
+                    "tmux": shutil.which("true"),
+                    "codex": shutil.which("true"),
+                },
+            }
+            job = cr.start_frozen_job(
+                paths,
+                task,
+                {"name": "no evidence", "command": [cr.sys.executable, "-c", "pass"]},
+            )
+            try:
+                returncode = cr.server_job_run(project_id, job["run_id"])
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+            finished = cr.load_server_job(paths, job["run_id"])
+            assert finished is not None
+        self.assertEqual(returncode, 1)
+        self.assertEqual(finished["state"], "INCOMPLETE")
+        self.assertFalse(finished["completion_marker_present"])
+        self.assertFalse(finished["artifact_evidence_present"])
+        self.assertTrue(Path(finished["state_dir"], "artifacts.manifest.json").is_file())
+
+    def test_missing_configured_marker_and_background_children_cannot_succeed(self) -> None:
+        def run_case(label: str, script: str) -> tuple[int, dict[str, object]]:
+            home = self.base / f"{label}-home"
+            home.mkdir()
+            project_id = f"{label}-project"
+            old_term = signal.getsignal(signal.SIGTERM)
+            old_int = signal.getsignal(signal.SIGINT)
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                paths = cr.ensure_server_layout(project_id)
+                source_sha = git(self.root, "rev-parse", "HEAD").stdout.strip()
+                git(self.root, "push", str(paths["broker"]), f"HEAD:refs/source/{source_sha}")
+                task = {
+                    "project_id": project_id,
+                    "project_name": label,
+                    "task_id": "task-source",
+                    "input_sha": source_sha,
+                    "result_sha": source_sha,
+                    "data_links": [],
+                    "tools": {
+                        "bash": shutil.which("bash"),
+                        "git": shutil.which("git"),
+                        "tmux": shutil.which("true"),
+                        "codex": shutil.which("true"),
+                    },
+                }
+                job = cr.start_frozen_job(
+                    paths,
+                    task,
+                    {
+                        "name": label,
+                        "command": [cr.sys.executable, "-c", script],
+                        "completion_marker": "COMPLETE",
+                    },
+                )
+                try:
+                    returncode = cr.server_job_run(project_id, job["run_id"])
+                finally:
+                    signal.signal(signal.SIGTERM, old_term)
+                    signal.signal(signal.SIGINT, old_int)
+                finished = cr.load_server_job(paths, job["run_id"])
+                assert finished is not None
+                return returncode, finished
+
+        missing_rc, missing = run_case(
+            "partial-without-marker",
+            "from pathlib import Path; import os; "
+            "Path(os.environ['CODEX_RESULTS_DIR'], 'partial.json').write_text('{}')",
+        )
+        self.assertEqual(missing_rc, 1)
+        self.assertEqual(missing["state"], "INCOMPLETE")
+        self.assertTrue(missing["artifact_evidence_present"])
+
+        background_rc, background = run_case(
+            "background-writer",
+            "from pathlib import Path; import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            "Path('COMPLETE').write_text('done')",
+        )
+        self.assertEqual(background_rc, 1)
+        self.assertEqual(background["state"], "FAILED")
+        self.assertTrue(background["background_process_detected"])
 
     def test_frozen_job_bootstraps_its_fresh_worktree_before_command(self) -> None:
         home = self.base / "bootstrap-job-home"
@@ -2078,6 +2415,463 @@ class ExperimentJobTests(RepositoryTestCase):
         self.assertIn("--output-schema", command_value)
         self.assertIn("--output-last-message", command_value)
         self.assertEqual(command_value[-1], "-")
+        audit_command = cr.job_audit_command(job)
+        self.assertEqual(audit_command[audit_command.index("--sandbox") + 1], "read-only")
+        self.assertTrue(any(value.endswith("audit-schema.json") for value in audit_command))
+
+    def test_blocking_audit_cannot_be_overruled_by_positive_analysis(self) -> None:
+        audit = {
+            "run_integrity": "invalid",
+            "implementation_matches_claim": "no",
+            "blocking_defects": ["the configured model was never invoked"],
+        }
+        analysis = {"run_complete": True, "evidence_status": "positive"}
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.validate_job_review_consistency(audit, analysis)
+        self.assertEqual(caught.exception.code, "JOB_REVIEW_INCONSISTENT")
+
+        incomplete = {
+            "run_integrity": "incomplete",
+            "implementation_matches_claim": "uncertain",
+            "blocking_defects": [],
+        }
+        cr.validate_job_review_consistency(
+            incomplete,
+            {"run_complete": False, "evidence_status": "incomplete"},
+        )
+
+    def test_weak_analysis_requires_actionable_continuation_or_justified_stop(self) -> None:
+        base = {
+            "evidence_status": "valid_negative",
+            "stopping_assessment": "One run does not meet a scientific kill criterion.",
+            "stop_recommended": False,
+            "stopping_criterion_met": False,
+            "alternative_explanations": ["The representation may be mismatched."],
+            "decisive_followups": [],
+            "future_directions": [],
+            "salvageable_contributions": [],
+        }
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.validate_job_analysis_actionability(base)
+        self.assertEqual(caught.exception.code, "JOB_ANALYSIS_NOT_ACTIONABLE")
+
+        bounded = dict(base)
+        bounded["decisive_followups"] = ["Run the predeclared 100-example control."]
+        cr.validate_job_analysis_actionability(bounded)
+
+        stopped = dict(base)
+        stopped["stop_recommended"] = True
+        stopped["stopping_criterion_met"] = True
+        stopped["stopping_assessment"] = (
+            "The preregistered kill criterion was met on both datasets; stop because "
+            "the calibrated baseline is within the declared equivalence margin."
+        )
+        cr.validate_job_analysis_actionability(stopped)
+
+        for misleading in (
+            "The stopping criterion was not met, so this run alone cannot end the direction.",
+            "Do not stop because the evidence is incomplete and no kill criterion was tested.",
+        ):
+            negated = dict(base)
+            negated["stopping_assessment"] = misleading
+            with self.assertRaises(cr.CodexRemoteError):
+                cr.validate_job_analysis_actionability(negated)
+
+    def test_negative_analysis_requires_alternative_explanation(self) -> None:
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.validate_job_analysis_actionability(
+                {
+                    "evidence_status": "mixed",
+                    "stopping_assessment": "Continue until the kill criterion is evaluated.",
+                    "stop_recommended": False,
+                    "stopping_criterion_met": False,
+                    "alternative_explanations": [],
+                    "decisive_followups": ["Run the leakage control."],
+                    "future_directions": [],
+                    "salvageable_contributions": [],
+                }
+            )
+        self.assertEqual(caught.exception.code, "JOB_ANALYSIS_NOT_ACTIONABLE")
+
+    def test_invalid_analysis_cannot_recommend_scientific_stop(self) -> None:
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.validate_job_analysis_actionability(
+                {
+                    "evidence_status": "invalid",
+                    "stopping_assessment": "A named criterion appears met in invalid output.",
+                    "stop_recommended": True,
+                    "stopping_criterion_met": True,
+                    "alternative_explanations": [],
+                    "decisive_followups": [],
+                    "future_directions": [],
+                    "salvageable_contributions": [],
+                }
+            )
+        self.assertEqual(caught.exception.code, "JOB_ANALYSIS_NOT_ACTIONABLE")
+
+    def test_analysis_launcher_refuses_planted_runner_helper_symlink(self) -> None:
+        home = self.base / "helper-symlink-home"
+        home.mkdir()
+        project_id = "helper-symlink-project"
+        target = home / "important-user-file"
+        target.write_text("preserve me\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            state_dir = paths["jobs_state"] / "run-helper-link"
+            (state_dir / "results").mkdir(parents=True)
+            (state_dir / "checkpoints").mkdir()
+            (state_dir / "codex-job-runner.py").symlink_to(target)
+            job = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "run_id": "run-helper-link",
+                "name": "helper link",
+                "state": "SUCCEEDED",
+                "created_at": cr.utc_now(),
+                "finished_at": cr.utc_now(),
+                "state_dir": str(state_dir),
+                "worktree": str(self.root),
+                "results_dir": str(state_dir / "results"),
+                "checkpoints_dir": str(state_dir / "checkpoints"),
+                "source_sha": git(self.root, "rev-parse", "HEAD").stdout.strip(),
+                "tools": {"tmux": "/bin/true", "bash": "/bin/sh"},
+                "data_links": [],
+            }
+            cr.seal_job_artifacts(job)
+            cr.save_server_job(paths, job)
+            with self.assertRaises(cr.CodexRemoteError) as caught:
+                cr.server_job_summarize(project_id, "run-helper-link")
+        self.assertEqual(caught.exception.code, "UNSAFE_STATE_FILE")
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserve me\n")
+
+    def test_local_export_extraction_rejects_links_and_traversal(self) -> None:
+        safe_archive = self.base / "safe-export.tar.gz"
+        payload = b"report\n"
+        with tarfile.open(safe_archive, "w:gz") as archive:
+            info = tarfile.TarInfo("run-safe/analysis.md")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        destination = self.base / "pulled" / "run-safe"
+        count = cr.extract_job_export(
+            safe_archive, destination, "run-safe", max_unpacked_bytes=1024
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual((destination / "analysis.md").read_bytes(), payload)
+
+        unsafe_archive = self.base / "unsafe-export.tar.gz"
+        with tarfile.open(unsafe_archive, "w:gz") as archive:
+            info = tarfile.TarInfo("run-safe/link")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "../../outside"
+            archive.addfile(info)
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.extract_job_export(
+                unsafe_archive,
+                self.base / "pulled" / "unsafe",
+                "run-safe",
+                max_unpacked_bytes=1024,
+            )
+        self.assertEqual(caught.exception.code, "UNSAFE_EXPORT_ARCHIVE")
+
+    def test_pulled_export_validates_selection_and_detects_local_edits(self) -> None:
+        destination = self.base / "validated-pull"
+        destination.mkdir()
+        (destination / "analysis.md").write_text("analysis\n", encoding="utf-8")
+        selection_base = {
+            "schema_version": 1,
+            "project_id": "project",
+            "run_id": "run-safe",
+            "profile": "report",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "source_sha": "a" * 40,
+            "files": [
+                {
+                    "path": "analysis.md",
+                    "size": (destination / "analysis.md").stat().st_size,
+                    "sha256": cr.sha256_file(destination / "analysis.md"),
+                }
+            ],
+            "omitted": [],
+            "selected_artifacts_verified": True,
+            "complete_artifact_set_verified": False,
+            "sealed_post_hoc": False,
+            "provenance_warning": "",
+        }
+        snapshot = cr.hashlib.sha256(
+            cr.json.dumps(selection_base, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        cr.atomic_write_json(
+            destination / "export-selection.json",
+            {**selection_base, "snapshot_sha256": snapshot},
+        )
+        cr.validate_pulled_export(
+            destination, "run-safe", "report", snapshot, allow_pull_marker=False
+        )
+        (destination / "analysis.md").write_text("edited\n", encoding="utf-8")
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.validate_pulled_export(
+                destination, "run-safe", "report", snapshot, allow_pull_marker=False
+            )
+        self.assertEqual(caught.exception.code, "EXPORT_HASH_MISMATCH")
+
+    def test_legacy_report_is_metadata_only_and_full_export_is_post_hoc(self) -> None:
+        home = self.base / "legacy-export-home"
+        home.mkdir()
+        project_id = "legacy-export-project"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            state_dir = paths["jobs_state"] / "run-legacy"
+            (state_dir / "results").mkdir(parents=True)
+            (state_dir / "checkpoints").mkdir()
+            (state_dir / "results/legacy.json").write_text("{}\n", encoding="utf-8")
+            job = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "run_id": "run-legacy",
+                "name": "legacy",
+                "state": "SUCCEEDED",
+                "created_at": cr.utc_now(),
+                "finished_at": cr.utc_now(),
+                "state_dir": str(state_dir),
+                "worktree": str(self.root),
+                "results_dir": str(state_dir / "results"),
+                "checkpoints_dir": str(state_dir / "checkpoints"),
+                "source_sha": git(self.root, "rev-parse", "HEAD").stdout.strip(),
+                "tools": {},
+            }
+            cr.save_server_job(paths, job)
+            report = cr.server_job_export(project_id, "run-legacy", "report")
+            with tarfile.open(report["archive"], "r:gz") as handle:
+                report_names = set(handle.getnames())
+            self.assertNotIn("run-legacy/results/legacy.json", report_names)
+            self.assertFalse(report["selected_artifacts_verified"])
+            self.assertIn("metadata-only", report["provenance_warning"])
+
+            full = cr.server_job_export(project_id, "run-legacy", "full")
+            with tarfile.open(full["archive"], "r:gz") as handle:
+                full_names = set(handle.getnames())
+            self.assertIn("run-legacy/results/legacy.json", full_names)
+            self.assertTrue(full["complete_artifact_set_verified"])
+            self.assertTrue(full["sealed_post_hoc"])
+
+    def test_job_artifact_manifest_rejects_symlinks(self) -> None:
+        state_dir = self.base / "symlink-artifact"
+        results = state_dir / "results"
+        checkpoints = state_dir / "checkpoints"
+        results.mkdir(parents=True)
+        checkpoints.mkdir()
+        (results / "outside").symlink_to(self.base)
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.build_job_artifact_manifest(
+                {
+                    "state_dir": str(state_dir),
+                    "results_dir": str(results),
+                    "checkpoints_dir": str(checkpoints),
+                }
+            )
+        self.assertEqual(caught.exception.code, "UNSAFE_JOB_ARTIFACT")
+        (results / "outside").unlink()
+        results.rmdir()
+        results.symlink_to(self.base, target_is_directory=True)
+        with self.assertRaises(cr.CodexRemoteError) as caught:
+            cr.build_job_artifact_manifest(
+                {
+                    "state_dir": str(state_dir),
+                    "results_dir": str(results),
+                    "checkpoints_dir": str(checkpoints),
+                }
+            )
+        self.assertEqual(caught.exception.code, "UNSAFE_JOB_ARTIFACT")
+
+    def test_analysis_runs_independent_audit_before_interpretation(self) -> None:
+        home = self.base / "two-pass-analysis-home"
+        home.mkdir()
+        project_id = "two-pass-analysis-project"
+        audit = {
+            "run_integrity": "auditable",
+            "implementation_matches_claim": "yes",
+            "summary": "The invoked implementation and artifacts match the contract.",
+            "evidence_manifest_path": "results/evidence-manifest.json",
+            "identity_and_split_evidence_verified": True,
+            "audited_paths": ["train.py", "results/metrics.json"],
+            "manifest_checks": ["source and command verified"],
+            "data_and_split_checks": ["patient groups are disjoint"],
+            "implementation_checks": ["configured model is invoked"],
+            "metric_and_statistics_checks": ["patient is the resampling unit"],
+            "leakage_or_contamination_risks": [],
+            "anomalies": [],
+            "blocking_defects": [],
+            "repair_actions": [],
+            "residual_risks": ["external dataset provenance was not re-downloaded"],
+        }
+        analysis = {
+            "run_complete": True,
+            "evidence_status": "valid_negative",
+            "claim_tested": "The proposed method beats calibrated late fusion.",
+            "summary": "The run is a valid negative result for this configuration.",
+            "source_and_command": "source abc; python train.py",
+            "audit_disposition": "Auditable with one residual provenance risk.",
+            "coverage_checks": ["all planned seeds present"],
+            "headline_results": ["difference from baseline is near zero"],
+            "effect_and_uncertainty": ["paired interval includes zero"],
+            "anomalies": [],
+            "supported_conclusions": ["no advantage in this setting"],
+            "unsupported_conclusions": ["the entire direction is nonviable"],
+            "alternative_explanations": ["conditional independence already holds"],
+            "decisive_followups": ["run the preregistered dependence stress test"],
+            "future_directions": ["retain the version-staleness benchmark"],
+            "salvageable_contributions": ["calibrated negative-result benchmark"],
+            "stop_recommended": False,
+            "stopping_criterion_met": False,
+            "stopping_assessment": "The global kill criterion is not yet met.",
+            "recommended_actions": ["perform one bounded decisive follow-up"],
+        }
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            state_dir = paths["jobs_state"] / "run-two-pass"
+            state_dir.mkdir(parents=True)
+            (state_dir / "results").mkdir()
+            (state_dir / "checkpoints").mkdir()
+            fake_codex = home / "codex"
+            payloads = {"audit.json": audit, "analysis.json": analysis}
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "sys.stdin.read()\n"
+                f"payloads = {payloads!r}\n"
+                "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+                "output.write_text(json.dumps(payloads[output.name]), encoding='utf-8')\n"
+                "print(json.dumps({'type': 'turn.completed'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            job = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "run_id": "run-two-pass",
+                "name": "two-pass",
+                "state": "SUCCEEDED",
+                "created_at": cr.utc_now(),
+                "state_dir": str(state_dir),
+                "worktree": str(self.root),
+                "results_dir": str(state_dir / "results"),
+                "checkpoints_dir": str(state_dir / "checkpoints"),
+                "source_sha": git(self.root, "rev-parse", "HEAD").stdout.strip(),
+                "command": ["true"],
+                "tools": {"codex": str(fake_codex)},
+            }
+            cr.atomic_write_json(
+                state_dir / "results/evidence-manifest.json",
+                {
+                    "dataset_manifest_sha256": "d" * 64,
+                    "split_manifest_sha256": "5" * 64,
+                    "membership_evidence_sha256": "e" * 64,
+                    "expected_counts": {"test": 10},
+                    "observed_counts": {"test": 10},
+                },
+            )
+            cr.seal_job_artifacts(job)
+            cr.save_server_job(paths, job)
+            returncode = cr.server_job_analyze(project_id, "run-two-pass")
+            finished = cr.load_server_job(paths, "run-two-pass")
+            assert finished is not None
+        self.assertEqual(returncode, 0)
+        self.assertEqual(finished["analysis"]["state"], "SUCCEEDED")
+        self.assertIn("Implementation matches claim:** yes", (state_dir / "audit.md").read_text())
+        rendered = (state_dir / "analysis.md").read_text()
+        self.assertIn("Evidence status:** valid_negative", rendered)
+        self.assertIn("Future directions", rendered)
+
+    def test_missing_identity_evidence_is_downgraded_but_still_interpreted(self) -> None:
+        home = self.base / "incomplete-analysis-home"
+        home.mkdir()
+        project_id = "incomplete-analysis-project"
+        audit = {
+            "run_integrity": "auditable",
+            "implementation_matches_claim": "yes",
+            "summary": "The implementation appears to match.",
+            "evidence_manifest_path": "results/evidence-manifest.json",
+            "identity_and_split_evidence_verified": True,
+            "audited_paths": [],
+            "manifest_checks": [],
+            "data_and_split_checks": [],
+            "implementation_checks": [],
+            "metric_and_statistics_checks": [],
+            "leakage_or_contamination_risks": [],
+            "anomalies": [],
+            "blocking_defects": [],
+            "repair_actions": [],
+            "residual_risks": [],
+        }
+        analysis = {
+            "run_complete": False,
+            "evidence_status": "incomplete",
+            "claim_tested": "candidate claim",
+            "summary": "Identity evidence is missing; the direction is not rejected.",
+            "source_and_command": "sealed source",
+            "audit_disposition": "incomplete",
+            "coverage_checks": [],
+            "headline_results": [],
+            "effect_and_uncertainty": [],
+            "anomalies": [],
+            "supported_conclusions": [],
+            "unsupported_conclusions": ["the direction is nonviable"],
+            "alternative_explanations": ["the output contract was miswritten"],
+            "decisive_followups": ["repair and smoke-test the evidence writer"],
+            "future_directions": ["retain the scientific hypothesis"],
+            "salvageable_contributions": ["the evaluator implementation"],
+            "stop_recommended": False,
+            "stopping_criterion_met": False,
+            "stopping_assessment": "No scientific kill criterion was evaluated.",
+            "recommended_actions": ["run one bounded repaired experiment"],
+        }
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            paths = cr.ensure_server_layout(project_id)
+            state_dir = paths["jobs_state"] / "run-incomplete"
+            (state_dir / "results").mkdir(parents=True)
+            (state_dir / "checkpoints").mkdir()
+            fake_codex = home / "codex"
+            payloads = {"audit.json": audit, "analysis.json": analysis}
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "sys.stdin.read()\n"
+                f"payloads = {payloads!r}\n"
+                "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+                "output.write_text(json.dumps(payloads[output.name]), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            job = {
+                "schema_version": cr.SCHEMA_VERSION,
+                "project_id": project_id,
+                "run_id": "run-incomplete",
+                "name": "incomplete",
+                "state": "SUCCEEDED",
+                "created_at": cr.utc_now(),
+                "state_dir": str(state_dir),
+                "worktree": str(self.root),
+                "results_dir": str(state_dir / "results"),
+                "checkpoints_dir": str(state_dir / "checkpoints"),
+                "source_sha": git(self.root, "rev-parse", "HEAD").stdout.strip(),
+                "command": ["true"],
+                "tools": {"codex": str(fake_codex)},
+            }
+            cr.seal_job_artifacts(job)
+            cr.save_server_job(paths, job)
+            returncode = cr.server_job_analyze(project_id, "run-incomplete")
+            finished_audit = cr.read_json(state_dir / "audit.json")
+        self.assertEqual(returncode, 0)
+        assert finished_audit is not None
+        self.assertEqual(finished_audit["run_integrity"], "incomplete")
+        self.assertEqual(finished_audit["blocking_defects"], [])
+        self.assertTrue(
+            any(
+                "Mechanical identity-evidence gate failed" in item
+                for item in finished_audit["manifest_checks"]
+            )
+        )
+        self.assertIn("Future directions", (state_dir / "analysis.md").read_text())
 
     def test_failed_analysis_cannot_reuse_stale_structured_output(self) -> None:
         home = self.base / "analysis-home"
@@ -2087,6 +2881,8 @@ class ExperimentJobTests(RepositoryTestCase):
             paths = cr.ensure_server_layout(project_id)
             state_dir = paths["jobs_state"] / "run-analysis"
             state_dir.mkdir(parents=True)
+            (state_dir / "results").mkdir()
+            (state_dir / "checkpoints").mkdir()
             fake_codex = home / "codex"
             fake_codex.write_text(
                 "#!/bin/sh\ncat >/dev/null\nexit 0\n",
@@ -2121,6 +2917,7 @@ class ExperimentJobTests(RepositoryTestCase):
                 "command": ["true"],
                 "tools": {"codex": str(fake_codex)},
             }
+            cr.seal_job_artifacts(job)
             cr.save_server_job(paths, job)
             returncode = cr.server_job_analyze(project_id, "run-analysis")
             finished = cr.load_server_job(paths, "run-analysis")
@@ -2409,7 +3206,8 @@ class MiscellaneousTests(RepositoryTestCase):
     def test_status_reconciles_matching_local_task_state(self) -> None:
         local = {"task_id": "task-1", "state": "STARTING", "local_branch": "main"}
         task = {"task_id": "task-1", "state": "FAILED", "error": "codex failed"}
-        with mock.patch.object(cr, "atomic_write_json") as write:
+        with mock.patch.object(cr, "LOCAL_STATE_ROOT", self.base / "local-state"), \
+             mock.patch.object(cr, "atomic_write_json") as write:
             updated = cr.reconcile_local_status("project-1", task, local)
 
         assert updated is not None

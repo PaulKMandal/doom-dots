@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Initialize and review research repositories without third-party dependencies."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import subprocess
+import sys
+import tarfile
+
+
+TEMPLATE_VERSION = 1
+SOURCE_SUFFIXES = {
+    ".c", ".cc", ".cfg", ".clj", ".cpp", ".css", ".cu", ".cuh", ".el",
+    ".fish", ".go", ".h", ".hpp", ".html", ".ini", ".ipynb", ".java",
+    ".jl", ".js", ".json", ".jsx", ".kt", ".lua", ".md", ".nix", ".org",
+    ".pl", ".proto", ".py", ".r", ".rb", ".rs", ".scala", ".scss", ".sh",
+    ".sql", ".tex", ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
+}
+SOURCE_NAMES = {
+    "Dockerfile", "Justfile", "LICENSE", "Makefile", "README", "Snakefile",
+    "environment.yml", "flake.lock", "flake.nix", "pixi.lock", "requirements.txt",
+    "uv.lock",
+}
+EXCLUDED_PARTS = {
+    ".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".venv",
+    "__pycache__", "artifacts", "checkpoints", "data", "datasets", "mlruns",
+    "outputs", "reports", "results", "review-bundles", "runs", "wandb", "weights",
+}
+SECRET_NAMES = {".env", "credentials", "credentials.json", "secrets", "secrets.json"}
+
+
+class ResearchRepoError(RuntimeError):
+    pass
+
+
+def run(argv: list[str], *, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        argv,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        raise ResearchRepoError(
+            f"Command failed ({completed.returncode}): {' '.join(argv)}\n{completed.stderr}"
+        )
+    return completed
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def lisp_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def render_dir_locals(args: argparse.Namespace, root: Path) -> str:
+    data_links = "nil"
+    if args.data_link:
+        data_links = "(" + " ".join(lisp_string(item) for item in args.data_link) + ")"
+    excludes = (
+        '(".git/" ".venv/" "data/" "datasets/" "artifacts/" "runs/" '
+        '"results/" "outputs/" "checkpoints/" "weights/" "wandb/" "mlruns/")'
+    )
+    return (
+        "((nil . (\n"
+        f"         (my/remote-host . {lisp_string(args.remote_host)})\n"
+        f"         (my/remote-dir . {lisp_string(args.remote_dir)})\n"
+        f"         (my/remote-setup-cmd . {lisp_string(args.bootstrap_cmd)})\n"
+        f"         (my/remote-test-cmd . {lisp_string(args.test_cmd)})\n"
+        f"         (my/remote-smoke-cmd . {lisp_string(args.smoke_cmd)})\n"
+        f"         (my/remote-run-cmd . {lisp_string(args.run_cmd)})\n"
+        f"         (my/remote-sync-excludes . {excludes})\n"
+        f"         (my/codex-remote-bootstrap-cmd . {lisp_string(args.bootstrap_cmd)})\n"
+        f"         (my/codex-remote-test-cmd . {lisp_string(args.test_cmd)})\n"
+        f"         (my/codex-remote-data-links . {data_links})\n"
+        "         (my/codex-remote-reasoning-effort . \"xhigh\")\n"
+        "         (my/codex-remote-enable-search . t))))\n"
+    )
+
+
+def template_root() -> Path:
+    return Path(__file__).resolve().parent.parent / "templates" / "research"
+
+
+def template_payloads(template: str, replacements: dict[str, str]) -> dict[PurePosixPath, bytes]:
+    root = template_root()
+    payloads: dict[PurePosixPath, bytes] = {}
+    for lane in ("common", template):
+        lane_root = root / lane
+        if not lane_root.is_dir():
+            raise ResearchRepoError(f"Research template is missing: {lane_root}")
+        for source in sorted(lane_root.rglob("*")):
+            if not source.is_file():
+                continue
+            relative = PurePosixPath(source.relative_to(lane_root).as_posix())
+            text = source.read_text(encoding="utf-8")
+            for key, value in replacements.items():
+                text = text.replace("{{" + key + "}}", value)
+            payloads[relative] = text.encode("utf-8")
+    agents = root.parent / "codex" / "research-AGENTS.md"
+    payloads[PurePosixPath("AGENTS.md")] = agents.read_bytes()
+    return payloads
+
+
+def command_init(args: argparse.Namespace) -> dict[str, object]:
+    root = Path(args.project_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    project_name = args.project_name or root.name
+    if not args.remote_dir:
+        args.remote_dir = f"/home/rhel/Projects/{project_name}"
+    if not args.remote_dir.startswith("/") or args.remote_dir in {"/", "/home", "/home/rhel"}:
+        raise ResearchRepoError("--remote-dir must be a non-shallow absolute server path")
+    if not (root / ".git").exists():
+        if args.no_git_init:
+            raise ResearchRepoError("Target is not a Git repository")
+        run(["git", "init"], cwd=root)
+    replacements = {
+        "PROJECT_NAME": project_name,
+        "TEMPLATE": args.template,
+        "CREATED_DATE": dt.date.today().isoformat(),
+    }
+    payloads = template_payloads(args.template, replacements)
+    payloads[PurePosixPath(".dir-locals.el")] = render_dir_locals(args, root).encode("utf-8")
+    manifest = {
+        "schema_version": 1,
+        "template": args.template,
+        "template_version": TEMPLATE_VERSION,
+        "project_name": project_name,
+        "remote_host": args.remote_host,
+        "remote_dir": args.remote_dir,
+        "initialized_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+    }
+    payloads[PurePosixPath("research/scaffold.json")] = (
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    conflicts: list[str] = []
+    for relative, content in payloads.items():
+        target = root.joinpath(*relative.parts)
+        if target.exists() and (not target.is_file() or target.read_bytes() != content):
+            conflicts.append(relative.as_posix())
+    if conflicts:
+        raise ResearchRepoError(
+            "Refusing to overwrite existing files: " + ", ".join(conflicts)
+        )
+    created: list[str] = []
+    unchanged: list[str] = []
+    for relative, content in sorted(payloads.items(), key=lambda item: item[0].as_posix()):
+        target = root.joinpath(*relative.parts)
+        if target.exists():
+            unchanged.append(relative.as_posix())
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        created.append(relative.as_posix())
+    return {
+        "ok": True,
+        "command": "init",
+        "root": str(root),
+        "template": args.template,
+        "created": created,
+        "unchanged": unchanged,
+    }
+
+
+def command_doctor(args: argparse.Namespace) -> dict[str, object]:
+    root = Path(args.project_root).expanduser().resolve()
+    checks: list[dict[str, object]] = []
+    required = [
+        "AGENTS.md", ".dir-locals.el", "research/PROJECT.md", "research/CLAIMS.md",
+        "research/DECISIONS.md", "research/RUNS.md", "research/scaffold.json",
+        "experiments/specs/README.md",
+    ]
+    for relative in required:
+        checks.append({"check": relative, "ok": (root / relative).is_file()})
+    git_check = run(["git", "rev-parse", "--show-toplevel"], cwd=root, check=False)
+    checks.append({"check": "git_repository", "ok": git_check.returncode == 0})
+    test_check = run(["git", "status", "--short"], cwd=root, check=False)
+    checks.append({"check": "git_status_readable", "ok": test_check.returncode == 0})
+    return {
+        "ok": all(bool(item["ok"]) for item in checks),
+        "command": "doctor",
+        "root": str(root),
+        "checks": checks,
+    }
+
+
+def nul_paths(value: str) -> list[str]:
+    return [item for item in value.split("\0") if item]
+
+
+def bundle_candidate(relative: str) -> bool:
+    path = PurePosixPath(relative)
+    lower_parts = {part.lower() for part in path.parts}
+    name = path.name
+    lower_name = name.lower()
+    if lower_parts & EXCLUDED_PARTS:
+        return False
+    if lower_name in SECRET_NAMES or lower_name.startswith(".env."):
+        return False
+    if name == "custom.el" or name.endswith((".pem", ".key", ".p12", ".pfx")):
+        return False
+    return path.suffix.lower() in SOURCE_SUFFIXES or name in SOURCE_NAMES or name.startswith("README")
+
+
+def command_bundle_code(args: argparse.Namespace) -> dict[str, object]:
+    root = Path(args.project_root).expanduser().resolve()
+    top = run(["git", "rev-parse", "--show-toplevel"], cwd=root).stdout.strip()
+    root = Path(top).resolve()
+    tracked = set(nul_paths(run(["git", "ls-files", "-z"], cwd=root).stdout))
+    untracked = set(
+        nul_paths(
+            run(
+                ["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=root
+            ).stdout
+        )
+    )
+    included: list[dict[str, object]] = []
+    excluded: list[dict[str, object]] = []
+    for relative in sorted(tracked | untracked):
+        path = root / relative
+        reason = ""
+        if not bundle_candidate(relative):
+            reason = "generated, sensitive, or non-source path"
+        elif path.is_symlink() or not path.is_file():
+            reason = "not a regular file"
+        elif path.stat().st_size > args.max_file_bytes:
+            reason = "exceeds per-file size limit"
+        if reason:
+            excluded.append({"path": relative, "reason": reason})
+            continue
+        content = path.read_bytes()
+        included.append(
+            {
+                "path": relative,
+                "source": "tracked" if relative in tracked else "untracked",
+                "size": len(content),
+                "sha256": sha256_bytes(content),
+            }
+        )
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output = (
+        Path(args.output).expanduser()
+        if args.output
+        else root / "review-bundles" / f"{root.name}-code-{timestamp}.tar.gz"
+    )
+    if not output.is_absolute():
+        output = root / output
+    output = output.resolve()
+    if output.exists():
+        raise ResearchRepoError(f"Output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    head = run(["git", "rev-parse", "HEAD"], cwd=root, check=False).stdout.strip()
+    branch = run(["git", "branch", "--show-current"], cwd=root, check=False).stdout.strip()
+    status = run(["git", "status", "--short", "--branch"], cwd=root).stdout
+    patch = run(["git", "diff", "--binary", "HEAD"], cwd=root, check=False).stdout
+    manifest = {
+        "schema_version": 1,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "project": root.name,
+        "head": head or None,
+        "branch": branch or None,
+        "working_tree_included": True,
+        "files": included,
+        "excluded": excluded,
+    }
+    prefix = PurePosixPath(f"{root.name}-code-review")
+    with tarfile.open(output, "w:gz", compresslevel=6) as archive:
+        for item in included:
+            relative = str(item["path"])
+            archive.add(root / relative, arcname=str(prefix / "files" / relative), recursive=False)
+        virtual = {
+            "manifest.json": json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            "git-status.txt": status,
+            "working-tree.patch": patch,
+        }
+        for name, text in virtual.items():
+            payload = text.encode("utf-8")
+            info = tarfile.TarInfo(str(prefix / name))
+            info.size = len(payload)
+            info.mode = 0o600
+            archive.addfile(info, io.BytesIO(payload))
+    return {
+        "ok": True,
+        "command": "bundle-code",
+        "root": str(root),
+        "output": str(output),
+        "sha256": sha256_bytes(output.read_bytes()),
+        "file_count": len(included),
+        "excluded_count": len(excluded),
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    init = sub.add_parser("init", help="apply a versioned research scaffold")
+    init.add_argument("--project-root", default=".")
+    init.add_argument("--template", choices=("generic", "chemistry", "federated"), default="generic")
+    init.add_argument("--project-name", default="")
+    init.add_argument("--remote-host", default="rhel-test")
+    init.add_argument("--remote-dir", default="")
+    init.add_argument("--bootstrap-cmd", default="python -m venv .venv && .venv/bin/python -m pip install -e .")
+    init.add_argument("--test-cmd", default=".venv/bin/python -m unittest discover -s tests -v")
+    init.add_argument("--smoke-cmd", default=".venv/bin/python -m unittest discover -s tests -v")
+    init.add_argument("--run-cmd", default=".venv/bin/python -m unittest discover -s tests -v")
+    init.add_argument("--data-link", action="append", default=[])
+    init.add_argument("--no-git-init", action="store_true")
+    doctor = sub.add_parser("doctor", help="check the scaffold contract")
+    doctor.add_argument("--project-root", default=".")
+    bundle = sub.add_parser("bundle-code", help="create a secret-aware working-tree code bundle")
+    bundle.add_argument("--project-root", default=".")
+    bundle.add_argument("--output", default="")
+    bundle.add_argument("--max-file-bytes", type=int, default=20 * 1024 * 1024)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    try:
+        if args.command == "init":
+            value = command_init(args)
+        elif args.command == "doctor":
+            value = command_doctor(args)
+        else:
+            value = command_bundle_code(args)
+        print(json.dumps(value, indent=2, sort_keys=True))
+        if not value.get("ok", False):
+            raise SystemExit(2)
+    except ResearchRepoError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, indent=2), file=sys.stderr)
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

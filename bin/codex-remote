@@ -19,6 +19,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -26,6 +27,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -42,13 +44,17 @@ LOCAL_STATE_ROOT = Path.home() / ".local/state/codex-remote"
 PROJECT_CONFIG_RELATIVE = "codex-remote/config.json"
 JOB_REQUEST_RELATIVE = ".codex-job-request.json"
 JOB_RESPONSE_RELATIVE = ".codex-job-response.json"
+JOB_CONTROL_REQUEST_RELATIVE = ".codex-job-control-request.json"
+JOB_CONTROL_RESPONSE_RELATIVE = ".codex-job-control-response.json"
 ENV_REQUEST_RELATIVE = ".codex-env-request.json"
 ENV_RESPONSE_RELATIVE = ".codex-env-response.json"
 COMMIT_REQUEST_RELATIVE = ".codex-commit-request.json"
 COMMIT_RESPONSE_RELATIVE = ".codex-commit-response.json"
 ENV_ACTIONS = {"refresh", "test", "check"}
+JOB_CONTROL_ACTIONS = {"list", "status", "logs", "artifacts", "analyze", "analysis"}
 JOB_POLICIES = {"deny", "prepare", "launch"}
 JOB_ACTIVE_STATES = {"STARTING", "BOOTSTRAPPING", "RUNNING", "STOP_REQUESTED"}
+JOB_STOP_GRACE_SECONDS = 2.0
 GLOBAL_AGENTS_BEGIN = "<!-- BEGIN CODEX-REMOTE MANAGED INSTRUCTIONS -->"
 GLOBAL_AGENTS_END = "<!-- END CODEX-REMOTE MANAGED INSTRUCTIONS -->"
 
@@ -228,6 +234,31 @@ def atomic_write_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -
             tmp.unlink()
 
 
+def exclusive_create_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None:
+    """Create PATH atomically without replacing an existing broker request."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, mode)
+    except FileExistsError as exc:
+        raise CodexRemoteError(
+            "A job-control request is already pending",
+            code="JOB_CONTROL_REQUEST_EXISTS",
+        ) from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        raise
+
+
 def atomic_write_text(path: Path, value: str, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -244,9 +275,98 @@ def atomic_write_text(path: Path, value: str, mode: int = 0o600) -> None:
             tmp.unlink()
 
 
+def atomic_write_bytes(path: Path, value: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def open_regular_nofollow(
+    path: Path,
+    *,
+    read: bool = False,
+    append: bool = False,
+    truncate: bool = False,
+    binary: bool = False,
+) -> Any:
+    """Open a regular file without following a final-component symlink."""
+    dispositions = sum(bool(value) for value in (read, append, truncate))
+    if dispositions != 1:
+        raise ValueError("choose exactly one regular-file disposition")
+    if read:
+        flags = os.O_RDONLY
+        mode = "rb" if binary else "r"
+    elif append:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        mode = "ab" if binary else "a"
+    else:
+        # Do not request O_TRUNC until after validating the opened inode.  A
+        # planted hardlink would otherwise be damaged before fstat can reject
+        # it.
+        flags = os.O_WRONLY | os.O_CREAT
+        mode = "wb" if binary else "w"
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise CodexRemoteError(
+            f"Refusing unsafe managed state file {path}: {exc}",
+            code="UNSAFE_STATE_FILE",
+        ) from exc
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise CodexRemoteError(
+                f"Refusing non-regular or multiply-linked managed state file {path}",
+                code="UNSAFE_STATE_FILE",
+            )
+        if truncate:
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+        return os.fdopen(fd, mode, encoding=None if binary else "utf-8")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def install_runner_helper(destination: Path, source: Path) -> str:
+    """Atomically install SOURCE without following a planted destination link."""
+    try:
+        existing = destination.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise CodexRemoteError(
+            f"Refusing unsafe runner helper path: {destination}",
+            code="UNSAFE_STATE_FILE",
+        )
+    payload = source.read_bytes()
+    expected = hashlib.sha256(payload).hexdigest()
+    atomic_write_bytes(destination, payload, mode=0o700)
+    installed = destination.lstat()
+    if not stat.S_ISREG(installed.st_mode) or sha256_file(destination) != expected:
+        raise CodexRemoteError(
+            "Runner helper did not retain its trusted identity after atomic installation",
+            code="UNSAFE_STATE_FILE",
+        )
+    return expected
+
+
 def read_json(path: Path) -> dict[str, Any] | None:
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with open_regular_nofollow(path, read=True) as handle:
             value = json.load(handle)
     except FileNotFoundError:
         return None
@@ -800,12 +920,13 @@ def ssh_run(
     remote_args: Sequence[str],
     *,
     timeout: int,
+    connect_timeout: int | None = None,
     input_data: str | bytes | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[Any]:
     command = shlex.join([str(item) for item in remote_args])
     return run(
-        ssh_argv(host, timeout, command),
+        ssh_argv(host, connect_timeout if connect_timeout is not None else timeout, command),
         input_data=input_data,
         timeout=max(timeout + 2, 10),
         check=check,
@@ -923,6 +1044,7 @@ def remote_invoke(
     args: Sequence[str],
     *,
     timeout: int,
+    connect_timeout: int | None = None,
     payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     input_data = json.dumps(payload) if payload is not None else None
@@ -930,6 +1052,7 @@ def remote_invoke(
         context["host"],
         [context["python"], context["helper"], *args],
         timeout=timeout,
+        connect_timeout=connect_timeout,
         input_data=input_data,
     )
     value = None
@@ -2814,6 +2937,14 @@ def cmd_jobs(args: argparse.Namespace) -> dict[str, Any]:
     return value
 
 
+def tmux_durable_pane_command(
+    tmux: str, bash: str, session: str, runner_argv: Sequence[str]
+) -> str:
+    """Set remain-on-exit from inside the pane before execing a fast runner."""
+    setup = shlex.join([tmux, "set-option", "-t", session, "remain-on-exit", "on"])
+    return shlex.join([bash, "-lc", setup + " && exec " + shlex.join(runner_argv)])
+
+
 def cmd_job_status(args: argparse.Namespace) -> dict[str, Any]:
     _root, _host, timeout, project_id, _project_name, context = job_remote_context(args)
     value = remote_invoke(
@@ -2857,9 +2988,18 @@ def cmd_job_stop(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_job_summarize(args: argparse.Namespace) -> dict[str, Any]:
     _root, _host, timeout, project_id, _project_name, context = job_remote_context(args)
+    remote_args = [
+        "_server-job-summarize",
+        "--project-id",
+        project_id,
+        "--run-id",
+        args.run_id,
+    ]
+    if args.force:
+        remote_args.append("--force")
     value = remote_invoke(
         context,
-        ["_server-job-summarize", "--project-id", project_id, "--run-id", args.run_id],
+        remote_args,
         timeout=timeout + 10,
     )
     value.update({"command": "job-summarize", "project_id": project_id})
@@ -2875,6 +3015,402 @@ def cmd_job_analysis(args: argparse.Namespace) -> dict[str, Any]:
     )
     value.update({"command": "job-analysis", "project_id": project_id})
     return value
+
+
+def fetch_remote_export(
+    context: Mapping[str, str], remote_path: str, destination: Path, *, timeout: int
+) -> None:
+    """Stream a trusted server export over SSH without buffering it in memory."""
+    remote = Path(remote_path)
+    allowed_root = Path(context["home"]) / REMOTE_STATE_RELATIVE
+    if not remote.is_absolute() or not remote.is_relative_to(allowed_root):
+        raise CodexRemoteError(
+            f"Server returned an export outside the managed state root: {remote}",
+            code="REMOTE_PROTOCOL_ERROR",
+        )
+    script = """import pathlib
+import sys
+
+with pathlib.Path(sys.argv[1]).open("rb") as handle:
+    while True:
+        chunk = handle.read(1024 * 1024)
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+"""
+    remote_command = shlex.join([context["python"], "-c", script, str(remote)])
+    argv = ssh_argv(context["host"], timeout, remote_command)
+    try:
+        with destination.open("wb") as output:
+            completed = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.PIPE,
+                timeout=max(timeout + 2, 4 * 60 * 60),
+                check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CodexRemoteError(f"Could not download run export: {exc}", code="EXPORT_DOWNLOAD_FAILED") from exc
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode(errors="replace") if completed.stderr else ""
+        raise CodexRemoteError(
+            f"Run export download failed with status {completed.returncode}: {stderr}",
+            code="EXPORT_DOWNLOAD_FAILED",
+        )
+
+
+def extract_job_export(
+    archive: Path, destination: Path, run_id: str, *, max_unpacked_bytes: int
+) -> int:
+    """Extract a regular-file-only export into a new destination."""
+    validate_safe_id(run_id, "run id")
+    if destination.exists():
+        raise CodexRemoteError(
+            f"Export destination already exists: {destination}",
+            code="EXPORT_DESTINATION_EXISTS",
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{destination.name}.pull-", dir=destination.parent) as tmp:
+        staging_root = Path(tmp)
+        with tarfile.open(archive, "r:gz") as handle:
+            members = handle.getmembers()
+            total = 0
+            seen_members: set[str] = set()
+            for member in members:
+                member_path = PurePosixPath(member.name)
+                if (
+                    member_path.is_absolute()
+                    or ".." in member_path.parts
+                    or not member_path.parts
+                    or member_path.parts[0] != run_id
+                    or not (member.isdir() or member.isfile())
+                ):
+                    raise CodexRemoteError(
+                        f"Unsafe member in run export: {member.name}",
+                        code="UNSAFE_EXPORT_ARCHIVE",
+                    )
+                if member.name in seen_members:
+                    raise CodexRemoteError(
+                        f"Duplicate member in run export: {member.name}",
+                        code="UNSAFE_EXPORT_ARCHIVE",
+                    )
+                seen_members.add(member.name)
+                total += member.size if member.isfile() else 0
+                if total > max_unpacked_bytes:
+                    raise CodexRemoteError(
+                        "Run export exceeds the configured unpacked-size limit",
+                        code="EXPORT_TOO_LARGE",
+                    )
+            for member in members:
+                relative = PurePosixPath(member.name)
+                target = staging_root.joinpath(*relative.parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = handle.extractfile(member)
+                if source is None:
+                    raise CodexRemoteError(
+                        f"Could not read archive member: {member.name}",
+                        code="UNSAFE_EXPORT_ARCHIVE",
+                    )
+                with source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                target.chmod(0o600)
+        extracted = staging_root / run_id
+        if not extracted.is_dir():
+            raise CodexRemoteError("Run export has no root directory", code="UNSAFE_EXPORT_ARCHIVE")
+        os.replace(extracted, destination)
+    return len([path for path in destination.rglob("*") if path.is_file()])
+
+
+def validate_pulled_export(
+    destination: Path,
+    run_id: str,
+    profile: str,
+    snapshot_sha256: str,
+    *,
+    allow_pull_marker: bool,
+) -> dict[str, Any]:
+    """Verify a local export snapshot and every file identity it declares."""
+    selection_path = destination / "export-selection.json"
+    selection = read_json(selection_path)
+    if not isinstance(selection, dict):
+        raise CodexRemoteError("Pulled export has no selection manifest", code="EXPORT_HASH_MISMATCH")
+    if (
+        selection.get("run_id") != run_id
+        or selection.get("profile") != profile
+        or selection.get("snapshot_sha256") != snapshot_sha256
+    ):
+        raise CodexRemoteError("Pulled export selection identity does not match", code="EXPORT_HASH_MISMATCH")
+    selection_base = dict(selection)
+    selection_base.pop("snapshot_sha256", None)
+    computed_snapshot = hashlib.sha256(
+        json.dumps(selection_base, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if computed_snapshot != snapshot_sha256:
+        raise CodexRemoteError("Pulled export selection was modified", code="EXPORT_HASH_MISMATCH")
+
+    records = selection.get("files")
+    if not isinstance(records, list):
+        raise CodexRemoteError("Pulled export file inventory is malformed", code="EXPORT_HASH_MISMATCH")
+    expected_files: set[str] = set()
+    for item in records:
+        if not isinstance(item, Mapping):
+            raise CodexRemoteError("Pulled export file inventory is malformed", code="EXPORT_HASH_MISMATCH")
+        relative_value = item.get("path")
+        if not isinstance(relative_value, str):
+            raise CodexRemoteError("Pulled export has an invalid file path", code="EXPORT_HASH_MISMATCH")
+        relative = PurePosixPath(relative_value)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not relative.parts
+            or relative.as_posix() in {"export-selection.json", ".codex-pull.json"}
+            or relative.as_posix() in expected_files
+        ):
+            raise CodexRemoteError("Pulled export has an unsafe or duplicate file path", code="EXPORT_HASH_MISMATCH")
+        expected_files.add(relative.as_posix())
+        candidate = destination.joinpath(*relative.parts)
+        if not candidate.is_file() or candidate.is_symlink():
+            raise CodexRemoteError(
+                f"Pulled export file is missing or unsafe: {relative_value}",
+                code="EXPORT_HASH_MISMATCH",
+            )
+        expected_size = item.get("size")
+        expected_hash = item.get("sha256")
+        if (
+            isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+            or candidate.stat().st_size != expected_size
+            or not isinstance(expected_hash, str)
+            or sha256_file(candidate) != expected_hash
+        ):
+            raise CodexRemoteError(
+                f"Pulled export file hash does not match: {relative_value}",
+                code="EXPORT_HASH_MISMATCH",
+            )
+
+    actual_files: set[str] = set()
+    for candidate in destination.rglob("*"):
+        if candidate.is_symlink():
+            raise CodexRemoteError("Pulled export contains a symlink", code="EXPORT_HASH_MISMATCH")
+        if candidate.is_file():
+            actual_files.add(candidate.relative_to(destination).as_posix())
+    allowed_files = expected_files | {"export-selection.json"}
+    if allow_pull_marker:
+        allowed_files.add(".codex-pull.json")
+    if actual_files != allowed_files:
+        raise CodexRemoteError(
+            "Pulled export contains missing or undeclared files",
+            code="EXPORT_HASH_MISMATCH",
+            details={"expected": sorted(allowed_files), "actual": sorted(actual_files)},
+        )
+    return selection
+
+
+def cmd_job_pull(args: argparse.Namespace) -> dict[str, Any]:
+    root, _host, timeout, project_id, _project_name, context = job_remote_context(args)
+    max_bytes = int(args.max_bytes or 0)
+    if max_bytes == 0:
+        max_bytes = (
+            JOB_REPORT_DEFAULT_MAX_BYTES
+            if args.profile == "report"
+            else JOB_FULL_DEFAULT_MAX_BYTES
+        )
+    if max_bytes < 1:
+        raise CodexRemoteError("--max-bytes must be positive", code="INVALID_ARGUMENT")
+    value = remote_invoke(
+        context,
+        [
+            "_server-job-export",
+            "--project-id",
+            project_id,
+            "--run-id",
+            args.run_id,
+            "--profile",
+            args.profile,
+            "--max-unpacked-bytes",
+            str(max_bytes),
+        ],
+        # First export creation may hash and compress tens of GiB.  The short
+        # SSH connect timeout is inappropriate once the authenticated helper is
+        # running; keep this bounded but long enough for a deliberate full pull.
+        timeout=max(timeout + 30, 4 * 60 * 60),
+        connect_timeout=timeout,
+    )
+    archive_size = int(value.get("archive_size") or 0)
+    if archive_size <= 0 or archive_size > max_bytes:
+        raise CodexRemoteError(
+            f"Export size {archive_size} exceeds the configured limit {max_bytes}",
+            code="EXPORT_TOO_LARGE",
+            details=value,
+        )
+    snapshot_sha256 = value.get("snapshot_sha256")
+    if not isinstance(snapshot_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", snapshot_sha256
+    ) is None:
+        raise CodexRemoteError(
+            "Server export has no valid snapshot identity", code="UNSAFE_EXPORT_ARCHIVE"
+        )
+    if args.destination:
+        destination = Path(args.destination).expanduser()
+        if not destination.is_absolute():
+            destination = root / destination
+    else:
+        base = "reports" if args.profile == "report" else "artifacts"
+        destination = root / base / "codex-jobs" / args.run_id
+    destination = destination.resolve()
+    if not destination.is_relative_to(root):
+        raise CodexRemoteError(
+            "Run exports must be placed inside the canonical project checkout",
+            code="INVALID_EXPORT_DESTINATION",
+        )
+
+    def matching_pull_marker(target: Path) -> dict[str, Any] | None:
+        try:
+            marker = read_json(target / ".codex-pull.json") if target.is_dir() else None
+        except CodexRemoteError:
+            return None
+        if (
+            isinstance(marker, dict)
+            and marker.get("snapshot_sha256") == snapshot_sha256
+            and marker.get("profile") == args.profile
+            and marker.get("run_id") == args.run_id
+        ):
+            try:
+                validate_pulled_export(
+                    target,
+                    args.run_id,
+                    args.profile,
+                    snapshot_sha256,
+                    allow_pull_marker=True,
+                )
+            except CodexRemoteError:
+                return None
+            return marker
+        return None
+
+    existing_marker = matching_pull_marker(destination)
+    if existing_marker is not None:
+        return {
+            "ok": True,
+            "command": "job-pull",
+            "project_id": project_id,
+            "run_id": args.run_id,
+            "profile": args.profile,
+            "destination": str(destination),
+            "file_count": existing_marker.get("file_count"),
+            "archive_sha256": value.get("archive_sha256"),
+            "archive_size": archive_size,
+            "snapshot_sha256": snapshot_sha256,
+            "provenance_warning": value.get("provenance_warning"),
+            "omitted_file_count": value.get("omitted_file_count"),
+            "selected_artifacts_verified": value.get("selected_artifacts_verified"),
+            "complete_artifact_set_verified": value.get("complete_artifact_set_verified"),
+            "sealed_post_hoc": value.get("sealed_post_hoc"),
+            "idempotent": True,
+        }
+    if destination.exists():
+        if args.destination:
+            raise CodexRemoteError(
+                "The requested export destination already exists with different or unknown contents",
+                code="EXPORT_DESTINATION_EXISTS",
+            )
+        destination = destination.with_name(
+            f"{args.run_id}-{args.profile}-{snapshot_sha256[:12]}"
+        )
+        existing_marker = matching_pull_marker(destination)
+        if existing_marker is not None:
+            return {
+                "ok": True,
+                "command": "job-pull",
+                "project_id": project_id,
+                "run_id": args.run_id,
+                "profile": args.profile,
+                "destination": str(destination),
+                "file_count": existing_marker.get("file_count"),
+                "archive_sha256": value.get("archive_sha256"),
+                "archive_size": archive_size,
+                "snapshot_sha256": snapshot_sha256,
+                "provenance_warning": value.get("provenance_warning"),
+                "omitted_file_count": value.get("omitted_file_count"),
+                "selected_artifacts_verified": value.get("selected_artifacts_verified"),
+                "complete_artifact_set_verified": value.get("complete_artifact_set_verified"),
+                "sealed_post_hoc": value.get("sealed_post_hoc"),
+                "idempotent": True,
+            }
+        if destination.exists():
+            raise CodexRemoteError(
+                "The versioned export destination already exists with unknown contents",
+                code="EXPORT_DESTINATION_EXISTS",
+            )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, archive_name = tempfile.mkstemp(
+        prefix=f".{args.run_id}-{args.profile}.", suffix=".tar.gz", dir=destination.parent
+    )
+    os.close(fd)
+    archive = Path(archive_name)
+    try:
+        fetch_remote_export(context, str(value["archive"]), archive, timeout=timeout)
+        if archive.stat().st_size != archive_size:
+            raise CodexRemoteError("Downloaded export size does not match the server", code="EXPORT_HASH_MISMATCH")
+        actual_sha = sha256_file(archive)
+        if actual_sha != value.get("archive_sha256"):
+            raise CodexRemoteError("Downloaded export hash does not match the server", code="EXPORT_HASH_MISMATCH")
+        file_count = extract_job_export(
+            archive,
+            destination,
+            args.run_id,
+            max_unpacked_bytes=max_bytes,
+        )
+        try:
+            validate_pulled_export(
+                destination,
+                args.run_id,
+                args.profile,
+                snapshot_sha256,
+                allow_pull_marker=False,
+            )
+        except Exception:
+            shutil.rmtree(destination)
+            raise
+        atomic_write_json(
+            destination / ".codex-pull.json",
+            {
+                "schema_version": 1,
+                "project_id": project_id,
+                "run_id": args.run_id,
+                "profile": args.profile,
+                "snapshot_sha256": snapshot_sha256,
+                "archive_sha256": value.get("archive_sha256"),
+                "archive_size": archive_size,
+                "file_count": file_count,
+                "pulled_at": utc_now(),
+            },
+        )
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            archive.unlink()
+    return {
+        "ok": True,
+        "command": "job-pull",
+        "project_id": project_id,
+        "run_id": args.run_id,
+        "profile": args.profile,
+        "destination": str(destination),
+        "file_count": file_count,
+        "archive_sha256": value.get("archive_sha256"),
+        "archive_size": archive_size,
+        "omitted_file_count": value.get("omitted_file_count"),
+        "snapshot_sha256": snapshot_sha256,
+        "selected_artifacts_verified": value.get("selected_artifacts_verified"),
+        "complete_artifact_set_verified": value.get("complete_artifact_set_verified"),
+        "sealed_post_hoc": value.get("sealed_post_hoc"),
+        "provenance_warning": value.get("provenance_warning"),
+        "idempotent": False,
+    }
 
 
 def global_agents_template_path() -> Path:
@@ -3386,6 +3922,147 @@ def consume_env_request(task: Mapping[str, Any]) -> dict[str, Any] | None:
     return normalized_env_request(value)
 
 
+def normalized_job_control_request(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a read/query request from sandboxed interactive Codex."""
+    action = value.get("action")
+    if action not in JOB_CONTROL_ACTIONS:
+        raise CodexRemoteError(
+            f"Unknown job-control action: {action!r}",
+            code="INVALID_JOB_CONTROL_REQUEST",
+        )
+    run_id = value.get("run_id") or ""
+    if not isinstance(run_id, str):
+        raise CodexRemoteError(
+            "Job-control run ID must be a string",
+            code="INVALID_JOB_CONTROL_REQUEST",
+        )
+    if action == "list":
+        if run_id:
+            raise CodexRemoteError(
+                "The list action does not accept a run ID",
+                code="INVALID_JOB_CONTROL_REQUEST",
+            )
+    else:
+        if not run_id:
+            raise CodexRemoteError(
+                f"The {action} action requires a run ID",
+                code="INVALID_JOB_CONTROL_REQUEST",
+            )
+        validate_safe_id(run_id, "run id")
+    request_nonce = value.get("request_nonce") or ""
+    if not isinstance(request_nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", request_nonce):
+        raise CodexRemoteError(
+            "Job-control request nonce is invalid",
+            code="INVALID_JOB_CONTROL_REQUEST",
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "action": action,
+        "run_id": run_id,
+        "request_nonce": request_nonce,
+        "requested_at": value.get("requested_at") or utc_now(),
+    }
+
+
+def request_job_control_file(
+    request_file: Path,
+    response_file: Path,
+    *,
+    action: str,
+    run_id: str = "",
+    wait_seconds: int,
+) -> dict[str, Any]:
+    """Ask the unsandboxed live runner to perform one job-control action."""
+    if (
+        request_file.name != JOB_CONTROL_REQUEST_RELATIVE
+        or response_file.name != JOB_CONTROL_RESPONSE_RELATIVE
+    ):
+        raise CodexRemoteError(
+            "Unexpected job-control path", code="INVALID_JOB_CONTROL_REQUEST"
+        )
+    expected_path = os.environ.get("CODEX_JOB_CONTROL_REQUEST_PATH")
+    if expected_path and request_file.resolve(strict=False) != Path(expected_path).resolve(
+        strict=False
+    ):
+        raise CodexRemoteError(
+            "Job-control request path does not match the runner-authorized worktree",
+            code="INVALID_JOB_CONTROL_REQUEST",
+        )
+    expected_response = os.environ.get("CODEX_JOB_CONTROL_RESPONSE_PATH")
+    if expected_response and response_file.resolve(strict=False) != Path(
+        expected_response
+    ).resolve(strict=False):
+        raise CodexRemoteError(
+            "Job-control response path does not match the runner-authorized state directory",
+            code="INVALID_JOB_CONTROL_REQUEST",
+        )
+    request = normalized_job_control_request(
+        {"action": action, "run_id": run_id, "request_nonce": secrets.token_hex(16)}
+    )
+    response_for_nonce = response_file.with_name(
+        f"{response_file.name}.{request['request_nonce']}"
+    )
+    exclusive_create_json(request_file, request)
+    try:
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            response = read_json(response_for_nonce)
+            if response is not None and response.get("request_nonce") == request["request_nonce"]:
+                if not response.get("ok", False):
+                    raise CodexRemoteError(
+                        str(response.get("error") or "The trusted job-control action failed"),
+                        code=str(response.get("error_code") or "JOB_CONTROL_FAILED"),
+                        details=response.get("details"),
+                    )
+                return response
+            time.sleep(0.2)
+        current = read_json(request_file)
+        if isinstance(current, dict) and current.get("request_nonce") == request["request_nonce"]:
+            with contextlib.suppress(FileNotFoundError):
+                request_file.unlink()
+        raise CodexRemoteError(
+            "Timed out waiting for the trusted runner to process the job-control request",
+            code="JOB_CONTROL_REQUEST_TIMEOUT",
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            response_for_nonce.unlink()
+
+
+def consume_job_control_request(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    request_path = Path(task["worktree"]) / JOB_CONTROL_REQUEST_RELATIVE
+    if not request_path.exists() and not request_path.is_symlink():
+        return None
+    if request_path.is_symlink() or not request_path.is_file():
+        if request_path.is_symlink() or not request_path.is_dir():
+            with contextlib.suppress(FileNotFoundError):
+                request_path.unlink()
+        elif request_path.is_dir():
+            shutil.rmtree(request_path)
+        raise CodexRemoteError(
+            "The job-control request is not a regular file",
+            code="INVALID_JOB_CONTROL_REQUEST",
+        )
+    if request_path.stat().st_size > 64 * 1024:
+        with contextlib.suppress(FileNotFoundError):
+            request_path.unlink()
+        raise CodexRemoteError(
+            "The job-control request is too large",
+            code="INVALID_JOB_CONTROL_REQUEST",
+        )
+    try:
+        value = read_json(request_path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            request_path.unlink()
+    if not isinstance(value, dict):
+        raise CodexRemoteError(
+            "The job-control request is invalid JSON",
+            code="INVALID_JOB_CONTROL_REQUEST",
+        )
+    return normalized_job_control_request(value)
+
+
 def normalized_commit_request(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one trusted commit request from sandboxed interactive Codex."""
     message = value.get("message")
@@ -3421,6 +4098,8 @@ def normalized_commit_request(value: Mapping[str, Any]) -> dict[str, Any]:
     control_paths = {
         JOB_REQUEST_RELATIVE,
         JOB_RESPONSE_RELATIVE,
+        JOB_CONTROL_REQUEST_RELATIVE,
+        JOB_CONTROL_RESPONSE_RELATIVE,
         ENV_REQUEST_RELATIVE,
         ENV_RESPONSE_RELATIVE,
         COMMIT_REQUEST_RELATIVE,
@@ -3459,6 +4138,11 @@ def normalized_commit_request(value: Mapping[str, Any]) -> dict[str, Any]:
         if normalized in control_paths:
             raise CodexRemoteError(
                 f"Commit path may not target codex-remote control state: {raw}",
+                code="INVALID_COMMIT_REQUEST",
+            )
+        if normalized.startswith(JOB_CONTROL_RESPONSE_RELATIVE + "."):
+            raise CodexRemoteError(
+                f"Commit path may not target dynamic job-control responses: {raw}",
                 code="INVALID_COMMIT_REQUEST",
             )
         if normalized not in seen:
@@ -3844,6 +4528,17 @@ def codex_job_instructions(task: Mapping[str, Any]) -> str:
         "tokens, or secret files. Run bounded foreground tests normally."
     )
     base += codex_persistent_data_instructions(task)
+    if policy in {"launch", "prepare"}:
+        base += (
+            " Before requesting a frozen experiment, make the invoked entry point write a "
+            "machine-readable JSON evidence manifest below $CODEX_RESULTS_DIR (normally "
+            "evidence-manifest.json). It must contain nonempty 64-character lowercase SHA-256 "
+            "values named dataset_manifest_sha256, split_manifest_sha256, and "
+            "membership_evidence_sha256, plus nonempty expected_counts and observed_counts "
+            "objects with identical keys and nonnegative integer values. The completion marker "
+            "is separate. The independent read-only auditor cannot create missing evidence "
+            "after the run, so test this output contract before launch."
+        )
     if task_execution_mode(task) == "interactive":
         base += (
             " Create small, coherent Git commits whenever a logical unit is complete and "
@@ -4213,6 +4908,12 @@ def codex_process_environment(task: Mapping[str, Any]) -> dict[str, str]:
             "CODEX_JOB_REQUEST_PATH": str(
                 Path(task["worktree"]) / JOB_REQUEST_RELATIVE
             ),
+            "CODEX_JOB_CONTROL_REQUEST_PATH": str(
+                Path(task["worktree"]) / JOB_CONTROL_REQUEST_RELATIVE
+            ),
+            "CODEX_JOB_CONTROL_RESPONSE_PATH": str(
+                Path(str(task["state_dir"])) / JOB_CONTROL_RESPONSE_RELATIVE
+            ),
             "CODEX_ENVCTL": str(task.get("envctl_path") or ""),
             "CODEX_ENV_REQUEST_PATH": str(
                 Path(task["worktree"]) / ENV_REQUEST_RELATIVE
@@ -4429,6 +5130,8 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
         commitctl_path = state_dir / "codex-commit"
         request_path = worktree / JOB_REQUEST_RELATIVE
         response_path = worktree / JOB_RESPONSE_RELATIVE
+        control_request_path = worktree / JOB_CONTROL_REQUEST_RELATIVE
+        control_response_path = state_dir / JOB_CONTROL_RESPONSE_RELATIVE
         env_request_path = worktree / ENV_REQUEST_RELATIVE
         env_response_path = worktree / ENV_RESPONSE_RELATIVE
         commit_request_path = worktree / COMMIT_REQUEST_RELATIVE
@@ -4448,18 +5151,50 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
                 f"--response-file {shlex.quote(str(response_path))} "
                 f"--wait-seconds 900 "
             )
-        jobctl_path.write_text(
-            "#!/bin/sh\n"
-            "set -eu\n"
-            "if [ \"${1:-}\" != request ]; then\n"
-            "  echo 'usage: codex-jobctl request --name NAME [options] -- COMMAND ARG...' >&2\n"
-            "  exit 2\n"
-            "fi\n"
-            "shift\n"
-            + jobctl_command
-            + '"$@"\n',
-            encoding="utf-8",
-        )
+        if execution_mode == "interactive":
+            control_command = (
+                f"exec {shlex.quote(str(Path(sys.executable).resolve()))} "
+                f"{shlex.quote(str(runner_helper))} _job-control "
+                f"--request-file {shlex.quote(str(control_request_path))} "
+                f"--response-file {shlex.quote(str(control_response_path))} "
+                "--wait-seconds 900 "
+            )
+            jobctl_script = (
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "action=${1:-}\n"
+                "case \"$action\" in\n"
+                "  request)\n"
+                "    shift\n"
+                f"    {jobctl_command}\"$@\"\n"
+                "    ;;\n"
+                "  list)\n"
+                f"    {control_command}--action list\n"
+                "    ;;\n"
+                "  status|logs|artifacts|analysis|analyze)\n"
+                "    run_id=${2:-}\n"
+                "    [ -n \"$run_id\" ] || { echo 'run ID required' >&2; exit 2; }\n"
+                f"    {control_command}--action \"$action\" --run-id \"$run_id\"\n"
+                "    ;;\n"
+                "  *)\n"
+                "    echo 'usage: codex-jobctl {request|list|status|logs|artifacts|analyze|analysis} ...' >&2\n"
+                "    exit 2\n"
+                "    ;;\n"
+                "esac\n"
+            )
+        else:
+            jobctl_script = (
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "if [ \"${1:-}\" != request ]; then\n"
+                "  echo 'usage: codex-jobctl request --name NAME [options] -- COMMAND ARG...' >&2\n"
+                "  exit 2\n"
+                "fi\n"
+                "shift\n"
+                + jobctl_command
+                + '"$@"\n'
+            )
+        jobctl_path.write_text(jobctl_script, encoding="utf-8")
         jobctl_path.chmod(0o700)
 
         envctl_path.write_text(
@@ -4570,13 +5305,12 @@ def server_start(project_id: str, task_id_value: str, payload: dict[str, Any]) -
         # The SSH helper itself uses absolute tool paths, but Codex-generated
         # commands need the server user's normal login environment (notably
         # Nix profile and uv paths).  Start the durable runner under bash -lc.
-        command = shlex.join(
-            [tools["bash"], "-lc", "exec " + shlex.join(runner_argv)]
+        command = tmux_durable_pane_command(
+            tools["tmux"], tools["bash"], session, runner_argv
         )
         task["runner_command"] = command
         task = save_server_task(paths, task)
         run([tools["tmux"], "new-session", "-d", "-s", session, command])
-        run([tools["tmux"], "set-option", "-t", session, "remain-on-exit", "on"])
         return {"ok": True, "task": task, "idempotent": False}
     except Exception:
         # Preserve any created state/worktree.  If metadata exists, classify it.
@@ -4714,6 +5448,64 @@ def terminate_child_process(
             pass
     with contextlib.suppress(ProcessLookupError):
         process.terminate()
+
+
+def process_group_alive(process_group_id: int) -> bool:
+    """Return whether PROCESS_GROUP_ID still contains at least one process."""
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_remaining_process_group(process_group_id: int) -> bool:
+    """Terminate orphaned group members and report whether any were detected."""
+    if not process_group_alive(process_group_id):
+        return False
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process_group_id, signal.SIGTERM)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and process_group_alive(process_group_id):
+        time.sleep(0.05)
+    if process_group_alive(process_group_id):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group_id, signal.SIGKILL)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and process_group_alive(process_group_id):
+            time.sleep(0.05)
+    return True
+
+
+def terminate_process_group_with_escalation(
+    pid: Any,
+    boot_id: Any,
+    start_ticks: Any,
+    *,
+    grace_seconds: float = JOB_STOP_GRACE_SECONDS,
+) -> tuple[bool, bool]:
+    """Signal an identity-checked process group, escalating TERM to KILL."""
+    if not process_identity_alive(pid, boot_id, start_ticks):
+        return False, False
+    process_group_id = int(pid)
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return False, False
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while time.monotonic() < deadline:
+        if not process_identity_alive(pid, boot_id, start_ticks):
+            return True, False
+        time.sleep(0.05)
+    if not process_identity_alive(pid, boot_id, start_ticks):
+        return True, False
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        return True, False
+    return True, True
 
 
 @contextlib.contextmanager
@@ -5301,6 +6093,46 @@ def interactive_job_request_watcher(
                 }
             atomic_write_json(env_response_path, response)
             continue
+        control_request_path = Path(task["worktree"]) / JOB_CONTROL_REQUEST_RELATIVE
+        control_response_base = Path(str(task["state_dir"])) / JOB_CONTROL_RESPONSE_RELATIVE
+        for stale_response in Path(str(task["state_dir"])).glob(
+            f"{JOB_CONTROL_RESPONSE_RELATIVE}.*"
+        ):
+            with contextlib.suppress(OSError):
+                if time.time() - stale_response.stat().st_mtime > 3600:
+                    stale_response.unlink()
+        if control_request_path.exists() or control_request_path.is_symlink():
+            request: dict[str, Any] | None = None
+            try:
+                request = consume_job_control_request(task)
+                if request is None:
+                    time.sleep(0.1)
+                    continue
+                response = server_interactive_job_control_action(
+                    project_id, task_id_value, request
+                )
+            except CodexRemoteError as exc:
+                response = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": exc.code,
+                    "details": exc.details,
+                }
+            except Exception as exc:  # defensive broker boundary
+                response = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": "UNEXPECTED_JOB_CONTROL_BROKER_ERROR",
+                    "details": traceback.format_exc(),
+                }
+            if request is not None:
+                response = dict(response)
+                response["request_nonce"] = request.get("request_nonce")
+                control_response_path = control_response_base.with_name(
+                    f"{control_response_base.name}.{request['request_nonce']}"
+                )
+                atomic_write_json(control_response_path, response)
+            continue
         request_path = Path(task["worktree"]) / JOB_REQUEST_RELATIVE
         response_path = Path(task["worktree"]) / JOB_RESPONSE_RELATIVE
         if request_path.exists() or request_path.is_symlink():
@@ -5606,6 +6438,13 @@ def server_run(project_id: str, task_id_value: str) -> int:
                 note("trusted interactive job broker did not stop within 120 seconds")
             with contextlib.suppress(FileNotFoundError):
                 (worktree / JOB_RESPONSE_RELATIVE).unlink()
+            for response_file in Path(str(task["state_dir"])).glob(
+                f"{JOB_CONTROL_RESPONSE_RELATIVE}.*"
+            ):
+                with contextlib.suppress(FileNotFoundError):
+                    response_file.unlink()
+            with contextlib.suppress(FileNotFoundError):
+                (worktree / JOB_CONTROL_REQUEST_RELATIVE).unlink()
             with contextlib.suppress(FileNotFoundError):
                 (worktree / ENV_RESPONSE_RELATIVE).unlink()
             with contextlib.suppress(FileNotFoundError):
@@ -5977,10 +6816,17 @@ def server_checkpoint(project_id: str, task_id_value: str) -> dict[str, Any]:
 
 
 def tail_file(path: Path, lines: int) -> str:
-    if not path.exists():
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
         return ""
+    if not stat.S_ISREG(metadata.st_mode):
+        raise CodexRemoteError(
+            f"Refusing to read non-regular managed log file: {path}",
+            code="UNSAFE_STATE_FILE",
+        )
     # Logs are expected to be modest.  Bound the read to the final 4 MiB.
-    with path.open("rb") as handle:
+    with open_regular_nofollow(path, read=True, binary=True) as handle:
         handle.seek(0, os.SEEK_END)
         size = handle.tell()
         handle.seek(max(0, size - 4 * 1024 * 1024))
@@ -6141,6 +6987,7 @@ def save_server_job(paths: Mapping[str, Path], job: Mapping[str, Any]) -> dict[s
             "finished_at": value.get("finished_at"),
             "exit_code": value.get("exit_code"),
             "completion_marker_present": value.get("completion_marker_present"),
+            "artifact_evidence_present": value.get("artifact_evidence_present"),
             "updated_at": value["updated_at"],
             "error": value.get("error"),
             "analysis": value.get("analysis"),
@@ -6272,8 +7119,7 @@ def start_frozen_job(
     source_ref = f"refs/codex/{task['project_id']}/job/{run_id}"
     session = f"job-{task['project_id'][-10:]}-{run_id[-12:]}"
     runner_helper = state_dir / "codex-job-runner.py"
-    runner_helper.write_bytes(Path(__file__).resolve().read_bytes())
-    runner_helper.chmod(0o700)
+    runner_helper_sha256 = install_runner_helper(runner_helper, Path(__file__).resolve())
     job: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "project_id": task["project_id"],
@@ -6296,6 +7142,7 @@ def start_frozen_job(
         "resume_command": normalized["resume_command"],
         "metadata": normalized["metadata"],
         "requested_at": normalized["requested_at"],
+        "runner_helper_sha256": runner_helper_sha256,
         "launch_validation": {
             "codex_exit_code": task.get("codex_exit_code"),
             "environment_refresh": task.get("environment_refresh"),
@@ -6368,20 +7215,12 @@ def start_frozen_job(
             "--run-id",
             run_id,
         ]
-        command = shlex.join([tools["bash"], "-lc", "exec " + shlex.join(runner_argv)])
+        command = tmux_durable_pane_command(
+            tools["tmux"], tools["bash"], session, runner_argv
+        )
         job["runner_command"] = command
         job = save_server_job(paths, job)
         run([tools["tmux"], "new-session", "-d", "-s", session, command])
-        tmux_option = run(
-            [tools["tmux"], "set-option", "-t", session, "remain-on-exit", "on"],
-            check=False,
-        )
-        if tmux_option.returncode != 0:
-            atomic_write_text(
-                state_dir / "tmux-warning.txt",
-                (tmux_option.stderr or tmux_option.stdout or "tmux set-option failed")
-                + "\n",
-            )
         # The runner can advance to RUNNING or even finish before tmux returns.
         # Never overwrite that newer state with this stale STARTING object.
         return load_server_job(paths, run_id) or job
@@ -6396,6 +7235,10 @@ def start_frozen_job(
         job["state"] = "FAILED"
         job["error"] = f"Job launch setup failed: {exc}"
         job["finished_at"] = utc_now()
+        try:
+            seal_job_artifacts(job)
+        except Exception as manifest_exc:
+            job["artifact_manifest_error"] = str(manifest_exc)
         save_server_job(paths, job)
         raise
 
@@ -6433,6 +7276,13 @@ def server_request_job(
         raise CodexRemoteError(
             f"Interactive job requests require a live TUI; current state is {task.get('state')}",
             code="TASK_NOT_ACTIVE",
+            details=task,
+        )
+    if task.get("job_policy") == "launch" and not str(task.get("test_cmd") or "").strip():
+        raise CodexRemoteError(
+            "A live interactive job launch requires a configured nonempty test command. "
+            "Configure the project test command, validate the committed checkpoint, and retry.",
+            code="JOB_PREFLIGHT_REQUIRED",
             details=task,
         )
     normalized = normalized_job_request(request)
@@ -6508,6 +7358,42 @@ def server_request_job(
         }
 
 
+def server_interactive_job_control_action(
+    project_id: str,
+    task_id_value: str,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Execute a sandbox-requested job query through the trusted live runner."""
+    paths = ensure_server_layout(project_id)
+    task = load_server_task(paths)
+    if not task or task.get("task_id") != task_id_value:
+        raise CodexRemoteError(
+            "The requesting interactive task is not current",
+            code="TASK_NOT_FOUND",
+            details=task,
+        )
+    if task_execution_mode(task) != "interactive" or task.get("state") not in INTERACTIVE_ATTACH_STATES:
+        raise CodexRemoteError(
+            "Job-control requests require the current live interactive TUI",
+            code="TASK_NOT_ACTIVE",
+            details=task,
+        )
+    normalized = normalized_job_control_request(request)
+    action = str(normalized["action"])
+    run_id = str(normalized["run_id"])
+    if action == "list":
+        return server_jobs(project_id)
+    if action == "status":
+        return server_job_status(project_id, run_id)
+    if action == "logs":
+        return server_job_logs(project_id, run_id, 500)
+    if action == "artifacts":
+        return server_job_artifacts(project_id, run_id)
+    if action == "analyze":
+        return server_job_summarize(project_id, run_id)
+    return server_job_analysis(project_id, run_id)
+
+
 def job_process_environment(job: Mapping[str, Any]) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
@@ -6518,11 +7404,160 @@ def job_process_environment(job: Mapping[str, Any]) -> dict[str, str]:
             "CODEX_RESULTS_DIR": str(job["results_dir"]),
             "CODEX_CHECKPOINTS_DIR": str(job["checkpoints_dir"]),
             "CODEX_SOURCE_SHA": str(job["source_sha"]),
+            "CODEX_COMPLETION_MARKER": (
+                str(
+                    job_completion_marker_path(
+                        Path(str(job["worktree"])), str(job.get("completion_marker") or "")
+                    )
+                )
+                if job.get("completion_marker")
+                else ""
+            ),
         }
     )
     if job.get("gpus"):
         env["CUDA_VISIBLE_DEVICES"] = str(job["gpus"])
     return env
+
+
+def build_job_artifact_manifest(
+    job: Mapping[str, Any],
+    roles: set[str] | None = None,
+    paths: set[str] | None = None,
+) -> dict[str, Any]:
+    """Inventory immutable run artifacts without following symlinks."""
+    state_dir = Path(str(job["state_dir"])).resolve()
+    artifacts: list[dict[str, Any]] = []
+    for role, key in (("result", "results_dir"), ("checkpoint", "checkpoints_dir")):
+        if roles is not None and role not in roles:
+            continue
+        root = Path(str(job[key]))
+        if (
+            root.is_symlink()
+            or not root.is_dir()
+            or not root.resolve().is_relative_to(state_dir)
+        ):
+            raise CodexRemoteError(
+                f"Managed {role} root is missing, unsafe, or outside the run directory: {root}",
+                code="UNSAFE_JOB_ARTIFACT",
+            )
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root)
+            manifest_path = str(PurePosixPath(root.name) / PurePosixPath(relative.as_posix()))
+            if path.is_symlink():
+                raise CodexRemoteError(
+                    f"Symlinks are forbidden in sealed job artifacts: {manifest_path}",
+                    code="UNSAFE_JOB_ARTIFACT",
+                )
+            if not path.is_file():
+                continue
+            if paths is not None and manifest_path not in paths:
+                continue
+            resolved = path.resolve()
+            if not resolved.is_relative_to(state_dir):
+                raise CodexRemoteError(
+                    f"Artifact escapes the run directory: {path}",
+                    code="UNSAFE_JOB_ARTIFACT",
+                )
+            artifacts.append(
+                {
+                    "path": manifest_path,
+                    "role": role,
+                    "kind": "file",
+                    "size": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
+            )
+    return {
+        "schema_version": 1,
+        "run_id": job.get("run_id"),
+        "source_sha": job.get("source_sha"),
+        "generated_at": utc_now(),
+        "artifacts": artifacts,
+    }
+
+
+def seal_job_artifacts(job: dict[str, Any]) -> dict[str, Any]:
+    manifest = build_job_artifact_manifest(job)
+    manifest_path = Path(job["state_dir"]) / "artifacts.manifest.json"
+    atomic_write_json(manifest_path, manifest)
+    regular = [
+        str(item["path"])
+        for item in manifest["artifacts"]
+        if item.get("kind") == "file"
+    ]
+    job["artifact_manifest"] = str(manifest_path)
+    job["artifact_evidence"] = regular
+    job["artifact_evidence_present"] = bool(regular)
+    return manifest
+
+
+def verify_job_artifact_manifest(
+    job: Mapping[str, Any],
+    roles: set[str] | None = None,
+    paths: set[str] | None = None,
+) -> dict[str, Any]:
+    path = Path(str(job["state_dir"])) / "artifacts.manifest.json"
+    recorded = read_json(path)
+    if not isinstance(recorded, dict):
+        raise CodexRemoteError(
+            "The run has no artifact manifest; rerun finalization before exporting it",
+            code="ARTIFACT_MANIFEST_MISSING",
+        )
+    current = build_job_artifact_manifest(job, roles=roles, paths=paths)
+    recorded_artifacts = recorded.get("artifacts") or []
+    if roles is not None:
+        recorded_artifacts = [
+            item
+            for item in recorded_artifacts
+            if isinstance(item, Mapping) and item.get("role") in roles
+        ]
+    if paths is not None:
+        recorded_artifacts = [
+            item
+            for item in recorded_artifacts
+            if isinstance(item, Mapping) and item.get("path") in paths
+        ]
+    if recorded_artifacts != current.get("artifacts"):
+        raise CodexRemoteError(
+            "Results or checkpoints changed after the run artifact manifest was sealed",
+            code="ARTIFACT_MANIFEST_MISMATCH",
+            details={"recorded": recorded_artifacts, "current": current.get("artifacts")},
+        )
+    return recorded
+
+
+def adopt_legacy_job_artifacts(
+    paths: Mapping[str, Path],
+    job: Mapping[str, Any],
+    *,
+    verify_existing: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Seal a pre-upgrade terminal job now, while marking the weaker provenance."""
+    value = dict(job)
+    manifest_path = Path(str(value["state_dir"])) / "artifacts.manifest.json"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        manifest = read_json(manifest_path)
+        if not isinstance(manifest, dict):
+            raise CodexRemoteError("The artifact manifest is invalid", code="ARTIFACT_MANIFEST_MISSING")
+        if verify_existing:
+            manifest = verify_job_artifact_manifest(value)
+        return value, manifest
+    if value.get("state") in JOB_ACTIVE_STATES:
+        raise CodexRemoteError(
+            "Active jobs cannot be adopted as legacy terminal artifacts",
+            code="JOB_ACTIVE",
+            details=value,
+        )
+    manifest = seal_job_artifacts(value)
+    value["sealed_post_hoc"] = True
+    value["sealed_post_hoc_at"] = utc_now()
+    value["sealed_post_hoc_warning"] = (
+        "Artifacts were first hashed after upgrading codex-remote; immutability since original "
+        "completion cannot be established."
+    )
+    value = save_server_job(paths, value)
+    return value, manifest
 
 
 def inspect_job_source(job: Mapping[str, Any]) -> dict[str, Any]:
@@ -6546,6 +7581,59 @@ def inspect_job_source(job: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def neutralize_unsafe_job_artifact_roots(job: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Unlink unsafe managed-root symlinks without touching their targets."""
+    records: list[dict[str, str]] = []
+    for key in ("results_dir", "checkpoints_dir"):
+        root = Path(str(job[key]))
+        if root.is_symlink():
+            target = os.readlink(root)
+            root.unlink()
+            records.append({"root": key, "path": str(root), "symlink_target": target})
+    if records:
+        atomic_write_json(
+            Path(str(job["state_dir"])) / "unsafe-artifact-roots.json",
+            {"schema_version": 1, "neutralized_at": utc_now(), "roots": records},
+        )
+    return records
+
+
+def finalize_job_terminal(
+    paths: Mapping[str, Path],
+    job: Mapping[str, Any],
+    state: str,
+    *,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Apply common cleanup and sealing for non-runner terminal transitions."""
+    value = dict(job)
+    if value.get("data_links_active"):
+        try:
+            remove_data_links(value)
+        except Exception as exc:
+            value["data_link_cleanup_error"] = str(exc)
+        else:
+            value["data_links_active"] = False
+    try:
+        seal_job_artifacts(value)
+    except Exception as exc:
+        value["artifact_manifest_error"] = str(exc)
+    worktree_value = value.get("worktree")
+    if isinstance(worktree_value, str) and Path(worktree_value).is_dir():
+        try:
+            value["source_integrity"] = inspect_job_source(value)
+        except Exception as exc:
+            value["source_integrity_error"] = str(exc)
+    value["state"] = state
+    value["phase"] = "finished"
+    value["finished_at"] = utc_now()
+    if error:
+        value["error"] = error
+    value.pop("process_pid", None)
+    value.pop("process_start_ticks", None)
+    return save_server_job(paths, value)
+
+
 def server_job_run(project_id: str, run_id: str) -> int:
     paths = ensure_server_layout(project_id)
     job = load_server_job(paths, run_id)
@@ -6561,7 +7649,7 @@ def server_job_run(project_id: str, run_id: str) -> int:
     active: dict[str, Any] = {"process": None, "stop": False}
 
     def save_note(message: str) -> None:
-        with log_path.open("a", encoding="utf-8") as handle:
+        with open_regular_nofollow(log_path, append=True) as handle:
             handle.write(f"{utc_now()} [runner] {message}\n")
             handle.flush()
 
@@ -6586,7 +7674,7 @@ def server_job_run(project_id: str, run_id: str) -> int:
 
     def run_job_process(argv: Sequence[str], output_path: Path) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with output_path.open("a", encoding="utf-8") as output:
+        with open_regular_nofollow(output_path, append=True) as output:
             process = subprocess.Popen(
                 list(argv),
                 cwd=Path(job["worktree"]),
@@ -6603,6 +7691,16 @@ def server_job_run(project_id: str, run_id: str) -> int:
             if refresh_stop_request():
                 terminate_child_process(process, process_group=True)
             returncode = process.wait()
+            background_process_detected = terminate_remaining_process_group(process.pid)
+            if background_process_detected:
+                job["background_process_detected"] = True
+                job["background_process_group"] = process.pid
+                save_note(
+                    "detected and terminated process-group members left after the invoked "
+                    "command exited"
+                )
+                if returncode == 0:
+                    returncode = 125
             refresh_stop_request()
         active["process"] = None
         job.pop("process_pid", None)
@@ -6614,6 +7712,7 @@ def server_job_run(project_id: str, run_id: str) -> int:
         if job.get("data_links_active"):
             remove_data_links(job)
             job["data_links_active"] = False
+        seal_job_artifacts(job)
         job["source_integrity"] = inspect_job_source(job)
         job["state"] = state
         job["phase"] = "finished"
@@ -6755,6 +7854,33 @@ def server_job_run(project_id: str, run_id: str) -> int:
                     "Frozen-source preflight tests changed the pinned source checkout",
                 )
 
+        preexisting_artifacts: list[str] = []
+        for key in ("results_dir", "checkpoints_dir"):
+            root = Path(str(job[key]))
+            if root.is_symlink() or not root.is_dir():
+                return finish_before_command(
+                    "FAILED", 1, f"Managed artifact root became unsafe before launch: {root}"
+                )
+            preexisting_artifacts.extend(
+                str(path.relative_to(root)) for path in root.rglob("*")
+            )
+        if preexisting_artifacts:
+            return finish_before_command(
+                "FAILED",
+                1,
+                "Bootstrap or preflight created experiment artifacts before the command: "
+                + ", ".join(preexisting_artifacts[:20]),
+            )
+        marker = str(job.get("completion_marker") or "")
+        if marker:
+            marker_path = job_completion_marker_path(Path(job["worktree"]), marker)
+            if marker_path.exists() or marker_path.is_symlink():
+                return finish_before_command(
+                    "FAILED",
+                    1,
+                    "Bootstrap or preflight created the completion marker before the command",
+                )
+
         job["phase"] = "command"
         job["command_started_at"] = utc_now()
         job = save_server_job(paths, job)
@@ -6764,7 +7890,7 @@ def server_job_run(project_id: str, run_id: str) -> int:
         job["exit_code"] = returncode
 
         marker = str(job.get("completion_marker") or "")
-        marker_present = True
+        marker_present = False
         marker_error: str | None = None
         if marker:
             try:
@@ -6790,6 +7916,8 @@ def server_job_run(project_id: str, run_id: str) -> int:
         # link.
         remove_data_links(job)
         job["data_links_active"] = False
+        seal_job_artifacts(job)
+        artifact_evidence = list(job["artifact_evidence"])
         source_integrity = inspect_job_source(job)
         job["source_integrity"] = source_integrity
         tracked_changes = str(source_integrity["tracked_changes"])
@@ -6810,9 +7938,15 @@ def server_job_run(project_id: str, run_id: str) -> int:
             job["error"] = (
                 "The experiment altered its frozen source identity: " + "; ".join(details)
             )
-        elif not marker_present:
+        elif marker and not marker_present:
             job["state"] = "INCOMPLETE"
-            job["error"] = marker_error or f"Completion marker was not created: {marker}"
+            job["error"] = marker_error or "The configured completion marker is missing"
+        elif not marker and not artifact_evidence:
+            job["state"] = "INCOMPLETE"
+            job["error"] = marker_error or (
+                "The command exited zero but created neither its configured completion marker "
+                "nor a regular file under CODEX_RESULTS_DIR or CODEX_CHECKPOINTS_DIR"
+            )
         else:
             job["state"] = "SUCCEEDED"
         job["phase"] = "finished"
@@ -6836,6 +7970,10 @@ def server_job_run(project_id: str, run_id: str) -> int:
         job["finished_at"] = utc_now()
         job.pop("process_pid", None)
         job.pop("process_start_ticks", None)
+        try:
+            seal_job_artifacts(job)
+        except Exception as manifest_exc:
+            job["artifact_manifest_error"] = str(manifest_exc)
         save_server_job(paths, job)
         save_note(f"failed: {exc}")
         return 1
@@ -6872,17 +8010,12 @@ def job_with_runtime_status(paths: Mapping[str, Path], job: dict[str, Any]) -> d
     if value.get("state") in JOB_ACTIVE_STATES:
         pane = value["tmux"]
         if not value["process_alive"] and (pane.get("pane_dead") or not pane.get("exists")):
-            value["state"] = "ORPHANED"
-            value["error"] = "Job runner and process disappeared while the job was active"
-            value["finished_at"] = utc_now()
-            if value.get("data_links_active"):
-                try:
-                    remove_data_links(value)
-                except Exception as exc:
-                    value["data_link_cleanup_error"] = str(exc)
-                else:
-                    value["data_links_active"] = False
-            value = save_server_job(paths, value)
+            value = finalize_job_terminal(
+                paths,
+                value,
+                "ORPHANED",
+                error="Job runner and process disappeared while the job was active",
+            )
             value["tmux"] = pane
             value["worktree_exists"] = bool(
                 isinstance(worktree_value, str)
@@ -6936,6 +8069,8 @@ def server_job_logs(project_id: str, run_id: str, lines: int) -> dict[str, Any]:
     for title, filename in (
         ("Run", "run.log"),
         ("Frozen-worktree bootstrap", "bootstrap.log"),
+        ("Independent audit events", "audit.jsonl"),
+        ("Independent audit stderr", "audit.stderr.log"),
         ("Analysis events", "analysis.jsonl"),
         ("Analysis stderr", "analysis.stderr.log"),
     ):
@@ -6961,77 +8096,444 @@ def server_job_stop(project_id: str, run_id: str) -> dict[str, Any]:
     job["state"] = "STOP_REQUESTED"
     job = save_server_job(paths, job)
     pid = job.get("process_pid")
-    if process_identity_alive(pid, job.get("server_boot_id"), job.get("process_start_ticks")):
-        try:
-            os.killpg(int(pid), signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            pass
+    signalled, escalated = terminate_process_group_with_escalation(
+        pid,
+        job.get("server_boot_id"),
+        job.get("process_start_ticks"),
+    )
+    if signalled:
+        latest = load_server_job(paths, run_id) or job
+        latest["stop_requested"] = True
+        latest["stop_signal"] = "SIGKILL" if escalated else "SIGTERM"
+        latest["stop_escalated"] = escalated
+        job = save_server_job(paths, latest)
     elif not pid:
         tmux = job.get("tools", {}).get("tmux") or login_which("tmux")
         if tmux and job.get("tmux_session"):
             run([tmux, "kill-session", "-t", job["tmux_session"]], check=False)
-        job["state"] = "STOPPED"
-        job["finished_at"] = utc_now()
-        job = save_server_job(paths, job)
+        job = finalize_job_terminal(
+            paths,
+            job,
+            "STOPPED",
+            error="Job was stopped before a child experiment process was active",
+        )
     return {"ok": True, "job": job}
 
 
-def job_analysis_schema() -> dict[str, Any]:
+def job_audit_schema() -> dict[str, Any]:
     string_array = {"type": "array", "items": {"type": "string"}}
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "run_integrity": {
+                "type": "string",
+                "enum": ["invalid", "incomplete", "auditable"],
+            },
+            "implementation_matches_claim": {
+                "type": "string",
+                "enum": ["yes", "no", "uncertain"],
+            },
+            "summary": {"type": "string"},
+            "evidence_manifest_path": {"type": "string"},
+            "identity_and_split_evidence_verified": {"type": "boolean"},
+            "audited_paths": string_array,
+            "manifest_checks": string_array,
+            "data_and_split_checks": string_array,
+            "implementation_checks": string_array,
+            "metric_and_statistics_checks": string_array,
+            "leakage_or_contamination_risks": string_array,
+            "anomalies": string_array,
+            "blocking_defects": string_array,
+            "repair_actions": string_array,
+            "residual_risks": string_array,
+        },
+        "required": [
+            "run_integrity",
+            "implementation_matches_claim",
+            "summary",
+            "evidence_manifest_path",
+            "identity_and_split_evidence_verified",
+            "audited_paths",
+            "manifest_checks",
+            "data_and_split_checks",
+            "implementation_checks",
+            "metric_and_statistics_checks",
+            "leakage_or_contamination_risks",
+            "anomalies",
+            "blocking_defects",
+            "repair_actions",
+            "residual_risks",
+        ],
+    }
+
+
+def job_analysis_schema() -> dict[str, Any]:
+    string_array = {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+    }
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
             "run_complete": {"type": "boolean"},
+            "evidence_status": {
+                "type": "string",
+                "enum": ["invalid", "incomplete", "valid_negative", "mixed", "positive"],
+            },
+            "claim_tested": {"type": "string"},
             "summary": {"type": "string"},
             "source_and_command": {"type": "string"},
+            "audit_disposition": {"type": "string"},
             "coverage_checks": string_array,
             "headline_results": string_array,
+            "effect_and_uncertainty": string_array,
             "anomalies": string_array,
             "supported_conclusions": string_array,
             "unsupported_conclusions": string_array,
+            "alternative_explanations": string_array,
+            "decisive_followups": string_array,
+            "future_directions": string_array,
+            "salvageable_contributions": string_array,
+            "stop_recommended": {"type": "boolean"},
+            "stopping_criterion_met": {"type": "boolean"},
+            "stopping_assessment": {"type": "string", "minLength": 1},
             "recommended_actions": string_array,
         },
         "required": [
             "run_complete",
+            "evidence_status",
+            "claim_tested",
             "summary",
             "source_and_command",
+            "audit_disposition",
             "coverage_checks",
             "headline_results",
+            "effect_and_uncertainty",
             "anomalies",
             "supported_conclusions",
             "unsupported_conclusions",
+            "alternative_explanations",
+            "decisive_followups",
+            "future_directions",
+            "salvageable_contributions",
+            "stop_recommended",
+            "stopping_criterion_met",
+            "stopping_assessment",
             "recommended_actions",
         ],
     }
 
 
-def job_analysis_prompt(job: Mapping[str, Any]) -> str:
-    return f"""Inspect and interpret frozen experiment run {job['run_id']}.
+def validate_job_analysis_actionability(analysis: Mapping[str, Any]) -> None:
+    """Require a bounded continuation or a specifically justified stop.
+
+    Prompting alone is not a sufficient guard against treating one weak or
+    negative result as the end of a research direction.  This validator is
+    intentionally separate from the audit/interpretation consistency gate so
+    both requirements remain explicit and independently testable.
+    """
+    evidence = analysis.get("evidence_status")
+    stopping = str(analysis.get("stopping_assessment") or "").strip()
+    if not stopping:
+        raise CodexRemoteError(
+            "Experiment analysis needs a nonempty stopping assessment",
+            code="JOB_ANALYSIS_NOT_ACTIONABLE",
+        )
+
+    def useful_items(key: str) -> list[str]:
+        value = analysis.get(key)
+        if not isinstance(value, list):
+            return []
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+    if evidence in {"valid_negative", "mixed"} and not useful_items(
+        "alternative_explanations"
+    ):
+        raise CodexRemoteError(
+            "Negative or mixed evidence needs at least one alternative explanation",
+            code="JOB_ANALYSIS_NOT_ACTIONABLE",
+        )
+
+    stop_recommended = analysis.get("stop_recommended") is True
+    criterion_met = analysis.get("stopping_criterion_met") is True
+    if stop_recommended and not criterion_met:
+        raise CodexRemoteError(
+            "Stopping cannot be recommended unless a stated kill criterion was met",
+            code="JOB_ANALYSIS_NOT_ACTIONABLE",
+        )
+    if evidence in {"invalid", "incomplete"} and stop_recommended:
+        raise CodexRemoteError(
+            "Invalid or incomplete evidence cannot retire the scientific direction",
+            code="JOB_ANALYSIS_NOT_ACTIONABLE",
+        )
+    if evidence not in {"invalid", "incomplete", "valid_negative", "mixed"}:
+        return
+
+    bounded_paths = any(
+        useful_items(key)
+        for key in (
+            "decisive_followups",
+            "future_directions",
+            "salvageable_contributions",
+        )
+    )
+    justified_stop = stop_recommended and criterion_met
+    if not bounded_paths and not justified_stop:
+        raise CodexRemoteError(
+            "Invalid, incomplete, negative, or mixed evidence needs a bounded follow-up, "
+            "future direction, salvageable contribution, or an explicitly justified stop",
+            code="JOB_ANALYSIS_NOT_ACTIONABLE",
+        )
+
+
+def validate_job_review_consistency(
+    audit: Mapping[str, Any], analysis: Mapping[str, Any]
+) -> None:
+    """Mechanically prevent interpretation from overruling a blocking audit."""
+    integrity = audit.get("run_integrity")
+    implementation = audit.get("implementation_matches_claim")
+    blocking = audit.get("blocking_defects")
+    evidence = analysis.get("evidence_status")
+    if integrity not in {"invalid", "incomplete", "auditable"}:
+        raise CodexRemoteError("Audit has an invalid integrity status", code="JOB_REVIEW_INCONSISTENT")
+    if implementation not in {"yes", "no", "uncertain"}:
+        raise CodexRemoteError("Audit has an invalid implementation status", code="JOB_REVIEW_INCONSISTENT")
+    if not isinstance(blocking, list):
+        raise CodexRemoteError("Audit blocking defects are malformed", code="JOB_REVIEW_INCONSISTENT")
+    if evidence not in {"invalid", "incomplete", "valid_negative", "mixed", "positive"}:
+        raise CodexRemoteError("Analysis has an invalid evidence status", code="JOB_REVIEW_INCONSISTENT")
+
+    required_evidence: str | None = None
+    if integrity == "invalid" or implementation == "no" or blocking:
+        required_evidence = "invalid"
+    elif integrity == "incomplete" or implementation == "uncertain":
+        required_evidence = "incomplete"
+    if required_evidence and evidence != required_evidence:
+        raise CodexRemoteError(
+            f"Audit requires evidence_status={required_evidence}, but analysis returned {evidence}",
+            code="JOB_REVIEW_INCONSISTENT",
+            details={"audit": dict(audit), "analysis": dict(analysis)},
+        )
+    if required_evidence and analysis.get("run_complete") is not False:
+        raise CodexRemoteError(
+            "Invalid or incomplete audited evidence cannot be marked run_complete",
+            code="JOB_REVIEW_INCONSISTENT",
+        )
+
+
+def validate_job_audit_evidence(job: Mapping[str, Any], audit: Mapping[str, Any]) -> None:
+    """Require sealed machine-readable identity evidence before calling a run auditable."""
+    if audit.get("run_integrity") != "auditable":
+        return
+    if job.get("sealed_post_hoc"):
+        raise CodexRemoteError(
+            "Post-hoc-sealed legacy artifacts cannot be classified as auditable",
+            code="JOB_AUDIT_EVIDENCE_MISSING",
+        )
+    if audit.get("identity_and_split_evidence_verified") is not True:
+        raise CodexRemoteError(
+            "An auditable run must verify machine-readable identity and split evidence",
+            code="JOB_AUDIT_EVIDENCE_MISSING",
+        )
+    relative_value = audit.get("evidence_manifest_path")
+    if not isinstance(relative_value, str):
+        raise CodexRemoteError(
+            "An auditable run must name its evidence manifest",
+            code="JOB_AUDIT_EVIDENCE_MISSING",
+        )
+    relative = PurePosixPath(relative_value)
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or len(relative.parts) < 2
+        or relative.parts[0] != "results"
+    ):
+        raise CodexRemoteError(
+            "The audit evidence manifest must be a path under results/",
+            code="JOB_AUDIT_EVIDENCE_MISSING",
+        )
+    sealed = verify_job_artifact_manifest(
+        job, roles={"result"}, paths={relative.as_posix()}
+    )
+    sealed_paths = {
+        item.get("path")
+        for item in sealed.get("artifacts") or []
+        if isinstance(item, Mapping) and item.get("kind") == "file"
+    }
+    if relative.as_posix() not in sealed_paths:
+        raise CodexRemoteError(
+            "The audit evidence manifest is not part of the sealed result set",
+            code="JOB_AUDIT_EVIDENCE_MISSING",
+        )
+    manifest = read_json(Path(str(job["state_dir"])).joinpath(*relative.parts))
+    required_hashes = (
+        "dataset_manifest_sha256",
+        "split_manifest_sha256",
+        "membership_evidence_sha256",
+    )
+    if not isinstance(manifest, dict) or any(
+        not isinstance(manifest.get(key), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(manifest.get(key))) is None
+        for key in required_hashes
+    ):
+        raise CodexRemoteError(
+            "The sealed evidence manifest needs three lowercase SHA-256 identities",
+            code="JOB_AUDIT_EVIDENCE_MISSING",
+        )
+    expected = manifest.get("expected_counts")
+    observed = manifest.get("observed_counts")
+    for label, counts in (("expected_counts", expected), ("observed_counts", observed)):
+        if (
+            not isinstance(counts, dict)
+            or not counts
+            or any(
+                not isinstance(key, str)
+                or not key
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for key, value in counts.items()
+            )
+        ):
+            raise CodexRemoteError(
+                f"The sealed evidence manifest has invalid {label}",
+                code="JOB_AUDIT_EVIDENCE_MISSING",
+            )
+    if set(expected) != set(observed):
+        raise CodexRemoteError(
+            "Expected and observed evidence counts must use identical keys",
+            code="JOB_AUDIT_EVIDENCE_MISSING",
+        )
+
+
+def constrain_job_audit(
+    job: Mapping[str, Any],
+    audit: Mapping[str, Any],
+    *,
+    artifact_integrity_error: str | None = None,
+    artifact_integrity_code: str | None = None,
+) -> dict[str, Any]:
+    """Downgrade unsupported audit claims while preserving phase-two interpretation."""
+    value = dict(audit)
+    defect: str | None = None
+    forced_integrity = "incomplete"
+    if artifact_integrity_error:
+        defect = "Mechanical artifact-integrity gate failed: " + artifact_integrity_error
+        forced_integrity = "invalid"
+    else:
+        try:
+            validate_job_audit_evidence(job, value)
+        except CodexRemoteError as exc:
+            if exc.code not in {
+                "JOB_AUDIT_EVIDENCE_MISSING",
+                "ARTIFACT_MANIFEST_MISMATCH",
+                "ARTIFACT_MANIFEST_MISSING",
+                "UNSAFE_JOB_ARTIFACT",
+            }:
+                raise
+            defect = "Mechanical identity-evidence gate failed: " + str(exc)
+    if defect and forced_integrity == "invalid":
+        blockers = list(value.get("blocking_defects") or [])
+        if defect not in blockers:
+            blockers.append(defect)
+        value["blocking_defects"] = blockers
+    elif defect:
+        manifest_checks = list(value.get("manifest_checks") or [])
+        if defect not in manifest_checks:
+            manifest_checks.append(defect)
+        value["manifest_checks"] = manifest_checks
+        residual = list(value.get("residual_risks") or [])
+        if defect not in residual:
+            residual.append(defect)
+        value["residual_risks"] = residual
+    if defect:
+        value["run_integrity"] = forced_integrity
+        value["identity_and_split_evidence_verified"] = False
+        summary = str(value.get("summary") or "").strip()
+        value["summary"] = (
+            f"{defect} " + summary
+        ).strip()
+    return value
+
+
+def job_audit_prompt(
+    job: Mapping[str, Any], *, artifact_access_forbidden: bool = False
+) -> str:
+    artifact_instruction = (
+        "The trusted runner detected an unsafe artifact-root path and neutralized any symlink. "
+        "Do not open the results_dir or checkpoints_dir recorded in run.json; audit only safe "
+        "run metadata, logs, and frozen source. Classify the run invalid."
+        if artifact_access_forbidden
+        else (
+            f"Inspect captured artifacts in {job['results_dir']} and {job['checkpoints_dir']}."
+        )
+    )
+    return f"""Independently audit frozen experiment run {job['run_id']} before anyone interprets it.
 
 Read the run manifest at {Path(job['state_dir']) / 'run.json'}, the status and logs in
-{job['state_dir']}, the frozen source at {job['worktree']}, and any artifacts in
-{job['results_dir']} and {job['checkpoints_dir']}.
+{job['state_dir']} and the frozen source at {job['worktree']}. {artifact_instruction}
 
-First verify the exit status, completion marker, expected groups/rows/artifacts, malformed or
-zero-byte files, and whether the run is actually complete. Do not infer completion merely from
-a nonempty output file. Identify the exact source SHA and command, headline metrics and
-uncertainty, comparison with any clearly identified prior comparable output, anomalies that
-could invalidate interpretation, supported conclusions, unsupported conclusions, and concrete
-next actions. Do not modify files, relaunch work, stop processes, or delete outputs. Return only
-the requested structured result.
+Act as an adversarial methods and implementation reviewer, not as the author and not as a results
+summarizer. Reconstruct the intended claim from repository research records, configs, and invoked
+entry points. Trace config -> data and split -> preprocessing -> model/checkpoint -> decoding ->
+aggregation -> reported metric. Inspect the actual invoked code paths. Check sample identity,
+train/test isolation, target leakage, label alignment, silent fallbacks, model and checkpoint
+identity, denominators, deduplication, seed use, statistical units, completion and artifact
+coverage. A zero exit status, nonempty file, or plausible number is not sufficient. Classify the
+run as invalid, incomplete, or auditable, and say whether the implementation matches the claim.
+You may return auditable only when a sealed JSON evidence manifest under results/ records dataset,
+split, and membership hashes plus expected and observed counts; return its relative path and set
+identity_and_split_evidence_verified only after checking it against the invoked code and artifacts.
+Do not decide whether the research direction is promising. Do not modify files, use network
+search, relaunch work, stop processes, or delete outputs. Return only the requested structured
+result.
 """
 
 
-def job_analysis_command(job: Mapping[str, Any]) -> list[str]:
+def job_analysis_prompt(
+    job: Mapping[str, Any], *, artifact_access_forbidden: bool = False
+) -> str:
+    safe_read_scope = (
+        "Do not open the results_dir or checkpoints_dir paths recorded in run.json because the "
+        "trusted runner classified an artifact root as unsafe. Use only audit.json, audit.md, "
+        "safe run metadata/logs, frozen source, and repository research records."
+        if artifact_access_forbidden
+        else f"Read safe captured artifacts under {job['state_dir']} as needed."
+    )
+    return f"""Interpret frozen experiment run {job['run_id']} after its independent audit.
+
+Read {Path(job['state_dir']) / 'audit.json'} and {Path(job['state_dir']) / 'audit.md'} first. Then
+read the run manifest, logs, frozen source, and repository research records. {safe_read_scope}
+
+Classify the evidence as invalid, incomplete, valid_negative, mixed, or positive. If the audit
+finds a blocking defect or does not establish implementation fidelity, do not use the metrics as
+evidence for or against the scientific hypothesis. For auditable evidence, report effect sizes
+and uncertainty where available, supported and unsupported conclusions, and alternative
+technical, data, statistical, and conceptual explanations. For negative or mixed evidence,
+identify the cheapest decisive follow-ups, scoped future directions, and any reusable empirical
+or methodological contribution. Do not declare the overall direction nonviable from one run.
+Set stop_recommended and stopping_criterion_met true only when a stated kill criterion is actually
+met; otherwise set both false and state what criterion and evidence would justify stopping. Do not
+manufacture optimism or propose an unbounded fishing
+expedition. Do not modify files, use network search, relaunch work, stop processes, or delete
+outputs. Return only the requested structured result.
+"""
+
+
+def job_review_command(job: Mapping[str, Any], phase: str) -> list[str]:
+    if phase not in {"audit", "analysis"}:
+        raise CodexRemoteError(f"Unknown job review phase: {phase}", code="INVALID_ARGUMENT")
     codex = job.get("tools", {}).get("codex") or login_which("codex")
     if not codex:
         raise CodexRemoteError("Codex is unavailable for analysis", code="REMOTE_PREREQUISITES_MISSING")
     state_dir = Path(job["state_dir"])
     command = [codex, "--ask-for-approval", "never", "exec", "--json", "--sandbox", "read-only"]
-    command.extend(["--output-schema", str(state_dir / "analysis-schema.json")])
-    command.extend(["--output-last-message", str(state_dir / "analysis.json")])
+    command.extend(["--output-schema", str(state_dir / f"{phase}-schema.json")])
+    command.extend(["--output-last-message", str(state_dir / f"{phase}.json")])
     if job.get("model"):
         command.extend(["--model", job["model"]])
     if job.get("profile"):
@@ -7043,9 +8545,16 @@ def job_analysis_command(job: Mapping[str, Any]) -> list[str]:
             "--config",
             "developer_instructions="
             + json.dumps(
-                "Analyze this completed experiment read-only. Do not edit files, start or stop "
-                "jobs, use network search, or claim completion without checking the manifest, "
-                "exit status, completion marker, and artifact coverage."
+                (
+                    "Audit this experiment independently and read-only. Verify the invoked "
+                    "implementation, data path, split integrity, metrics, and artifact coverage; "
+                    "do not interpret scientific promise."
+                    if phase == "audit"
+                    else
+                    "Interpret this experiment read-only and only after reading the independent "
+                    "audit. Distinguish invalid, incomplete, valid-negative, mixed, and positive "
+                    "evidence; do not terminate a direction without explicit kill criteria."
+                )
             ),
             "-",
         ]
@@ -7053,17 +8562,67 @@ def job_analysis_command(job: Mapping[str, Any]) -> list[str]:
     return command
 
 
+def job_audit_command(job: Mapping[str, Any]) -> list[str]:
+    return job_review_command(job, "audit")
+
+
+def job_analysis_command(job: Mapping[str, Any]) -> list[str]:
+    return job_review_command(job, "analysis")
+
+
+def render_job_audit(value: Mapping[str, Any], run_id: str) -> str:
+    sections = [f"# Independent experiment audit: {run_id}", ""]
+    sections.append(f"**Run integrity:** {value.get('run_integrity') or 'unknown'}")
+    sections.append(
+        f"**Implementation matches claim:** {value.get('implementation_matches_claim') or 'unknown'}"
+    )
+    sections.append(
+        f"**Evidence manifest:** {value.get('evidence_manifest_path') or 'not established'}"
+    )
+    sections.append(
+        "**Identity/split evidence verified:** "
+        + ("yes" if value.get("identity_and_split_evidence_verified") else "no")
+    )
+    sections.extend(["", "## Summary", "", str(value.get("summary") or "")])
+    for heading, key in (
+        ("Audited paths", "audited_paths"),
+        ("Manifest checks", "manifest_checks"),
+        ("Data and split checks", "data_and_split_checks"),
+        ("Implementation checks", "implementation_checks"),
+        ("Metric and statistics checks", "metric_and_statistics_checks"),
+        ("Leakage or contamination risks", "leakage_or_contamination_risks"),
+        ("Anomalies", "anomalies"),
+        ("Blocking defects", "blocking_defects"),
+        ("Repair actions", "repair_actions"),
+        ("Residual risks", "residual_risks"),
+    ):
+        sections.extend(["", f"## {heading}", ""])
+        items = value.get(key) or []
+        sections.extend(f"- {item}" for item in items)
+        if not items:
+            sections.append("- None identified.")
+    return "\n".join(sections).rstrip() + "\n"
+
+
 def render_job_analysis(value: Mapping[str, Any], run_id: str) -> str:
     sections = [f"# Experiment analysis: {run_id}", ""]
     sections.append(f"**Run complete:** {'yes' if value.get('run_complete') else 'no'}")
+    sections.append(f"**Evidence status:** {value.get('evidence_status') or 'unknown'}")
+    sections.extend(["", "## Claim tested", "", str(value.get("claim_tested") or "")])
     sections.extend(["", "## Summary", "", str(value.get("summary") or "")])
     sections.extend(["", "## Source and command", "", str(value.get("source_and_command") or "")])
+    sections.extend(["", "## Audit disposition", "", str(value.get("audit_disposition") or "")])
     for heading, key in (
         ("Coverage checks", "coverage_checks"),
         ("Headline results", "headline_results"),
+        ("Effect and uncertainty", "effect_and_uncertainty"),
         ("Anomalies", "anomalies"),
         ("Supported conclusions", "supported_conclusions"),
         ("Unsupported conclusions", "unsupported_conclusions"),
+        ("Alternative explanations", "alternative_explanations"),
+        ("Decisive follow-ups", "decisive_followups"),
+        ("Future directions", "future_directions"),
+        ("Salvageable contributions", "salvageable_contributions"),
         ("Recommended actions", "recommended_actions"),
     ):
         sections.extend(["", f"## {heading}", ""])
@@ -7072,6 +8631,15 @@ def render_job_analysis(value: Mapping[str, Any], run_id: str) -> str:
             sections.extend(f"- {item}" for item in items)
         else:
             sections.append("- None identified.")
+    sections.extend(
+        ["", "## Stopping assessment", "", str(value.get("stopping_assessment") or "")]
+    )
+    sections.append(
+        "\n**Stop recommended:** "
+        + ("yes" if value.get("stop_recommended") else "no")
+        + "; **stopping criterion met:** "
+        + ("yes" if value.get("stopping_criterion_met") else "no")
+    )
     return "\n".join(sections).rstrip() + "\n"
 
 
@@ -7088,20 +8656,67 @@ def server_job_analyze(project_id: str, run_id: str) -> int:
     job["analysis"] = analysis
     save_server_job(paths, job)
     try:
+        # Interpret only the exact artifact set sealed when the run became
+        # terminal.  The public launcher checks this too; retain the check here
+        # so direct/internal invocation cannot analyze mutable evidence.
+        artifact_integrity_error: str | None = None
+        artifact_integrity_code: str | None = None
+        try:
+            verify_job_artifact_manifest(job)
+        except CodexRemoteError as exc:
+            artifact_integrity_error = str(exc)
+            artifact_integrity_code = exc.code
+        artifact_access_forbidden = artifact_integrity_code == "UNSAFE_JOB_ARTIFACT"
+        if artifact_access_forbidden:
+            neutralize_unsafe_job_artifact_roots(job)
+        atomic_write_json(state_dir / "audit-schema.json", job_audit_schema())
         atomic_write_json(state_dir / "analysis-schema.json", job_analysis_schema())
         # A failed rerun must never be mistaken for the structured output from
         # an earlier successful analysis attempt.
-        for stale_name in ("analysis.json", "analysis.md"):
+        for stale_name in ("audit.json", "audit.md", "analysis.json", "analysis.md"):
             with contextlib.suppress(FileNotFoundError):
                 (state_dir / stale_name).unlink()
+
+        audit_command = job_audit_command(job)
+        with open_regular_nofollow(state_dir / "audit.jsonl", truncate=True) as out, (
+            open_regular_nofollow(state_dir / "audit.stderr.log", truncate=True)
+        ) as err:
+            audit_completed = subprocess.run(
+                audit_command,
+                cwd=Path(job["worktree"]),
+                input=job_audit_prompt(
+                    job, artifact_access_forbidden=artifact_access_forbidden
+                ),
+                stdout=out,
+                stderr=err,
+                text=True,
+                check=False,
+            )
+        audit_value = read_json(state_dir / "audit.json")
+        if audit_completed.returncode != 0 or not isinstance(audit_value, dict):
+            raise CodexRemoteError(
+                f"Codex audit exited {audit_completed.returncode} without valid structured output",
+                code="JOB_AUDIT_FAILED",
+            )
+        audit_value = constrain_job_audit(
+            job,
+            audit_value,
+            artifact_integrity_error=artifact_integrity_error,
+            artifact_integrity_code=artifact_integrity_code,
+        )
+        atomic_write_json(state_dir / "audit.json", audit_value)
+        atomic_write_text(state_dir / "audit.md", render_job_audit(audit_value, run_id))
+
         command = job_analysis_command(job)
-        with (state_dir / "analysis.jsonl").open("w", encoding="utf-8") as out, (
-            state_dir / "analysis.stderr.log"
-        ).open("w", encoding="utf-8") as err:
+        with open_regular_nofollow(state_dir / "analysis.jsonl", truncate=True) as out, (
+            open_regular_nofollow(state_dir / "analysis.stderr.log", truncate=True)
+        ) as err:
             completed = subprocess.run(
                 command,
                 cwd=Path(job["worktree"]),
-                input=job_analysis_prompt(job),
+                input=job_analysis_prompt(
+                    job, artifact_access_forbidden=artifact_access_forbidden
+                ),
                 stdout=out,
                 stderr=err,
                 text=True,
@@ -7113,12 +8728,16 @@ def server_job_analyze(project_id: str, run_id: str) -> int:
                 f"Codex analysis exited {completed.returncode} without valid structured output",
                 code="JOB_ANALYSIS_FAILED",
             )
+        validate_job_review_consistency(audit_value, value)
+        validate_job_analysis_actionability(value)
         atomic_write_text(state_dir / "analysis.md", render_job_analysis(value, run_id))
         analysis.update(
             {
                 "state": "SUCCEEDED",
                 "exit_code": completed.returncode,
                 "finished_at": utc_now(),
+                "audit_json": str(state_dir / "audit.json"),
+                "audit_markdown": str(state_dir / "audit.md"),
                 "analysis_json": str(state_dir / "analysis.json"),
                 "analysis_markdown": str(state_dir / "analysis.md"),
             }
@@ -7139,7 +8758,9 @@ def server_job_analyze(project_id: str, run_id: str) -> int:
         return 1
 
 
-def server_job_summarize(project_id: str, run_id: str) -> dict[str, Any]:
+def server_job_summarize(
+    project_id: str, run_id: str, *, force: bool = False
+) -> dict[str, Any]:
     paths = ensure_server_layout(project_id)
     job = load_server_job(paths, run_id)
     if not job:
@@ -7151,8 +8772,15 @@ def server_job_summarize(project_id: str, run_id: str) -> dict[str, Any]:
             code="JOB_ACTIVE",
             details=status,
         )
+    job = load_server_job(paths, run_id) or job
+    job, _manifest = adopt_legacy_job_artifacts(
+        paths, job, verify_existing=False
+    )
+    status = job_with_runtime_status(paths, job)
     analysis = dict(job.get("analysis") or {})
     if analysis.get("state") in {"STARTING", "RUNNING"}:
+        return {"ok": True, "job": status, "analysis": analysis, "idempotent": True}
+    if analysis.get("state") == "SUCCEEDED" and not force:
         return {"ok": True, "job": status, "analysis": analysis, "idempotent": True}
     tmux = job.get("tools", {}).get("tmux") or login_which("tmux")
     bash = job.get("tools", {}).get("bash") or login_which("bash")
@@ -7162,10 +8790,7 @@ def server_job_summarize(project_id: str, run_id: str) -> dict[str, Any]:
     state_dir = Path(job["state_dir"])
     helper = state_dir / "codex-job-runner.py"
     current_helper = Path(__file__).resolve()
-    current_helper_sha256 = sha256_file(current_helper)
-    if not helper.exists() or sha256_file(helper) != current_helper_sha256:
-        helper.write_bytes(current_helper.read_bytes())
-        helper.chmod(0o700)
+    current_helper_sha256 = install_runner_helper(helper, current_helper)
     job["runner_helper_sha256"] = current_helper_sha256
     session = f"analysis-{project_id[-9:]}-{run_id[-10:]}"
     runner_argv = [
@@ -7177,7 +8802,7 @@ def server_job_summarize(project_id: str, run_id: str) -> dict[str, Any]:
         "--run-id",
         run_id,
     ]
-    command = shlex.join([bash, "-lc", "exec " + shlex.join(runner_argv)])
+    command = tmux_durable_pane_command(tmux, bash, session, runner_argv)
     analysis = {
         "state": "STARTING",
         "created_at": utc_now(),
@@ -7189,7 +8814,6 @@ def server_job_summarize(project_id: str, run_id: str) -> dict[str, Any]:
     run([tmux, "kill-session", "-t", session], check=False)
     try:
         run([tmux, "new-session", "-d", "-s", session, command])
-        run([tmux, "set-option", "-t", session, "remain-on-exit", "on"])
     except Exception as exc:
         analysis.update(
             {
@@ -7208,9 +8832,387 @@ def server_job_analysis(project_id: str, run_id: str) -> dict[str, Any]:
     status = server_job_status(project_id, run_id)
     job = status["job"]
     state_dir = Path(job["state_dir"])
-    text = (state_dir / "analysis.md").read_text(encoding="utf-8") if (state_dir / "analysis.md").is_file() else ""
+    text = tail_file(state_dir / "analysis.md", 1000000)
     value = read_json(state_dir / "analysis.json")
-    return {"ok": True, "job": job, "analysis": value, "markdown": text}
+    audit_text = tail_file(state_dir / "audit.md", 1000000)
+    audit_value = read_json(state_dir / "audit.json")
+    combined = ""
+    if audit_text:
+        combined += audit_text.rstrip() + "\n\n---\n\n"
+    combined += text
+    return {
+        "ok": True,
+        "job": job,
+        "audit": audit_value,
+        "audit_markdown": audit_text,
+        "analysis": value,
+        "markdown": combined,
+    }
+
+
+def server_job_artifacts(project_id: str, run_id: str) -> dict[str, Any]:
+    paths = ensure_server_layout(project_id)
+    job = load_server_job(paths, run_id)
+    if not job:
+        raise CodexRemoteError(f"Job not found: {run_id}", code="JOB_NOT_FOUND")
+    status = job_with_runtime_status(paths, job)
+    if status.get("state") in JOB_ACTIVE_STATES:
+        raise CodexRemoteError(
+            "Artifact inventory is sealed only after the job becomes terminal",
+            code="JOB_ACTIVE",
+            details=status,
+        )
+    job = load_server_job(paths, run_id) or job
+    job, manifest = adopt_legacy_job_artifacts(paths, job)
+    status = job_with_runtime_status(paths, job)
+    return {
+        "ok": True,
+        "job": status,
+        "artifact_manifest": manifest,
+        "artifact_manifest_path": str(Path(job["state_dir"]) / "artifacts.manifest.json"),
+    }
+
+
+JOB_REPORT_EXTENSIONS = {
+    ".arrow",
+    ".csv",
+    ".feather",
+    ".html",
+    ".jpeg",
+    ".jpg",
+    ".json",
+    ".log",
+    ".md",
+    ".parquet",
+    ".pdf",
+    ".png",
+    ".svg",
+    ".tex",
+    ".tsv",
+    ".txt",
+}
+JOB_REPORT_MAX_FILE_BYTES = 64 * 1024 * 1024
+JOB_REPORT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+JOB_REPORT_DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024
+JOB_FULL_DEFAULT_MAX_BYTES = 20 * 1024 * 1024 * 1024
+
+
+def verify_server_export_archive(
+    archive: Path, run_id: str, selection: Mapping[str, Any]
+) -> None:
+    """Verify a cached/new archive against its immutable selection snapshot."""
+    records = selection.get("files")
+    if not isinstance(records, list):
+        raise CodexRemoteError("Export selection is malformed", code="EXPORT_HASH_MISMATCH")
+    expected: dict[str, Mapping[str, Any]] = {}
+    for item in records:
+        if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
+            raise CodexRemoteError("Export selection is malformed", code="EXPORT_HASH_MISMATCH")
+        name = str(PurePosixPath(run_id) / str(item["path"]))
+        if name in expected:
+            raise CodexRemoteError("Export selection has duplicate files", code="EXPORT_HASH_MISMATCH")
+        expected[name] = item
+    selection_name = str(PurePosixPath(run_id) / "export-selection.json")
+    try:
+        with tarfile.open(archive, "r:gz") as handle:
+            members = handle.getmembers()
+            names = [member.name for member in members]
+            if len(names) != len(set(names)) or set(names) != set(expected) | {selection_name}:
+                raise CodexRemoteError(
+                    "Export archive members do not match its selection",
+                    code="EXPORT_HASH_MISMATCH",
+                )
+            for member in members:
+                if not member.isfile():
+                    raise CodexRemoteError(
+                        "Export archive contains a non-regular member",
+                        code="EXPORT_HASH_MISMATCH",
+                    )
+                source = handle.extractfile(member)
+                if source is None:
+                    raise CodexRemoteError(
+                        "Export archive member cannot be read", code="EXPORT_HASH_MISMATCH"
+                    )
+                with source:
+                    if member.name == selection_name:
+                        try:
+                            archived_selection = json.load(source)
+                        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                            raise CodexRemoteError(
+                                "Export selection member is invalid",
+                                code="EXPORT_HASH_MISMATCH",
+                            ) from exc
+                        if archived_selection != dict(selection):
+                            raise CodexRemoteError(
+                                "Export selection member was modified",
+                                code="EXPORT_HASH_MISMATCH",
+                            )
+                        continue
+                    item = expected[member.name]
+                    digest = hashlib.sha256()
+                    size = 0
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        size += len(chunk)
+                        digest.update(chunk)
+                    if size != item.get("size") or digest.hexdigest() != item.get("sha256"):
+                        raise CodexRemoteError(
+                            f"Export archive content changed while packaging: {member.name}",
+                            code="EXPORT_HASH_MISMATCH",
+                        )
+    except (tarfile.TarError, OSError) as exc:
+        if isinstance(exc, CodexRemoteError):
+            raise
+        raise CodexRemoteError(
+            f"Export archive is unreadable: {exc}", code="EXPORT_HASH_MISMATCH"
+        ) from exc
+
+
+def server_job_export(
+    project_id: str,
+    run_id: str,
+    profile: str,
+    max_unpacked_bytes: int = 0,
+) -> dict[str, Any]:
+    """Create a verified server-side archive for a local pull."""
+    if profile not in {"report", "full"}:
+        raise CodexRemoteError(f"Unknown export profile: {profile}", code="INVALID_ARGUMENT")
+    if max_unpacked_bytes < 0:
+        raise CodexRemoteError("Export size limit cannot be negative", code="INVALID_ARGUMENT")
+    paths = ensure_server_layout(project_id)
+    job = load_server_job(paths, run_id)
+    if not job:
+        raise CodexRemoteError(f"Job not found: {run_id}", code="JOB_NOT_FOUND")
+    status = job_with_runtime_status(paths, job)
+    if status.get("state") in JOB_ACTIVE_STATES:
+        raise CodexRemoteError(
+            "Wait until the experiment job is terminal before exporting it",
+            code="JOB_ACTIVE",
+            details=status,
+        )
+    job = load_server_job(paths, run_id) or job
+    state_dir = Path(str(job["state_dir"])).resolve()
+    artifact_manifest_path = state_dir / "artifacts.manifest.json"
+    selected_artifacts_verified = False
+    provenance_warning = str(job.get("sealed_post_hoc_warning") or "")
+    if artifact_manifest_path.is_symlink():
+        raise CodexRemoteError(
+            "The artifact manifest cannot be a symlink", code="UNSAFE_JOB_ARTIFACT"
+        )
+    if artifact_manifest_path.is_file():
+        artifact_manifest = read_json(artifact_manifest_path)
+        if not isinstance(artifact_manifest, dict):
+            raise CodexRemoteError(
+                "The artifact manifest is invalid", code="ARTIFACT_MANIFEST_MISSING"
+            )
+    elif profile == "full":
+        job, artifact_manifest = adopt_legacy_job_artifacts(paths, job)
+        provenance_warning = str(job.get("sealed_post_hoc_warning") or "")
+    else:
+        artifact_manifest = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "source_sha": job.get("source_sha"),
+            "artifacts": [],
+        }
+        provenance_warning = (
+            "This pre-upgrade run has no completion-time artifact seal. The report export is "
+            "metadata-only; use a full export to adopt current artifacts with an explicit "
+            "post-hoc provenance warning."
+        )
+
+    selected: dict[str, Path] = {}
+    omitted: list[dict[str, Any]] = []
+    metadata_names = (
+        "run.json",
+        "status.json",
+        "command.txt",
+        "bootstrap-command.txt",
+        "source-snapshot.txt",
+        "environment.txt",
+        "bootstrap.log",
+        "preflight-tests.log",
+        "run.log",
+        "artifacts.manifest.json",
+        "audit-schema.json",
+        "audit.json",
+        "audit.md",
+        "audit.jsonl",
+        "audit.stderr.log",
+        "analysis-schema.json",
+        "analysis.json",
+        "analysis.md",
+        "analysis.jsonl",
+        "analysis.stderr.log",
+    )
+    for name in metadata_names:
+        candidate = state_dir / name
+        if candidate.is_file() and not candidate.is_symlink():
+            if profile == "report" and candidate.stat().st_size > JOB_REPORT_MAX_FILE_BYTES:
+                omitted.append({"path": name, "reason": "report file-size limit"})
+                continue
+            selected[name] = candidate
+
+    selected_artifact_paths: set[str] = set()
+    for item in artifact_manifest.get("artifacts") or []:
+        if not isinstance(item, Mapping) or item.get("kind") != "file":
+            if isinstance(item, Mapping):
+                omitted.append({"path": item.get("path"), "reason": "non-regular artifact"})
+            continue
+        relative_value = item.get("path")
+        if not isinstance(relative_value, str):
+            continue
+        relative = PurePosixPath(relative_value)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise CodexRemoteError("Unsafe path in artifact manifest", code="UNSAFE_JOB_ARTIFACT")
+        candidate = state_dir.joinpath(*relative.parts)
+        include = profile == "full"
+        if profile == "report" and item.get("role") == "result":
+            include = (
+                candidate.suffix.lower() in JOB_REPORT_EXTENSIONS
+                and int(item.get("size") or 0) <= JOB_REPORT_MAX_FILE_BYTES
+            )
+        if include:
+            if not candidate.is_file() or candidate.is_symlink():
+                raise CodexRemoteError(
+                    f"Manifest artifact is no longer a regular file: {relative_value}",
+                    code="ARTIFACT_MANIFEST_MISMATCH",
+                )
+            selected[relative.as_posix()] = candidate
+            selected_artifact_paths.add(relative.as_posix())
+        else:
+            omitted.append({"path": relative_value, "reason": "outside export profile"})
+
+    if artifact_manifest_path.is_file():
+        if profile == "full":
+            verify_job_artifact_manifest(job)
+        else:
+            verify_job_artifact_manifest(
+                job, roles={"result"}, paths=selected_artifact_paths
+            )
+        selected_artifacts_verified = True
+
+    export_dir = state_dir / ".exports"
+    if export_dir.is_symlink():
+        raise CodexRemoteError("The export cache cannot be a symlink", code="UNSAFE_EXPORT_ARCHIVE")
+    export_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not export_dir.is_dir() or not export_dir.resolve().is_relative_to(state_dir):
+        raise CodexRemoteError(
+            "The export cache is outside the managed run directory",
+            code="UNSAFE_EXPORT_ARCHIVE",
+        )
+    if provenance_warning:
+        warning_path = export_dir / f"{profile}.provenance-warning.txt"
+        atomic_write_text(warning_path, provenance_warning.rstrip() + "\n")
+        selected["PROVENANCE-WARNING.txt"] = warning_path
+
+    selected_bytes = sum(path.stat().st_size for path in selected.values())
+    if profile == "report" and selected_bytes > JOB_REPORT_MAX_TOTAL_BYTES:
+        raise CodexRemoteError(
+            "Report export exceeds the server report-size limit; use the full profile with an "
+            "explicit larger --max-bytes value if needed",
+            code="EXPORT_TOO_LARGE",
+            details={"selected_unpacked_bytes": selected_bytes},
+        )
+    if max_unpacked_bytes and selected_bytes > max_unpacked_bytes:
+        raise CodexRemoteError(
+            "Run export exceeds the requested unpacked-size limit",
+            code="EXPORT_TOO_LARGE",
+            details={"selected_unpacked_bytes": selected_bytes},
+        )
+
+    selected_file_records: list[dict[str, Any]] = []
+    for relative, source in sorted(selected.items()):
+        digest = sha256_file(source)
+        if digest is None:
+            raise CodexRemoteError(
+                f"Export source disappeared: {relative}", code="ARTIFACT_MANIFEST_MISMATCH"
+            )
+        selected_file_records.append(
+            {"path": relative, "size": source.stat().st_size, "sha256": digest}
+        )
+    selection_base = {
+        "schema_version": 1,
+        "project_id": project_id,
+        "run_id": run_id,
+        "profile": profile,
+        "created_at": (
+            job.get("finished_at") or job.get("updated_at") or job.get("created_at") or utc_now()
+        ),
+        "source_sha": job.get("source_sha"),
+        "files": selected_file_records,
+        "omitted": omitted,
+        "selected_artifacts_verified": selected_artifacts_verified,
+        "complete_artifact_set_verified": (
+            selected_artifacts_verified and profile == "full"
+        ),
+        "sealed_post_hoc": bool(job.get("sealed_post_hoc")),
+        "provenance_warning": provenance_warning,
+    }
+    snapshot_sha256 = hashlib.sha256(
+        json.dumps(selection_base, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    selection = dict(selection_base)
+    selection["snapshot_sha256"] = snapshot_sha256
+    selection_path = export_dir / f"{profile}-{snapshot_sha256[:12]}.selection.json"
+    atomic_write_json(selection_path, selection)
+    selected["export-selection.json"] = selection_path
+    selected_bytes += selection_path.stat().st_size
+    if profile == "report" and selected_bytes > JOB_REPORT_MAX_TOTAL_BYTES:
+        raise CodexRemoteError("Report export exceeds the server report-size limit", code="EXPORT_TOO_LARGE")
+    if max_unpacked_bytes and selected_bytes > max_unpacked_bytes:
+        raise CodexRemoteError(
+            "Run export exceeds the requested unpacked-size limit",
+            code="EXPORT_TOO_LARGE",
+            details={"selected_unpacked_bytes": selected_bytes},
+        )
+
+    archive = export_dir / f"{run_id}-{profile}-{snapshot_sha256[:12]}.tar.gz"
+    if archive.is_symlink():
+        raise CodexRemoteError("The export archive cannot be a symlink", code="UNSAFE_EXPORT_ARCHIVE")
+    if archive.is_file():
+        try:
+            verify_server_export_archive(archive, run_id, selection)
+        except CodexRemoteError:
+            archive.unlink()
+    if not archive.is_file():
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{run_id}-{profile}.", suffix=".tar.gz", dir=export_dir
+        )
+        os.close(fd)
+        temporary_archive = Path(temporary_name)
+        try:
+            with tarfile.open(temporary_archive, "w:gz", compresslevel=6) as handle:
+                for relative, source in sorted(selected.items()):
+                    handle.add(
+                        source,
+                        arcname=str(PurePosixPath(run_id) / relative),
+                        recursive=False,
+                    )
+            verify_server_export_archive(temporary_archive, run_id, selection)
+            temporary_archive.chmod(0o600)
+            os.replace(temporary_archive, archive)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary_archive.unlink()
+    verify_server_export_archive(archive, run_id, selection)
+    return {
+        "ok": True,
+        "job": job_with_runtime_status(paths, job),
+        "profile": profile,
+        "archive": str(archive),
+        "archive_sha256": sha256_file(archive),
+        "archive_size": archive.stat().st_size,
+        "selected_unpacked_bytes": selected_bytes,
+        "selected_file_count": len(selected),
+        "omitted_file_count": len(omitted),
+        "snapshot_sha256": snapshot_sha256,
+        "selected_artifacts_verified": selected_artifacts_verified,
+        "complete_artifact_set_verified": (
+            selected_artifacts_verified and profile == "full"
+        ),
+        "sealed_post_hoc": bool(job.get("sealed_post_hoc")),
+        "provenance_warning": provenance_warning,
+    }
 
 
 def server_cancel(project_id: str) -> dict[str, Any]:
@@ -7439,12 +9441,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common(job_summarize_parser)
     job_summarize_parser.add_argument("--run-id", required=True)
+    job_summarize_parser.add_argument(
+        "--force", action="store_true", help="rerun an already successful sealed review"
+    )
 
     job_analysis_parser = sub.add_parser(
         "job-analysis", help="show the structured interpretation of a job"
     )
     add_common(job_analysis_parser)
     job_analysis_parser.add_argument("--run-id", required=True)
+
+    job_pull_parser = sub.add_parser(
+        "job-pull", help="download a verified report or full artifact export"
+    )
+    add_common(job_pull_parser)
+    job_pull_parser.add_argument("--run-id", required=True)
+    job_pull_parser.add_argument("--profile", choices=("report", "full"), default="report")
+    job_pull_parser.add_argument("--destination", default="")
+    job_pull_parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=0,
+        help="maximum compressed and unpacked bytes (default: 2 GiB report, 20 GiB full)",
+    )
 
     install_agents = sub.add_parser(
         "install-agents", help="install/update the managed global AGENTS.md block on the server"
@@ -7482,6 +9501,12 @@ def build_parser() -> argparse.ArgumentParser:
     job_request_parser.add_argument("--resume-command", default="")
     job_request_parser.add_argument("--metadata", action="append", default=[])
     job_request_parser.add_argument("job_command", nargs=argparse.REMAINDER)
+    job_control_parser = sub.add_parser("_job-control")
+    job_control_parser.add_argument("--request-file", required=True)
+    job_control_parser.add_argument("--response-file", required=True)
+    job_control_parser.add_argument("--wait-seconds", type=int, default=900)
+    job_control_parser.add_argument("--action", choices=sorted(JOB_CONTROL_ACTIONS), required=True)
+    job_control_parser.add_argument("--run-id", default="")
     env_request_parser = sub.add_parser("_env-request")
     env_request_parser.add_argument("--request-file", required=True)
     env_request_parser.add_argument("--response-file", required=True)
@@ -7512,8 +9537,15 @@ def build_parser() -> argparse.ArgumentParser:
     internal_job_stop.add_argument("--run-id", required=True)
     internal_job_summarize = sub.add_parser("_server-job-summarize", parents=[internal_parser()])
     internal_job_summarize.add_argument("--run-id", required=True)
+    internal_job_summarize.add_argument("--force", action="store_true")
     internal_job_analysis = sub.add_parser("_server-job-analysis", parents=[internal_parser()])
     internal_job_analysis.add_argument("--run-id", required=True)
+    internal_job_artifacts = sub.add_parser("_server-job-artifacts", parents=[internal_parser()])
+    internal_job_artifacts.add_argument("--run-id", required=True)
+    internal_job_export = sub.add_parser("_server-job-export", parents=[internal_parser()])
+    internal_job_export.add_argument("--run-id", required=True)
+    internal_job_export.add_argument("--profile", choices=("report", "full"), required=True)
+    internal_job_export.add_argument("--max-unpacked-bytes", type=int, default=0)
     internal_job_run = sub.add_parser("_server-job-run", parents=[internal_parser()])
     internal_job_run.add_argument("--run-id", required=True)
     internal_job_analyze = sub.add_parser("_server-job-analyze", parents=[internal_parser()])
@@ -7555,6 +9587,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
         return cmd_job_summarize(args)
     if args.command == "job-analysis":
         return cmd_job_analysis(args)
+    if args.command == "job-pull":
+        return cmd_job_pull(args)
     if args.command == "install-agents":
         return cmd_install_agents(args)
     if args.command == "_server-init":
@@ -7594,6 +9628,14 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
             resume_command=args.resume_command,
             metadata_values=args.metadata,
             response_file=Path(args.response_file) if args.response_file else None,
+            wait_seconds=args.wait_seconds,
+        )
+    if args.command == "_job-control":
+        return request_job_control_file(
+            Path(args.request_file),
+            Path(args.response_file),
+            action=args.action,
+            run_id=args.run_id,
             wait_seconds=args.wait_seconds,
         )
     if args.command == "_env-request":
@@ -7636,9 +9678,18 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | int:
     if args.command == "_server-job-stop":
         return server_job_stop(args.project_id, args.run_id)
     if args.command == "_server-job-summarize":
-        return server_job_summarize(args.project_id, args.run_id)
+        return server_job_summarize(args.project_id, args.run_id, force=args.force)
     if args.command == "_server-job-analysis":
         return server_job_analysis(args.project_id, args.run_id)
+    if args.command == "_server-job-artifacts":
+        return server_job_artifacts(args.project_id, args.run_id)
+    if args.command == "_server-job-export":
+        return server_job_export(
+            args.project_id,
+            args.run_id,
+            args.profile,
+            max_unpacked_bytes=args.max_unpacked_bytes,
+        )
     if args.command == "_server-job-run":
         return server_job_run(args.project_id, args.run_id)
     if args.command == "_server-job-analyze":
