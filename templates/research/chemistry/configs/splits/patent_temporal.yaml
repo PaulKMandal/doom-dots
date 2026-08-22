@@ -1,0 +1,29 @@
+id: patent_temporal_v1
+connected_component_constraints:
+  - normalized_reaction_signature
+  - normalized_product_key_for_retro
+  - overall_mechanism_sequence_id_for_mechanism_lanes
+  - patent_family_if_enriched
+fallback_patent_identity: normalized_publication_and_application_grant_identifiers
+pairwise_disjoint: [train_validation, train_test, validation_test]
+note: Lowe records do not provide patent-family membership; do not synthesize it from patent number alone
+component_construction:
+  universe: all eligible records before augmentation
+  edges:
+    - equal_normalized_reaction_signature
+    - equal_normalized_product_key_for_retro
+    - equal_overall_mechanism_sequence_id_for_mechanism_lanes
+    - equal_patent_family_if_enriched
+  algorithm: deterministic_union_find_sorted_by_reaction_id
+cross_cutoff_component_policy:
+  action: exclude_entire_component
+  rule: exclude when member years occupy more than one of train_validation_test_bands
+  unknown_year: exclude
+  prohibited: [move_component_across_cutoff, assign_by_mean_year, assign_by_first_record]
+  report: [component_count, reaction_count, year_histogram, exclusion_reason]
+proposal:
+  train_end_year: 2013
+  validation_year: 2014
+  test_start_year: 2015
+  test_end: 2016-09
+adjustment_policy: change only after recording counts and before model evaluation

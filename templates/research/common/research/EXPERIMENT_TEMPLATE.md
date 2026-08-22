@@ -1,0 +1,24 @@
+# Experiment: short name
+
+- Claim ID:
+- Research question:
+- Estimand and unit of analysis:
+- Dataset version/checksum:
+- Inclusion and exclusion rules:
+- Split manifest/checksum:
+- Methods and exact revisions:
+- Primary baseline:
+- Negative controls:
+- Seeds:
+- Primary metric and uncertainty:
+- Compute and inference budget:
+- Expected artifacts and counts:
+- Required sealed evidence manifest: `$CODEX_RESULTS_DIR/evidence-manifest.json` with 64-character lowercase `dataset_manifest_sha256`, `split_manifest_sha256`, and `membership_evidence_sha256`; nonempty integer-valued `expected_counts` and `observed_counts` must use identical keys
+- Result/report paths (must be under `$CODEX_RESULTS_DIR`):
+- Resume/checkpoint paths (must be under `$CODEX_CHECKPOINTS_DIR`):
+- Completion marker (sentinel only; use `$CODEX_COMPLETION_MARKER`):
+- Resume semantics:
+- Success criterion:
+- Kill criterion:
+- Interpretation owner:
+- Independent audit owner/process:

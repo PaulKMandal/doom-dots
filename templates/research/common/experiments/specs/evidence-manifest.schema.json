@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/codex/evidence-manifest.schema.json",
+  "title": "Codex frozen-run evidence manifest",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "dataset_manifest_sha256",
+    "split_manifest_sha256",
+    "membership_evidence_sha256",
+    "expected_counts",
+    "observed_counts"
+  ],
+  "properties": {
+    "dataset_manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "split_manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "membership_evidence_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "expected_counts": {
+      "$ref": "#/$defs/counts"
+    },
+    "observed_counts": {
+      "$ref": "#/$defs/counts"
+    }
+  },
+  "$defs": {
+    "counts": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    }
+  }
+}

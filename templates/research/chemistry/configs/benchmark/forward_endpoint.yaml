@@ -1,0 +1,8 @@
+task: forward_endpoint
+input: mixed_reactants_and_reagents
+target: product_multiset
+primary_metrics: [top1_exact, top3_exact, top5_exact, top10_exact]
+diagnostics: [stereo_free_exact, validity, unique_candidates]
+resource_metrics: [batch1_latency_ms, throughput_per_s, peak_vram_mb, model_calls]
+candidate_deduplication: required
+reaction_class_visible_at_inference: false

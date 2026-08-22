@@ -1,0 +1,44 @@
+id: transformation_disjoint_v1
+scope: [forward_endpoint, forward_elementary_step, forward_pathway_search, retro_single_step]
+derive_before_split: true
+derive_from_raw_unaugmented_records_only: true
+grouping_mapper_outputs_are_split_metadata_not_model_inputs: true
+atom_mapping:
+  implementation: RXNMapper
+  revision: REQUIRED_PIN
+  model_checksum: REQUIRED_SHA256
+  failure_policy: quarantine_and_report_never_fallback
+transformation_signature:
+  changed_bonds: sorted_multiset_of_bond_deletions_additions_and_order_changes
+  atom_features: [element, formal_charge, aromaticity]
+  local_environment_radius: 1
+  canonicalization_revision: REQUIRED_PIN
+  include_reagents: false
+  hash: sha256_of_canonical_signature
+group_graph:
+  nodes: reaction_id
+  undirected_edges:
+    - equal_transformation_signature
+    - equal_normalized_reaction_signature
+    - equal_normalized_product_key_for_retro
+    - equal_overall_mechanism_sequence_id_for_mechanism_lanes
+  components: deterministic_union_find_sorted_by_reaction_id
+assignment:
+  seed: 1729
+  train_fraction: 0.80
+  validation_fraction: 0.10
+  test_fraction: 0.10
+  stratify_summary_only: [reaction_class_if_available, product_heavy_atom_bin]
+  unit: connected_component
+pairwise_disjoint: [train_validation, train_test, validation_test]
+verification:
+  require_zero_signature_overlap: true
+  require_zero_component_overlap: true
+  emit_membership_hashes: true
+  emit_component_and_reaction_counts: true
+training_policy:
+  released_checkpoints: reproduction_only
+  comparison_models: retrain_from_scratch_on_this_exact_split
+  split_before_augmentation: true
+  no_tuning_on_test: true
+unresolved_fields_block_launch: [atom_mapping.revision, atom_mapping.model_checksum, transformation_signature.canonicalization_revision]

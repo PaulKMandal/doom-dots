@@ -1,0 +1,26 @@
+id: symile_mimic_e0_e1
+status: proposed
+evidence_role: feasibility_with_patient_bootstrap_uncertainty
+claims: [C-001]
+dataset_manifest: configs/datasets/symile_mimic.yaml
+unit: patient_admission
+train_partition: disjoint_cxr_ecg_labs_expert_pools
+test_partition: fully_paired_unseen_patients
+seeds: [17, 23, 41, 67, 89]
+primary_metrics: [auroc, auprc, nll, brier, ece]
+primary_negative_control: within_label_subject_shuffle
+local_go_criterion: signal_and_calibration_support_replication_on_a_second_dataset
+decisive_go_criterion: recover_half_centralized_gain_with_at_most_5_percent_bridge_on_two_datasets
+decisive_kill_criterion: calibrated_late_fusion_within_1_absolute_auroc_point_on_two_datasets
+oracle_gap_guard:
+  metric: auroc
+  minimum_positive_centralized_minus_best_unimodal: 0.01
+  if_not_met: dataset_noninformative_for_recovery_fraction_not_pass_or_fail
+  always_report_companion: absolute_auroc_gain_over_best_unimodal
+second_dataset_required_before_decisive_claim: true
+outputs:
+  results_dir_env: CODEX_RESULTS_DIR
+  checkpoints_dir_env: CODEX_CHECKPOINTS_DIR
+  required_results: [run-card.json, evidence-manifest.json, cohort-flow.json, metrics.json]
+  completion_marker_is_sentinel_only: true
+completion_marker: artifacts/symile_e0_e1/COMPLETE

@@ -1,0 +1,8 @@
+task: retro_single_step
+input: product_only
+target: precursor_multiset
+reaction_class_visible_at_inference: false
+atom_maps_visible_at_inference: false
+primary_metrics: [top1_exact, top3_exact, top5_exact, top10_exact, top50_exact, mrr]
+diagnostics: [stereo_free_exact, validity, unique_candidates, reaction_center_diversity]
+round_trip_metric_role: secondary_only

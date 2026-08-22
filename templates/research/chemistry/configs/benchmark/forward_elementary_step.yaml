@@ -1,0 +1,15 @@
+task: forward_elementary_step
+input: atom_mapped_current_mechanistic_state
+target: next_atom_mapped_state_and_electron_redistribution
+primary_metrics: [step_top1_exact, step_top5_exact, next_state_validity]
+conservation_metrics: [heavy_atom_conservation, proton_conservation, electron_conservation]
+new_diagnostics: [net_charge_conservation]
+mapping_policy:
+  input_atom_maps: required
+  maps_used_only_for_identity_and_scoring: true
+compute_budget:
+  samples_per_state: REQUIRED
+  nbest: REQUIRED
+  generated_candidates: REQUIRED
+  model_forward_calls: REQUIRED
+group_split_key: overall_mechanism_sequence_id

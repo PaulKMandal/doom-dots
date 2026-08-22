@@ -1,0 +1,36 @@
+schema_version: 1
+shared_target:
+  name: hospital_mortality
+  type: binary
+  ontology_version: v1
+  ordered_class_ids: [survives_after_landmark, dies_after_landmark_before_discharge]
+  target_horizon: from_72h_admission_landmark_through_index_discharge
+expert_required_fields:
+  - expert_id
+  - modality
+  - semantic_version
+  - model_sha256
+  - checkpoint_sha256
+  - training_cohort_manifest_sha256
+  - target_ontology_sha256
+  - ordered_class_ids
+  - target_horizon
+  - class_prior
+  - preprocessing_manifest_sha256
+  - calibration_set_sha256
+  - calibration_method
+  - calibration_validation_manifest_sha256
+  - output_schema_version
+  - created_at
+transmitted_object: calibrated_task_evidence
+deployment_prior:
+  ordered_class_ids: [survives_after_landmark, dies_after_landmark_before_discharge]
+  estimation_cohort_role: predeployment
+  estimation_cohort_manifest_sha256: REQUIRED
+  disjoint_from_validation_and_test: true
+  test_labels_forbidden: true
+  label_shift_policy: predeclared_reweighting_only
+  sensitivity_grid: REQUIRED_AROUND_ESTIMATE
+training_synchronization: none
+inference_join: subject_event_token
+privacy_claim: data_locality_only

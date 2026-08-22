@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import sys
 import tarfile
@@ -18,7 +19,7 @@ import tarfile
 TEMPLATE_VERSION = 1
 SOURCE_SUFFIXES = {
     ".c", ".cc", ".cfg", ".clj", ".cpp", ".css", ".cu", ".cuh", ".el",
-    ".fish", ".go", ".h", ".hpp", ".html", ".ini", ".ipynb", ".java",
+    ".fish", ".go", ".h", ".hpp", ".html", ".ini", ".java",
     ".jl", ".js", ".json", ".jsx", ".kt", ".lua", ".md", ".nix", ".org",
     ".pl", ".proto", ".py", ".r", ".rb", ".rs", ".scala", ".scss", ".sh",
     ".sql", ".tex", ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
@@ -33,7 +34,30 @@ EXCLUDED_PARTS = {
     "__pycache__", "artifacts", "checkpoints", "data", "datasets", "mlruns",
     "outputs", "reports", "results", "review-bundles", "runs", "wandb", "weights",
 }
-SECRET_NAMES = {".env", "credentials", "credentials.json", "secrets", "secrets.json"}
+SECRET_NAMES = {
+    ".env", ".env.local", ".env.production", ".env.development",
+    "auth.json", "credentials", "credentials.json", "kaggle.json", "secrets", "secrets.json",
+    "token.json", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+}
+SECRET_SUFFIXES = {".pem", ".p12", ".pfx", ".ppk", ".key", ".keystore"}
+SENSITIVE_CONFIG_SUFFIXES = {".cfg", ".ini", ".json", ".toml", ".yaml", ".yml"}
+SENSITIVE_PARTS = {".aws", ".gnupg", ".ssh", "credentials", "secrets"}
+SECRET_CONTENT_PATTERNS = (
+    re.compile(br"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(br'"type"\s*:\s*"service_account"'),
+    re.compile(br'"private_key"\s*:\s*"-----BEGIN'),
+    re.compile(br"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(br"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b"),
+    re.compile(br"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(br"\bhf_[A-Za-z0-9]{30,}\b"),
+    re.compile(br"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
+    re.compile(br"\bgithub_pat_[A-Za-z0-9_]{40,}\b"),
+    re.compile(br"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(br"\bxox[baprs]-[0-9A-Za-z-]{20,}\b"),
+    re.compile(
+        br"\b(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|KAGGLE_KEY|WANDB_API_KEY)\s*[:=]\s*[\"']?[^\s\"']{16,}"
+    ),
+)
 
 
 class ResearchRepoError(RuntimeError):
@@ -61,6 +85,14 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def lisp_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -70,8 +102,8 @@ def render_dir_locals(args: argparse.Namespace, root: Path) -> str:
     if args.data_link:
         data_links = "(" + " ".join(lisp_string(item) for item in args.data_link) + ")"
     excludes = (
-        '(".git/" ".venv/" "data/" "datasets/" "artifacts/" "runs/" '
-        '"results/" "outputs/" "checkpoints/" "weights/" "wandb/" "mlruns/")'
+        '("/.git/" "/.venv/" "/data/" "/datasets/" "/artifacts/" "/runs/" '
+        '"/results/" "/reports/" "/outputs/" "/checkpoints/" "/weights/" "/wandb/" "/mlruns/")'
     )
     return (
         "((nil . (\n"
@@ -90,6 +122,23 @@ def render_dir_locals(args: argparse.Namespace, root: Path) -> str:
     )
 
 
+def normalize_remote_dir(value: str) -> str:
+    """Return one canonical, non-shallow absolute POSIX deployment path."""
+    if not isinstance(value, str) or not value.startswith("/") or "\n" in value or "\r" in value:
+        raise ResearchRepoError("--remote-dir must be a non-shallow absolute server path")
+    normalized = value.rstrip("/") or "/"
+    raw_parts = normalized.split("/")[1:]
+    if any(part in {"", ".", ".."} for part in raw_parts):
+        raise ResearchRepoError("--remote-dir must not contain empty, dot, or parent components")
+    if (
+        len(raw_parts) < 2
+        or (len(raw_parts) == 2 and raw_parts[0] in {"home", "Users"})
+        or normalized in {"/", "/home", "/root", "/tmp", "/var", "/srv", "/opt", "/usr"}
+    ):
+        raise ResearchRepoError("--remote-dir must be a non-shallow absolute server path")
+    return normalized
+
+
 def template_root() -> Path:
     return Path(__file__).resolve().parent.parent / "templates" / "research"
 
@@ -102,10 +151,21 @@ def template_payloads(template: str, replacements: dict[str, str]) -> dict[PureP
         if not lane_root.is_dir():
             raise ResearchRepoError(f"Research template is missing: {lane_root}")
         for source in sorted(lane_root.rglob("*")):
-            if not source.is_file():
+            relative_parts = source.relative_to(lane_root).parts
+            if (
+                "__pycache__" in relative_parts
+                or source.suffix.lower() in {".pyc", ".pyo"}
+                or source.is_symlink()
+                or not source.is_file()
+            ):
                 continue
             relative = PurePosixPath(source.relative_to(lane_root).as_posix())
-            text = source.read_text(encoding="utf-8")
+            try:
+                text = source.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise ResearchRepoError(
+                    f"Research templates must be UTF-8 text: {source}"
+                ) from exc
             for key, value in replacements.items():
                 text = text.replace("{{" + key + "}}", value)
             payloads[relative] = text.encode("utf-8")
@@ -114,22 +174,67 @@ def template_payloads(template: str, replacements: dict[str, str]) -> dict[PureP
     return payloads
 
 
+def validate_scaffold_target(root: Path, relative: PurePosixPath) -> Path:
+    """Reject symlinked or escaping path components before scaffold writes."""
+    current = root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        if current.is_symlink():
+            raise ResearchRepoError(f"Refusing symlink in scaffold destination: {relative}")
+        if current.exists() and index < len(relative.parts) - 1 and not current.is_dir():
+            raise ResearchRepoError(f"Scaffold parent is not a directory: {current}")
+        if not current.resolve(strict=False).is_relative_to(root):
+            raise ResearchRepoError(f"Scaffold destination escapes project root: {relative}")
+    return current
+
+
 def command_init(args: argparse.Namespace) -> dict[str, object]:
     root = Path(args.project_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     project_name = args.project_name or root.name
     if not args.remote_dir:
         args.remote_dir = f"/home/rhel/Projects/{project_name}"
-    if not args.remote_dir.startswith("/") or args.remote_dir in {"/", "/home", "/home/rhel"}:
-        raise ResearchRepoError("--remote-dir must be a non-shallow absolute server path")
+    args.remote_dir = normalize_remote_dir(args.remote_dir)
+    python_bootstrap = "python3 -m venv .venv && .venv/bin/python -m pip install -e ."
+    python_test = ".venv/bin/python -m unittest discover -s tests -v"
+    if args.bootstrap_cmd is None:
+        args.bootstrap_cmd = "true" if args.template == "generic" else python_bootstrap
+    if args.test_cmd is None:
+        args.test_cmd = "" if args.template == "generic" else python_test
+    if args.smoke_cmd is None:
+        args.smoke_cmd = "" if args.template == "generic" else python_test
+    if args.run_cmd is None:
+        args.run_cmd = "" if args.template == "generic" else python_test
     if not (root / ".git").exists():
         if args.no_git_init:
             raise ResearchRepoError("Target is not a Git repository")
         run(["git", "init"], cwd=root)
+    initialized_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    created_date = dt.date.today().isoformat()
+    existing_scaffold_path = root / "research" / "scaffold.json"
+    if existing_scaffold_path.is_file() and not existing_scaffold_path.is_symlink():
+        try:
+            existing_scaffold = json.loads(existing_scaffold_path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            existing_scaffold = None
+        if isinstance(existing_scaffold, dict) and all(
+            existing_scaffold.get(key) == value
+            for key, value in {
+                "template": args.template,
+                "template_version": TEMPLATE_VERSION,
+                "project_name": project_name,
+                "remote_host": args.remote_host,
+                "remote_dir": args.remote_dir,
+            }.items()
+        ):
+            prior_initialized = existing_scaffold.get("initialized_at")
+            if isinstance(prior_initialized, str) and re.match(r"^\d{4}-\d{2}-\d{2}", prior_initialized):
+                initialized_at = prior_initialized
+                created_date = prior_initialized[:10]
     replacements = {
         "PROJECT_NAME": project_name,
         "TEMPLATE": args.template,
-        "CREATED_DATE": dt.date.today().isoformat(),
+        "CREATED_DATE": created_date,
     }
     payloads = template_payloads(args.template, replacements)
     payloads[PurePosixPath(".dir-locals.el")] = render_dir_locals(args, root).encode("utf-8")
@@ -140,14 +245,14 @@ def command_init(args: argparse.Namespace) -> dict[str, object]:
         "project_name": project_name,
         "remote_host": args.remote_host,
         "remote_dir": args.remote_dir,
-        "initialized_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "initialized_at": initialized_at,
     }
     payloads[PurePosixPath("research/scaffold.json")] = (
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
     conflicts: list[str] = []
     for relative, content in payloads.items():
-        target = root.joinpath(*relative.parts)
+        target = validate_scaffold_target(root, relative)
         if target.exists() and (not target.is_file() or target.read_bytes() != content):
             conflicts.append(relative.as_posix())
     if conflicts:
@@ -157,7 +262,7 @@ def command_init(args: argparse.Namespace) -> dict[str, object]:
     created: list[str] = []
     unchanged: list[str] = []
     for relative, content in sorted(payloads.items(), key=lambda item: item[0].as_posix()):
-        target = root.joinpath(*relative.parts)
+        target = validate_scaffold_target(root, relative)
         if target.exists():
             unchanged.append(relative.as_posix())
             continue
@@ -188,11 +293,15 @@ def command_doctor(args: argparse.Namespace) -> dict[str, object]:
     checks.append({"check": "git_repository", "ok": git_check.returncode == 0})
     test_check = run(["git", "status", "--short"], cwd=root, check=False)
     checks.append({"check": "git_status_readable", "ok": test_check.returncode == 0})
+    dir_locals = (root / ".dir-locals.el").read_text(encoding="utf-8") if (root / ".dir-locals.el").is_file() else ""
+    launch_ready = '(my/codex-remote-test-cmd . "")' not in dir_locals
     return {
         "ok": all(bool(item["ok"]) for item in checks),
         "command": "doctor",
         "root": str(root),
         "checks": checks,
+        "launch_ready": launch_ready,
+        "launch_warning": None if launch_ready else "Configure a real bounded test command before frozen jobs can launch.",
     }
 
 
@@ -207,11 +316,75 @@ def bundle_candidate(relative: str) -> bool:
     lower_name = name.lower()
     if lower_parts & EXCLUDED_PARTS:
         return False
-    if lower_name in SECRET_NAMES or lower_name.startswith(".env."):
+    placeholder = lower_name.endswith((".example", ".sample", ".template", ".dist"))
+    secret_document = not placeholder and (
+        lower_name == ".env"
+        or lower_name.startswith(".env.")
+        or lower_name == "credentials"
+        or lower_name.startswith("credentials.")
+        or lower_name == "secrets"
+        or lower_name.startswith("secrets.")
+    )
+    sensitive_config_name = (
+        path.suffix.lower() in SENSITIVE_CONFIG_SUFFIXES
+        and re.search(r"(?:^|[-_.])(auth|credentials?|secrets?|tokens?|service[-_]account)(?:[-_.]|$)", lower_name)
+    )
+    if (
+        secret_document
+        or lower_name in SECRET_NAMES
+        or any(lower_name.endswith(suffix) for suffix in SECRET_SUFFIXES)
+        or bool(lower_parts & SENSITIVE_PARTS)
+        or (sensitive_config_name and not placeholder)
+    ):
         return False
-    if name == "custom.el" or name.endswith((".pem", ".key", ".p12", ".pfx")):
+    if name == "custom.el":
         return False
     return path.suffix.lower() in SOURCE_SUFFIXES or name in SOURCE_NAMES or name.startswith("README")
+
+
+def content_is_secret(content: bytes) -> bool:
+    """Detect only high-confidence credential material to avoid bundling it."""
+    return any(pattern.search(content) for pattern in SECRET_CONTENT_PATTERNS)
+
+
+def verify_code_bundle_archive(
+    output: Path,
+    prefix: PurePosixPath,
+    included: list[dict[str, object]],
+    virtual_names: set[str],
+) -> None:
+    """Verify archive bytes still match the read-time hash manifest."""
+    expected = {
+        str(prefix / "files" / str(item["path"])): item for item in included
+    }
+    expected_names = set(expected) | {str(prefix / name) for name in virtual_names}
+    try:
+        with tarfile.open(output, "r:gz") as archive:
+            members = archive.getmembers()
+            names = [member.name for member in members]
+            if len(names) != len(set(names)) or set(names) != expected_names:
+                raise ResearchRepoError("Review bundle member inventory changed while packaging")
+            for member in members:
+                if member.name not in expected:
+                    continue
+                if not member.isfile():
+                    raise ResearchRepoError(f"Review bundle source became unsafe: {member.name}")
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ResearchRepoError(f"Could not verify review member: {member.name}")
+                digest = hashlib.sha256()
+                size = 0
+                with source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        size += len(chunk)
+                        digest.update(chunk)
+                item = expected[member.name]
+                if size != item["size"] or digest.hexdigest() != item["sha256"]:
+                    raise ResearchRepoError(
+                        f"Source changed while the review bundle was being created: {item['path']}"
+                    )
+    except (tarfile.TarError, OSError) as exc:
+        raise ResearchRepoError(f"Could not verify review bundle: {exc}") from exc
 
 
 def command_bundle_code(args: argparse.Namespace) -> dict[str, object]:
@@ -219,6 +392,15 @@ def command_bundle_code(args: argparse.Namespace) -> dict[str, object]:
     top = run(["git", "rev-parse", "--show-toplevel"], cwd=root).stdout.strip()
     root = Path(top).resolve()
     tracked = set(nul_paths(run(["git", "ls-files", "-z"], cwd=root).stdout))
+    head_tracked = set(
+        nul_paths(
+            run(
+                ["git", "ls-tree", "-r", "-z", "--name-only", "HEAD"],
+                cwd=root,
+                check=False,
+            ).stdout
+        )
+    )
     untracked = set(
         nul_paths(
             run(
@@ -228,19 +410,26 @@ def command_bundle_code(args: argparse.Namespace) -> dict[str, object]:
     )
     included: list[dict[str, object]] = []
     excluded: list[dict[str, object]] = []
-    for relative in sorted(tracked | untracked):
+    for relative in sorted(tracked | head_tracked | untracked):
         path = root / relative
         reason = ""
         if not bundle_candidate(relative):
             reason = "generated, sensitive, or non-source path"
         elif path.is_symlink() or not path.is_file():
-            reason = "not a regular file"
+            reason = (
+                "deleted source; content represented only in the review patch"
+                if relative in head_tracked and not path.exists()
+                else "not a regular file"
+            )
         elif path.stat().st_size > args.max_file_bytes:
             reason = "exceeds per-file size limit"
         if reason:
             excluded.append({"path": relative, "reason": reason})
             continue
         content = path.read_bytes()
+        if content_is_secret(content):
+            excluded.append({"path": relative, "reason": "high-confidence secret content"})
+            continue
         included.append(
             {
                 "path": relative,
@@ -264,7 +453,33 @@ def command_bundle_code(args: argparse.Namespace) -> dict[str, object]:
     head = run(["git", "rev-parse", "HEAD"], cwd=root, check=False).stdout.strip()
     branch = run(["git", "branch", "--show-current"], cwd=root, check=False).stdout.strip()
     status = run(["git", "status", "--short", "--branch"], cwd=root).stdout
-    patch = run(["git", "diff", "--binary", "HEAD"], cwd=root, check=False).stdout
+    included_tracked = [
+        str(item["path"]) for item in included if item["source"] == "tracked"
+    ]
+    # Deletions are essential review context even though no current file bytes
+    # exist to archive. Sensitive filenames remain excluded, and the complete
+    # patch is secret-scanned below so removed credential material cannot leak.
+    included_tracked.extend(
+        relative
+        for relative in sorted(head_tracked)
+        if not (root / relative).exists() and bundle_candidate(relative)
+    )
+    patch_parts: list[str] = []
+    for start in range(0, len(included_tracked), 128):
+        pathspecs = [f":(literal){path}" for path in included_tracked[start : start + 128]]
+        patch_parts.append(
+            run(
+                ["git", "diff", "--binary", "HEAD", "--", *pathspecs],
+                cwd=root,
+                check=False,
+            ).stdout
+        )
+    patch = "".join(patch_parts)
+    if content_is_secret(patch.encode("utf-8")):
+        raise ResearchRepoError(
+            "Refusing to create review bundle because the working-tree patch contains "
+            "high-confidence credential material, including possibly removed HEAD content"
+        )
     manifest = {
         "schema_version": 1,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -276,27 +491,33 @@ def command_bundle_code(args: argparse.Namespace) -> dict[str, object]:
         "excluded": excluded,
     }
     prefix = PurePosixPath(f"{root.name}-code-review")
-    with tarfile.open(output, "w:gz", compresslevel=6) as archive:
-        for item in included:
-            relative = str(item["path"])
-            archive.add(root / relative, arcname=str(prefix / "files" / relative), recursive=False)
-        virtual = {
-            "manifest.json": json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-            "git-status.txt": status,
-            "working-tree.patch": patch,
-        }
-        for name, text in virtual.items():
-            payload = text.encode("utf-8")
-            info = tarfile.TarInfo(str(prefix / name))
-            info.size = len(payload)
-            info.mode = 0o600
-            archive.addfile(info, io.BytesIO(payload))
+    virtual = {
+        "manifest.json": json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        "git-status.txt": status,
+        "working-tree.patch": patch,
+    }
+    try:
+        with tarfile.open(output, "w:gz", compresslevel=6) as archive:
+            for item in included:
+                relative = str(item["path"])
+                archive.add(root / relative, arcname=str(prefix / "files" / relative), recursive=False)
+            for name, text in virtual.items():
+                payload = text.encode("utf-8")
+                info = tarfile.TarInfo(str(prefix / name))
+                info.size = len(payload)
+                info.mode = 0o600
+                archive.addfile(info, io.BytesIO(payload))
+        verify_code_bundle_archive(output, prefix, included, set(virtual))
+    except Exception:
+        if output.is_file() or output.is_symlink():
+            output.unlink()
+        raise
     return {
         "ok": True,
         "command": "bundle-code",
         "root": str(root),
         "output": str(output),
-        "sha256": sha256_bytes(output.read_bytes()),
+        "sha256": sha256_file(output),
         "file_count": len(included),
         "excluded_count": len(excluded),
     }
@@ -311,10 +532,10 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--project-name", default="")
     init.add_argument("--remote-host", default="rhel-test")
     init.add_argument("--remote-dir", default="")
-    init.add_argument("--bootstrap-cmd", default="python -m venv .venv && .venv/bin/python -m pip install -e .")
-    init.add_argument("--test-cmd", default=".venv/bin/python -m unittest discover -s tests -v")
-    init.add_argument("--smoke-cmd", default=".venv/bin/python -m unittest discover -s tests -v")
-    init.add_argument("--run-cmd", default=".venv/bin/python -m unittest discover -s tests -v")
+    init.add_argument("--bootstrap-cmd", default=None)
+    init.add_argument("--test-cmd", default=None)
+    init.add_argument("--smoke-cmd", default=None)
+    init.add_argument("--run-cmd", default=None)
     init.add_argument("--data-link", action="append", default=[])
     init.add_argument("--no-git-init", action="store_true")
     doctor = sub.add_parser("doctor", help="check the scaffold contract")

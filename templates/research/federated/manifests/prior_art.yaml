@@ -1,0 +1,24 @@
+works:
+  hddm:
+    title: Heterogeneous Decentralized Diffusion Models
+    venue: CVPR 2026
+    url: https://openaccess.thecvf.com/content/CVPR2026/html/Jiang_Heterogeneous_Decentralized_Diffusion_Models_CVPR_2026_paper.html
+    relation: inspiration_for_inference_only_expert_composition
+  ha_fedformer_utmp:
+    url: https://arxiv.org/abs/2303.15486
+    relation: closest_overlap_unimodal_training_to_multimodal_prediction
+  harmony:
+    url: https://github.com/xmouyang/Harmony
+    relation: required_modality_heterogeneous_fl_baseline
+  creamfl:
+    url: https://github.com/FLAIR-THU/CreamFL
+    relation: public_anchor_representation_alignment_baseline
+  fedmbridge:
+    url: https://proceedings.mlr.press/v235/chen24ba.html
+    relation: architecture_personalized_multimodal_fl_baseline
+  fedafd:
+    url: https://github.com/Chao2433/FedAFD
+    relation: modality_task_model_heterogeneity_competitor
+  fedvs:
+    url: https://proceedings.mlr.press/v202/li23an.html
+    relation: vertical_federated_straggler_baseline

@@ -1,0 +1,7 @@
+# Chemistry benchmark claim ledger
+
+| ID | Claim | Alternatives | Decisive evidence | Kill criterion | Status |
+|---|---|---|---|---|---|
+| C-001 | The FlowER system improves conservation and OOD endpoint recovery over the study's adapted G2S systems. | Gains arise from architecture, BE-matrix representation, parameter count, search/sampling budget, explicit-H/Kekulé preprocessing, or released-checkpoint data advantage. | Reproduction plus scratch retraining on identical IID and transformation-disjoint splits; a within-architecture conservation/representation ablation is required for causal attribution. | No validity/OOD gain across three seeds after matching generated candidates, model forwards, state expansions, and preprocessing. | proposed |
+| C-002 | Root alignment improves sample efficiency independent of augmentation/query budget. | Official gains are driven by 5×–20× augmentation or extra decoding calls. | Matched canonical, randomized, and R-SMILES Transformers at 1%, 5%, 10%, 25%, 50%, and 100% training data with equal updates and forward-pass budget. | Learning curves are indistinguishable after matching on two datasets/splits. | proposed |
+| C-003 | Random-split rankings overstate generalization. | Temporal/disjoint stress tests are merely smaller or distributionally arbitrary. | Paired rank and error-slice comparison across legacy, patent-temporal, and transformation-disjoint tracks. | Rank changes disappear after matching sample size and uncertainty. | proposed |

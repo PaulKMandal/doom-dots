@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Persistent or generated research material
+data/
+datasets/
+runs/
+results/
+outputs/
+checkpoints/
+weights/
+wandb/
+mlruns/
+artifacts/codex-jobs/
+reports/codex-jobs/
+review-bundles/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+credentials.*
+secrets.*

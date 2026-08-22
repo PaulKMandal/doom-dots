@@ -1,0 +1,12 @@
+licenses:
+  lowe_uspto: CC0
+  orderly_data: CC-BY-4.0
+  open_reaction_database_data: CC-BY-SA-4.0
+  flower_figshare_artifact: MIT
+  flower_effective_record_license: UNRESOLVED_MIXED_PROVENANCE
+  rmechdb: CC-BY-NC-ND-4.0
+  pmechdb: CC-BY-NC-ND-4.0
+notes:
+  - Treat RMechDB/PMechDB-derived records as academic-only until permission is resolved.
+  - FlowER unseen reaction-type sets depending on NameRxn are not openly redistributable.
+  - Never vendor an upstream with an absent or incompatible license.

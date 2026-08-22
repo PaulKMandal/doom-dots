@@ -1,0 +1,19 @@
+id: e1_paired_bridge_sweep
+claim_ids: [C-001]
+paired_train_fraction: [0.0, 0.001, 0.005, 0.01, 0.05, 0.10, 1.0]
+disjoint_cohorts: [expert_train, calibration, bridge, validation, test]
+base_fusion: prior_corrected_evidence_sum
+residual:
+  type: set_router
+  regularize_toward_zero: true
+primary_outcome:
+  name: fraction_of_centralized_multimodal_gain_recovered
+  numerator: proposal_auroc_minus_best_unimodal_auroc
+  denominator: centralized_oracle_auroc_minus_best_unimodal_auroc
+  minimum_positive_oracle_gap_auroc: 0.01
+  when_denominator_below_threshold: dataset_noninformative_for_recovery_fraction
+companion_outcome:
+  name: absolute_auroc_gain_over_best_unimodal
+  report_even_when_recovery_fraction_is_noninformative: true
+negative_controls: [cross_subject_shuffle, within_label_shuffle, mask_only, random_router]
+completion_marker: artifacts/e1/COMPLETE

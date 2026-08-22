@@ -1,0 +1,32 @@
+status: unresolved_blocks_two_dataset_go_kill_decision
+decision_required_before: preregistered_cross_dataset_claim
+selection_criteria:
+  - independent_institution_or_cohort_from_mimic
+  - subject_level_multimodal_linkage
+  - endpoint_defined_without_post_outcome_features
+  - license_and_access_compatible_with_reproducible_membership_manifests
+candidates:
+  eicu_crd:
+    url: https://physionet.org/content/eicu-crd/2.0/
+    role: fastest_external_validation_of_version_missingness_and_evidence_composition
+    modalities: [vitals_time_series, labs, medications_and_clinical_covariates]
+    strength: multi_center_and_physionet_access_path
+    limitation: weaker_modality_heterogeneity_without_linked_raw_imaging_or_ecg_waveforms
+    recommendation: preferred_low_cost_second_feasibility_dataset
+  uk_biobank:
+    url: https://www.ukbiobank.ac.uk/enable-your-research/about-our-data
+    role: decisive_heterogeneous_modalities_showcase
+    modalities: [ecg, imaging, biomarkers, tabular_covariates]
+    strength: genuinely_distinct_modalities_and_large_cohort
+    limitation: application_cost_endpoint_alignment_and_long_cohort_build
+    recommendation: preferred_high_cost_confirmation_if_e0_e1_survive
+  adni:
+    url: https://adni.loni.usc.edu/data-samples/adni-data/
+    role: neurodegeneration_showcase
+    modalities: [mri, pet, biomarkers, cognitive_assessments, genetics]
+    strength: established_multimodal_longitudinal_cohort
+    limitation: smaller_sample_and_different_endpoint_ontology
+    recommendation: scoped_domain_extension_not_default_second_dataset
+not_allowed:
+  - count_another_mimic_derived_table_as_an_independent_dataset
+  - choose_after_observing_method_rankings_without_recording_the_decision

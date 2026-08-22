@@ -1,0 +1,34 @@
+name: symile_mimic
+source: https://physionet.org/content/symile-mimic/1.0.0/
+access: credentialed_physionet
+subject_key: subject_id
+event_key: hadm_id
+split: official_patient_disjoint
+official_test_format: retrieval_expanded_10_rows_per_query
+cohort_derivation:
+  deduplicate_to_one_row_per: hadm_id
+  require_identical_subject_and_feature_references_within_hadm: true
+  expected_test_unique_admissions: 464
+  expected_test_unique_patients: 461
+  preserve_official_patient_partition_after_deduplication: true
+modalities: [cxr, ecg, labs]
+acquisition_windows:
+  ecg: within_24h_of_admission
+  labs: within_24h_of_admission
+  cxr: 24_to_72h_after_admission
+primary_target: hospital_expire_flag
+estimand:
+  landmark: 72h_after_admission
+  eligibility: alive_and_still_admitted_at_landmark
+  outcome: death_after_landmark_before_index_discharge
+  exclude: [death_before_landmark, discharge_before_landmark, modality_after_landmark]
+input_policy:
+  allowlist_manifest_sha256: REQUIRED
+  target_only_not_features: [hospital_expire_flag]
+  forbidden_feature_groups:
+    - retrieval_query_candidate_ids_and_labels
+    - discharge_time_location_and_status
+    - death_time
+    - post_landmark_events_or_measurements
+  assert_no_target_or_post_outcome_columns: true
+checksum_manifest: REQUIRED

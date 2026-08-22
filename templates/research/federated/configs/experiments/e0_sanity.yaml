@@ -1,0 +1,19 @@
+id: e0_sanity_and_upper_bounds
+claim_ids: [C-001]
+models:
+  - best_single_modality
+  - uncalibrated_probability_average
+  - calibrated_logit_average
+  - prior_corrected_evidence_sum
+  - learned_logistic_stacking
+  - centralized_paired_early_fusion
+  - centralized_paired_late_fusion
+metrics: [auroc, auprc, balanced_accuracy, nll, brier, ece]
+uncertainty: patient_level_bootstrap
+expert_availability:
+  evaluate_all_nonempty_modality_subsets: true
+  modalities: [cxr, ecg, labs]
+  report_pattern_counts: true
+  missingness_mechanisms: [complete_case, mcar, informative_mnar]
+deployment_prior_source: disjoint_predeployment_cohort_only
+completion_marker: artifacts/e0/COMPLETE

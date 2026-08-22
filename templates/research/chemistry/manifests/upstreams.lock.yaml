@@ -1,0 +1,39 @@
+upstreams:
+  flower:
+    url: https://github.com/FongMunHong/FlowER
+    ref: 2.0.0
+    task: [forward_elementary_step, forward_pathway_search]
+    license: MIT
+  r_smiles:
+    url: https://github.com/otori-bird/retrosynthesis
+    ref: REQUIRED_FULL_SHA
+    native_tasks: [forward_endpoint, retro_single_step]
+    mechanism_status: no published mechanism task; any use is a local adaptation
+    license: MIT
+  graph2smiles:
+    url: https://github.com/coleygroup/graph2smiles
+    ref: REQUIRED_FULL_SHA
+    native_tasks: [forward_endpoint, retro_single_step]
+    license: MIT
+  g2s_flower:
+    upstream: graph2smiles
+    implementation_ref: REQUIRED_FLOWER_BENCHMARK_SHA
+    task: [forward_elementary_step, forward_pathway_search]
+    status: FlowER-study recursive mechanism adaptation
+    preprocessing: standard molecular graphs
+  g2s_h_flower:
+    upstream: graph2smiles
+    implementation_ref: REQUIRED_FLOWER_BENCHMARK_SHA
+    task: [forward_elementary_step, forward_pathway_search]
+    status: FlowER-study recursive mechanism adaptation
+    preprocessing: Kekule structures with explicit hydrogens
+  gln:
+    url: https://github.com/Hanjun-Dai/GLN
+    ref: REQUIRED_FULL_SHA
+    task: retro_single_step
+    license: MIT
+  graph2edits:
+    url: https://github.com/Jamson-Zhong/Graph2Edits
+    ref: REQUIRED_FULL_SHA
+    task: retro_single_step
+    license: MIT

@@ -1,0 +1,10 @@
+id: e4_async_model_evolution
+claim_ids: [C-002]
+staleness_versions: [0, 1, 2, 4, 8]
+scenarios: [unequal_update_rates, architecture_swap, calibration_drift, label_prior_shift, expert_dropout]
+evaluate_all_nonempty_expert_subsets: true
+report_availability_pattern_counts: true
+inference_deadline_ms: [100, 500, 2000, null]
+comparators: [static_fusion, retrain_after_every_update, versioned_contract_fusion]
+metrics: [performance_staleness_auc, worst_subset_auroc, nll, ece, fusion_retraining_cost, bytes]
+completion_marker: artifacts/e4/COMPLETE

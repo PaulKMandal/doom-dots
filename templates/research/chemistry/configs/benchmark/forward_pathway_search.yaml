@@ -1,0 +1,17 @@
+task: forward_pathway_search
+input: unmapped_initial_reactants
+target: recorded_experimental_endpoint
+primary_metrics: [endpoint_recovery_at_beam_1, endpoint_recovery_at_beam_5, endpoint_recovery_at_beam_10]
+new_diagnostics: [imputed_path_exact, intermediate_validity]
+metric_note: endpoint recovery is the minimum beam width that recursively reaches the recorded endpoint; it is not exact equality to an imputed intermediate path
+conservation_metrics: [heavy_atom_conservation, proton_conservation, electron_conservation]
+new_diagnostics_conservation: [net_charge_conservation]
+search_budget:
+  max_depth: 15
+  beam_width: [1, 5, 10]
+  samples_per_state: REQUIRED
+  nbest: REQUIRED
+  max_expanded_states: REQUIRED
+  generated_candidates: REQUIRED
+  model_forward_calls: REQUIRED
+group_split_key: overall_mechanism_sequence_id
