@@ -25,25 +25,57 @@
   "Rsync exclude patterns for this project.
 
 Entries are rsync pattern strings passed as --exclude PATTERN.
-Set this in .dir-locals.el.  Nil means no excludes.")
+Set this in .dir-locals.el. Built-in generated-data exclusions always apply.")
 
-;; Directory-local values for these variables are expected in projects that use
-;; the remote helpers.  Mark them safe by shape so Emacs does not repeatedly
-;; prompt for every project-specific host/path/command string.
+(defcustom my/remote-default-sync-excludes
+  '("/.git/" "/.venv/" "__pycache__/" ".pytest_cache/" ".mypy_cache/"
+    ".ruff_cache/" "/data/" "/datasets/" "/artifacts/" "/runs/" "/results/"
+    "/reports/" "/outputs/" "/checkpoints/" "/weights/" "/wandb/" "/mlruns/"
+    "/review-bundles/")
+  "Paths never deleted or overwritten by normal laptop-to-server sync."
+  :type '(repeat string))
+
+(defcustom my/remote-sync-max-delete 1000
+  "Maximum paths one rsync invocation may delete before refusing."
+  :type 'integer)
+
+;; Project hosts, deployment paths, and shell commands require Emacs's
+;; exact-value approval.  A syntactically valid hostile host could still receive
+;; the checkout, while a hostile path is a destructive rsync target.
 (defun my/remote--safe-string (value)
   "Return non-nil when VALUE is a single-line string."
   (and (stringp value)
        (not (string-match-p "[\n\r]" value))))
 
-(put 'my/remote-host 'safe-local-variable #'my/remote--safe-string)
-(put 'my/remote-dir 'safe-local-variable #'my/remote--safe-string)
-(put 'my/remote-run-cmd 'safe-local-variable #'my/remote--safe-string)
-(put 'my/remote-setup-cmd 'safe-local-variable #'my/remote--safe-string)
-(put 'my/remote-test-cmd 'safe-local-variable #'my/remote--safe-string)
-(put 'my/remote-smoke-cmd 'safe-local-variable #'my/remote--safe-string)
+(dolist (variable '(my/remote-host my/remote-dir my/remote-run-cmd
+                    my/remote-setup-cmd my/remote-test-cmd my/remote-smoke-cmd))
+  ;; Clear properties installed by older versions when this file is evaluated
+  ;; in a long-running Emacs instance.
+  (put variable 'safe-local-variable nil))
 (put 'my/remote-sync-excludes
      'safe-local-variable
      (lambda (value) (and (listp value) (seq-every-p #'my/remote--safe-string value))))
+
+(defun my/remote--normalize-directory (value)
+  "Return canonical safe absolute POSIX directory VALUE, or nil."
+  (when (and (my/remote--safe-string value)
+             (string-prefix-p "/" value))
+    (let* ((normalized (if (string= value "/")
+                           value
+                         (string-remove-suffix "/" value)))
+           (parts (split-string normalized "/" t))
+           (bad-component
+            (or (string-match-p "//" normalized)
+                (seq-some (lambda (part) (member part '("." ".."))) parts)))
+           (shallow-home
+            (and (= (length parts) 2)
+                 (member (car parts) '("home" "Users")))))
+      (unless (or bad-component
+                  (< (length parts) 2)
+                  shallow-home
+                  (member normalized
+                          '("/" "/home" "/root" "/tmp" "/var" "/srv" "/opt" "/usr")))
+        normalized))))
 
 
 (defun my/project-root ()
@@ -53,12 +85,24 @@ Set this in .dir-locals.el.  Nil means no excludes.")
         (car (project-roots pr)))
       (user-error "Not inside a project")))
 
+(defun my/remote--command-present-p (value)
+  "Return non-nil when VALUE is a nonblank shell command string."
+  (and (stringp value) (not (string-empty-p (string-trim value)))))
+
 (defun my/remote-check (&optional require-run-cmd)
   (unless my/remote-host
     (user-error "Set my/remote-host in .dir-locals.el"))
+  (unless (string-match-p
+           "\\`[A-Za-z0-9][A-Za-z0-9_.@-]*\\'" my/remote-host)
+    (user-error "Refusing unsafe SSH host/alias: %s" my/remote-host))
   (unless my/remote-dir
     (user-error "Set my/remote-dir in .dir-locals.el"))
-  (when (and require-run-cmd (not my/remote-run-cmd))
+  (let ((normalized (my/remote--normalize-directory my/remote-dir)))
+    (unless normalized
+      (user-error "Refusing unsafe or shallow my/remote-dir: %s" my/remote-dir))
+    (setq my/remote-dir normalized))
+  (when (and require-run-cmd
+             (not (my/remote--command-present-p my/remote-run-cmd)))
     (user-error "Set my/remote-run-cmd in .dir-locals.el")))
 
 (defun my/remote--shell-join (parts)
@@ -69,7 +113,9 @@ Set this in .dir-locals.el.  Nil means no excludes.")
   "Return rsync --exclude arguments from `my/remote-sync-excludes'."
   (mapconcat (lambda (pattern)
                (format "--exclude %s" (shell-quote-argument pattern)))
-             my/remote-sync-excludes
+             (delete-dups
+              (append my/remote-default-sync-excludes
+                      my/remote-sync-excludes))
              " "))
 
 (defun my/remote--ssh-command (remote-command)
@@ -88,14 +134,23 @@ Set this in .dir-locals.el.  Nil means no excludes.")
          (mkdir-cmd
           (my/remote--ssh-command
            (format "mkdir -p %s" (shell-quote-argument my/remote-dir))))
-         (rsync-cmd
+         (rsync-options
+          (format "rsync -az --itemize-changes %s"
+                  (my/remote--exclude-args)))
+         (rsync-operands
+          (format "%s %s:%s"
+                  (shell-quote-argument root)
+                  (shell-quote-argument my/remote-host)
+                  (shell-quote-argument (file-name-as-directory my/remote-dir))))
+         (delete-check
           (format
-           "rsync -az --delete %s %s %s:%s"
-           (my/remote--exclude-args)
-           (shell-quote-argument root)
-           (shell-quote-argument my/remote-host)
-           (shell-quote-argument (file-name-as-directory my/remote-dir)))))
-    (my/remote--shell-join (list mkdir-cmd rsync-cmd))))
+           "deletes=$(LC_ALL=C %s --dry-run --delete %s | awk '$1 == \"*deleting\" {n++} END {print n+0}'); [ \"$deletes\" -le %d ] || { echo \"Refusing rsync: $deletes deletions exceed limit %d\" >&2; exit 25; }"
+           rsync-options rsync-operands
+           my/remote-sync-max-delete my/remote-sync-max-delete))
+         (rsync-cmd
+          (format "%s --delete-delay --max-delete=%d %s"
+                  rsync-options my/remote-sync-max-delete rsync-operands)))
+    (my/remote--shell-join (list mkdir-cmd delete-check rsync-cmd))))
 
 (defun my/remote--run-command (command)
   "Return the SSH command that runs COMMAND in the normal remote checkout."
@@ -163,7 +218,7 @@ commands below do so before invoking it."
   "Refresh Codex commits, then run `my/remote-setup-cmd' remotely."
   (interactive)
   (my/remote-check)
-  (unless my/remote-setup-cmd
+  (unless (my/remote--command-present-p my/remote-setup-cmd)
     (user-error "Set my/remote-setup-cmd in .dir-locals.el"))
   (my/remote--run-after-refresh my/remote-setup-cmd "*remote-setup*"))
 
@@ -171,7 +226,7 @@ commands below do so before invoking it."
   "Refresh Codex commits, then run `my/remote-test-cmd' remotely."
   (interactive)
   (my/remote-check)
-  (unless my/remote-test-cmd
+  (unless (my/remote--command-present-p my/remote-test-cmd)
     (user-error "Set my/remote-test-cmd in .dir-locals.el"))
   (my/remote--run-after-refresh my/remote-test-cmd "*remote-test*"))
 
@@ -179,7 +234,7 @@ commands below do so before invoking it."
   "Refresh Codex commits, then run `my/remote-smoke-cmd' remotely."
   (interactive)
   (my/remote-check)
-  (unless my/remote-smoke-cmd
+  (unless (my/remote--command-present-p my/remote-smoke-cmd)
     (user-error "Set my/remote-smoke-cmd in .dir-locals.el"))
   (my/remote--run-after-refresh my/remote-smoke-cmd "*remote-smoke*"))
 
@@ -193,7 +248,7 @@ commands below do so before invoking it."
   "Refresh Codex commits, sync, then run `my/remote-setup-cmd'."
   (interactive)
   (my/remote-check)
-  (unless my/remote-setup-cmd
+  (unless (my/remote--command-present-p my/remote-setup-cmd)
     (user-error "Set my/remote-setup-cmd in .dir-locals.el"))
   (my/remote--run-after-refresh my/remote-setup-cmd "*remote-setup*" t))
 
@@ -201,7 +256,7 @@ commands below do so before invoking it."
   "Refresh Codex commits, sync, then run `my/remote-smoke-cmd'."
   (interactive)
   (my/remote-check)
-  (unless my/remote-smoke-cmd
+  (unless (my/remote--command-present-p my/remote-smoke-cmd)
     (user-error "Set my/remote-smoke-cmd in .dir-locals.el"))
   (my/remote--run-after-refresh my/remote-smoke-cmd "*remote-smoke*" t))
 

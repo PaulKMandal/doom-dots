@@ -67,6 +67,10 @@
         :desc "Check remote Codex setup"      "d" #'my/codex-remote-doctor
         :desc "Show remote Codex status"      "t" #'my/codex-remote-status
         :desc "Monitor Codex tmux"            "a" #'my/codex-remote-attach
+        :desc "Codex TUI inside Emacs"         "e" #'my/codex-remote-embedded
+        :desc "Paste region into Codex"        "v" #'my/codex-remote-send-region
+        :desc "Initialize research repository" "n" #'my/codex-research-init
+        :desc "Bundle code for review"         "b" #'my/codex-research-bundle-code
         :desc "Start/reattach managed Codex TUI" "i" #'my/codex-remote-interactive
         :desc "Start/reattach Codex + job"       "I" #'my/codex-remote-interactive-job
         :desc "Pull live Codex commits"          "p" #'my/codex-remote-pull
@@ -86,14 +90,16 @@
         :desc "Monitor experiment tmux"        "a" #'my/codex-job-attach
         :desc "Stop experiment job"            "x" #'my/codex-job-stop
         :desc "Interpret finished job"          "i" #'my/codex-job-interpret
-        :desc "Show job interpretation"        "r" #'my/codex-job-analysis)))
+        :desc "Show job interpretation"        "r" #'my/codex-job-analysis
+        :desc "Pull report/results summary"     "p" #'my/codex-job-pull-report
+        :desc "Pull full results/checkpoints"   "P" #'my/codex-job-pull-full)))
 
 (set-popup-rule! "^\\*remote-vterm\\*$"
   :side 'bottom
   :size 0.3
   :select t
   :quit nil)
-(set-popup-rule! "^\\*codex-\\(remote-\\(logs\\|status\\|tmux\\)\\|job\\|jobs\\)"
+(set-popup-rule! "^\\*codex-\\(remote-\\(logs\\|status\\|tmux\\|vterm\\)\\|job\\|jobs\\)"
   :side 'bottom
   :size 0.4
   :select t

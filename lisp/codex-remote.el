@@ -8,6 +8,9 @@
 (declare-function make-term "term" (name program &optional startfile &rest switches))
 (declare-function term-char-mode "term" ())
 (declare-function term-check-proc "term" (buffer))
+(declare-function vterm "vterm" (&optional buffer-name))
+(declare-function vterm-send-return "vterm" ())
+(declare-function vterm-send-string "vterm" (string &optional paste-p))
 
 (defgroup my/codex-remote nil
   "Run durable Codex tasks on a configured remote project host."
@@ -44,6 +47,11 @@ are appended to this list."
 (defcustom my/codex-remote-research-agents-template
   (expand-file-name "templates/codex/research-AGENTS.md" doom-user-dir)
   "Template used when creating a repository-level research AGENTS.md."
+  :type 'file)
+
+(defcustom my/codex-research-repo-program
+  (expand-file-name "bin/research-repo" doom-user-dir)
+  "Path to the research scaffold and review-bundle helper."
   :type 'file)
 
 (defvar-local my/codex-remote-bootstrap-cmd nil
@@ -84,6 +92,14 @@ worktree-relative path persist outside the ephemeral task worktree.")
 (defvar-local my/codex-remote-max-untracked-bytes (* 20 1024 1024)
   "Largest nonignored untracked file included in a hidden snapshot.")
 
+(defcustom my/codex-job-report-pull-max-bytes (* 2 1024 1024 1024)
+  "Maximum compressed and unpacked size accepted for a report pull."
+  :type 'integer)
+
+(defcustom my/codex-job-full-pull-max-bytes (* 20 1024 1024 1024)
+  "Maximum compressed and unpacked size accepted for a full artifact pull."
+  :type 'integer)
+
 (defun my/codex-remote--safe-reasoning (value)
   "Return non-nil when VALUE is nil or a supported reasoning effort."
   (or (null value)
@@ -102,6 +118,9 @@ worktree-relative path persist outside the ephemeral task worktree.")
      (lambda (value) (and (integerp value) (> value 0))))
 
 (defvar-local my/codex-remote--prompt-context nil)
+
+(defvar my/codex-remote--embedded-buffers (make-hash-table :test #'equal)
+  "Map canonical local project roots to their embedded Codex vterm buffers.")
 
 (defconst my/codex-remote--active-states
   '("SUBMITTING" "STARTING" "BOOTSTRAPPING" "RUNNING" "FINALIZING"
@@ -713,6 +732,113 @@ When READ-ONLY is non-nil, attach the tmux client without allowing input."
               (set-process-query-on-exit-flag process nil)))
           (pop-to-buffer buffer))))))
 
+(defun my/codex-remote--embedded-buffer-name (task)
+  "Return the vterm buffer name for TASK."
+  (format "*codex-remote-vterm:%s*"
+          (or (my/codex-remote--get task 'task_id)
+              (my/codex-remote--get task 'run_id)
+              "unknown")))
+
+(defun my/codex-remote--open-vterm (context task)
+  "Open TASK's live tmux pane read-write inside Emacs vterm."
+  (my/codex-remote--require-live-tmux task)
+  (require 'vterm)
+  (let* ((root (file-truename (plist-get context :root)))
+         (buffer-name (my/codex-remote--embedded-buffer-name task))
+         (existing (get-buffer buffer-name)))
+    (if (and existing
+             (process-live-p (get-buffer-process existing)))
+        (pop-to-buffer existing)
+      (when existing
+        (kill-buffer existing))
+      (let* ((ssh (my/codex-remote--ssh-executable))
+             (args (my/codex-remote--tmux-interactive-args context task))
+             (command
+              (concat "exec "
+                      (mapconcat #'shell-quote-argument
+                                 (cons ssh args)
+                                 " "))))
+        (vterm buffer-name)
+        (puthash root (current-buffer) my/codex-remote--embedded-buffers)
+        (when-let ((process (get-buffer-process (current-buffer))))
+          (set-process-query-on-exit-flag process nil))
+        (vterm-send-string command)
+        (vterm-send-return)
+        (message
+         "Attached to managed Codex inside Emacs; closing the buffer detaches while tmux continues")))))
+
+(defun my/codex-remote--start-interactive-embedded (context)
+  "Start managed interactive Codex and attach to it inside Emacs."
+  (my/codex-remote--save-project-buffers (plist-get context :root))
+  (my/codex-remote--run
+   "interactive-start-embedded"
+   (my/codex-remote--interactive-command context)
+   context
+   :on-success
+   (lambda (response buffer)
+     (kill-buffer buffer)
+     (my/codex-remote--open-vterm
+      context (my/codex-remote--get response 'task)))))
+
+(defun my/codex-remote-embedded ()
+  "Start or reattach to managed interactive Codex inside Emacs vterm."
+  (interactive)
+  (let* ((context (plist-put (my/codex-remote--context) :job-policy "launch"))
+         (command (my/codex-remote--common-args "status" context)))
+    (my/codex-remote--run
+     "interactive-status-embedded" command context
+     :on-success
+     (lambda (response buffer)
+       (let* ((task (my/codex-remote--get response 'task))
+              (state (or (my/codex-remote--get task 'state) "NONE"))
+              (mode (my/codex-remote--task-execution-mode task)))
+         (pcase (my/codex-remote--interactive-action task)
+           ('attach
+            (kill-buffer buffer)
+            (my/codex-remote--open-vterm context task))
+           ('start
+            (kill-buffer buffer)
+            (run-at-time 0 nil #'my/codex-remote--start-interactive-embedded context))
+           (_
+            (my/codex-remote--show-status-response response buffer)
+            (message
+             "Outstanding %s Codex task is %s; import, archive, or discard it before starting an interactive TUI"
+             mode state))))))))
+
+(defun my/codex-remote--terminal-control-p (text)
+  "Return non-nil when TEXT is unsafe to inject through a terminal paste."
+  (seq-some
+   (lambda (character)
+     (and (or (< character 32)
+              (= character 127)
+              (and (>= character 128) (<= character 159)))
+          (not (memq character '(9 10)))))
+   (string-to-list text)))
+
+(defun my/codex-remote-send-region (begin end)
+  "Paste the active region into this project's embedded Codex composer.
+
+The text is not submitted automatically, so it can be reviewed or extended
+before pressing RET."
+  (interactive "r")
+  (unless (use-region-p)
+    (user-error "Select a region to send to Codex"))
+  (let* ((root (file-truename (my/project-root)))
+         (buffer (gethash root my/codex-remote--embedded-buffers))
+         (text (buffer-substring-no-properties begin end)))
+    (unless (and (buffer-live-p buffer)
+                 (process-live-p (get-buffer-process buffer)))
+      (user-error "No embedded Codex session is attached; run SPC r c e first"))
+    (when (my/codex-remote--terminal-control-p text)
+      (user-error
+       "The selected region contains terminal control characters; remove or encode them first"))
+    (with-current-buffer buffer
+      (vterm-send-string
+       (concat "Review this selected code or research context:\n\n" text)
+       t))
+    (pop-to-buffer buffer)
+    (message "Pasted selection into Codex without submitting it")))
+
 (defun my/codex-remote--external-terminal-command (context task)
   "Return the external-terminal command for TASK."
   (append
@@ -938,6 +1064,11 @@ importable through `my/codex-remote-apply'."
                          job 'completion_marker_present)
                         "yes"
                       "no"))))
+            ("Artifact evidence"
+             . ,(when (my/codex-remote--get job 'finished_at)
+                  (if (my/codex-remote--get job 'artifact_evidence_present)
+                      "yes"
+                    "no")))
             ("Tracked source clean"
              . ,(when source-integrity
                   (if (my/codex-remote--get source-integrity 'tracked_clean)
@@ -1175,8 +1306,108 @@ importable through `my/codex-remote-apply'."
                   (special-mode))))
             (display-buffer buffer))))))))
 
+(defun my/codex-job--pull (profile)
+  "Select a job and download its PROFILE export into the local project."
+  (let ((context (my/codex-remote--context))
+        (max-bytes (if (string= profile "full")
+                       my/codex-job-full-pull-max-bytes
+                     my/codex-job-report-pull-max-bytes)))
+    (my/codex-job--select
+     context
+     (lambda (run-id)
+       (my/codex-remote--run
+        (format "job-pull-%s" profile)
+        (my/codex-job--command
+         "job-pull" context run-id "--profile" profile
+         "--max-bytes" (number-to-string max-bytes))
+        context
+        :on-success
+        (lambda (response process-buffer)
+          (kill-buffer process-buffer)
+          (let* ((destination (my/codex-remote--get response 'destination))
+                 (warning (my/codex-remote--get response 'provenance_warning))
+                 (omitted (or (my/codex-remote--get response 'omitted_file_count) 0))
+                 (idempotent (my/codex-remote--get response 'idempotent))
+                 (complete (my/codex-remote--get response 'complete_artifact_set_verified))
+                 (selected (my/codex-remote--get response 'selected_artifacts_verified)))
+            (when (and warning (not (string-empty-p warning)))
+              (display-warning 'codex-remote warning :warning))
+            (message "%s %s export for %s to %s (%d omitted; %s)"
+                     (if idempotent "Reused verified" "Pulled")
+                     profile run-id destination omitted
+                     (cond (complete "complete artifact set verified")
+                           (selected "selected export files verified")
+                           (t "metadata only; artifacts unverified")))
+            (when (and destination (file-directory-p destination))
+              (dired destination)))))))))
+
+(defun my/codex-job-pull-report ()
+  "Pull a selected job's verified small report/result profile."
+  (interactive)
+  (my/codex-job--pull "report"))
+
+(defun my/codex-job-pull-full ()
+  "Pull a selected job's complete verified results and checkpoints."
+  (interactive)
+  (when (yes-or-no-p
+         "Pull the full results/checkpoints export? It may be very large. ")
+    (my/codex-job--pull "full")))
+
 
 ;; AGENTS.md setup -----------------------------------------------------------
+
+(defun my/codex-research--run-helper (&rest args)
+  "Run the research repository helper with ARGS and return parsed JSON."
+  (unless (file-executable-p my/codex-research-repo-program)
+    (user-error "Research repository helper is unavailable: %s"
+                my/codex-research-repo-program))
+  (with-temp-buffer
+    (let ((status (apply #'process-file
+                         my/codex-research-repo-program nil '(t t) nil args)))
+      (unless (= status 0)
+        (user-error "Research helper failed: %s"
+                    (string-trim (buffer-string))))
+      (json-parse-string (buffer-string)
+                         :object-type 'alist
+                         :array-type 'list
+                         :null-object nil
+                         :false-object nil))))
+
+(defun my/codex-research-init (root template host remote-dir)
+  "Initialize ROOT with a research TEMPLATE and remote settings."
+  (interactive
+   (let* ((root (file-name-as-directory
+                 (expand-file-name
+                  (read-directory-name "Research repository: " nil nil nil))))
+          (name (file-name-nondirectory (directory-file-name root)))
+          (template (completing-read
+                     "Research template: "
+                     '("generic" "chemistry" "federated") nil t nil nil "generic"))
+          (host (read-string "SSH host: " "rhel-test"))
+          (remote-dir
+           (read-string "Absolute server project directory: "
+                        (format "/home/rhel/Projects/%s" name))))
+     (list root template host remote-dir)))
+  (let ((response
+         (my/codex-research--run-helper
+          "init" "--project-root" root "--template" template
+          "--remote-host" host "--remote-dir" remote-dir)))
+    (message "Initialized %s research scaffold (%s)"
+             template
+             (my/codex-remote--get response 'root))
+    (find-file (expand-file-name "research/PROJECT.md" root))))
+
+(defun my/codex-research-bundle-code ()
+  "Create a secret-aware code/config/documentation review bundle."
+  (interactive)
+  (let* ((root (my/project-root))
+         (response
+          (my/codex-research--run-helper
+           "bundle-code" "--project-root" root))
+         (output (my/codex-remote--get response 'output)))
+    (message "Created code review bundle: %s" output)
+    (when output
+      (dired (file-name-directory output)))))
 
 (defun my/codex-remote-install-global-agents ()
   "Install or update the managed global Codex instructions on the server."

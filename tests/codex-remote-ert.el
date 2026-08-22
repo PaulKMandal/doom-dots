@@ -19,7 +19,61 @@
   (should-not (get 'my/codex-remote-test-cmd 'safe-local-variable))
   (should-not (get 'my/codex-remote-data-links 'safe-local-variable))
   (should-not (get 'my/codex-remote-model 'safe-local-variable))
-  (should-not (get 'my/codex-remote-profile 'safe-local-variable)))
+  (should-not (get 'my/codex-remote-profile 'safe-local-variable))
+  (should-not (get 'my/remote-host 'safe-local-variable))
+  (should-not (get 'my/remote-dir 'safe-local-variable))
+  (should-not (get 'my/remote-run-cmd 'safe-local-variable))
+  (should-not (get 'my/remote-setup-cmd 'safe-local-variable))
+  (should-not (get 'my/remote-test-cmd 'safe-local-variable))
+  (should-not (get 'my/remote-smoke-cmd 'safe-local-variable)))
+
+(ert-deftest codex-remote-region-terminal-controls-are-detectable ()
+  (should-not (my/codex-remote--terminal-control-p "safe\tcontext\n"))
+  (should (my/codex-remote--terminal-control-p
+           (concat "escape" (string 27) "[201~")))
+  (should (my/codex-remote--terminal-control-p (concat "nul" (string 0)))))
+
+(ert-deftest remote-dev-rejects-unsafe-sync-boundaries ()
+  (let ((my/remote-host "rhel-test")
+        (my/remote-dir "/home/researcher"))
+    (should-error (my/remote-check) :type 'user-error))
+  (let ((my/remote-host "-oProxyCommand=bad")
+        (my/remote-dir "/srv/research/project"))
+    (should-error (my/remote-check) :type 'user-error)))
+
+(ert-deftest remote-dev-normalization-rejects-dot-and-shallow-paths ()
+  (dolist (path '("/root/." "/home/user/." "/srv/." "//"
+                  "/root" "/home/user" "/srv"))
+    (should-not (my/remote--normalize-directory path)))
+  (should (equal (my/remote--normalize-directory "/home/rhel/Projects/paper/")
+                 "/home/rhel/Projects/paper")))
+
+(ert-deftest remote-dev-blank-command-is-unconfigured ()
+  (should-not (my/remote--command-present-p nil))
+  (should-not (my/remote--command-present-p ""))
+  (should-not (my/remote--command-present-p " \t\n"))
+  (should (my/remote--command-present-p "pytest -q")))
+
+(ert-deftest remote-dev-always-excludes-generated-research-storage ()
+  (let ((my/remote-sync-excludes '("project-extra/")))
+    (let ((args (my/remote--exclude-args)))
+      (should (string-match-p "\\.git/" args))
+      (should (string-match-p "--exclude /results/" args))
+      (should (string-match-p "--exclude /reports/" args))
+      (should-not (string-match-p "--exclude results/" args))
+      (should (string-match-p "project-extra/" args)))))
+
+(ert-deftest remote-dev-sync-counts-deletions-before-real-rsync ()
+  (let ((my/remote-host "rhel-test")
+        (my/remote-dir "/home/rhel/Projects/paper")
+        (my/remote-sync-max-delete 37))
+    (cl-letf (((symbol-function 'my/project-root) (lambda () "/tmp/paper/")))
+      (let ((command (my/remote--sync-command)))
+        (should (string-match-p "--dry-run --delete" command))
+        (should (string-match-p "deletions exceed limit 37" command))
+        (should (string-match-p "--delete-delay --max-delete=37" command))
+        (should (< (string-match "--dry-run --delete" command)
+                   (string-match "--delete-delay --max-delete=37" command)))))))
 
 (ert-deftest codex-remote-common-arguments-preserve-project-context ()
   (let ((my/codex-remote-backend "/tmp/codex-remote")
@@ -299,6 +353,32 @@
           "env" "TERM=xterm-256color"
           "tmux" "attach-session" "-t" "codex-session"))))))
 
+(ert-deftest codex-remote-embedded-vterm-uses-read-write-tmux-attachment ()
+  (let ((sent nil)
+        (buffer-name "*codex-remote-vterm:task-embedded*"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'require) (lambda (&rest _args) t))
+                  ((symbol-function 'my/codex-remote--require-live-tmux)
+                   (lambda (_task) "codex-session"))
+                  ((symbol-function 'my/codex-remote--ssh-executable)
+                   (lambda () "/usr/bin/ssh"))
+                  ((symbol-function 'vterm)
+                   (lambda (name) (switch-to-buffer (get-buffer-create name))))
+                  ((symbol-function 'vterm-send-string)
+                   (lambda (value &optional _paste) (setq sent value)))
+                  ((symbol-function 'vterm-send-return) #'ignore)
+                  ((symbol-function 'pop-to-buffer) #'switch-to-buffer))
+          (my/codex-remote--open-vterm
+           '(:root "/tmp/" :host "rhel-test" :timeout 5)
+           '((task_id . "task-embedded")
+             (tmux_session . "codex-session")
+             (tmux . ((exists . t) (running . t) (pane_dead . nil)))))
+          (should (string-match-p "tmux attach-session" sent))
+          (should-not (string-match-p "attach-session -r" sent)))
+      (remhash (file-truename "/tmp/") my/codex-remote--embedded-buffers)
+      (when (get-buffer buffer-name)
+        (kill-buffer buffer-name)))))
+
 
 (ert-deftest codex-remote-terminal-job-command-preserves-project-options ()
   (let ((my/codex-remote-backend "/tmp/codex-remote")
@@ -411,6 +491,23 @@
         "--timeout" "5"
         "--max-untracked-bytes" "2048"
         "--run-id" "run-123")))))
+
+(ert-deftest codex-remote-report-pull-forwards-configured-byte-cap ()
+  (let ((my/codex-job-report-pull-max-bytes 123456)
+        captured)
+    (cl-letf (((symbol-function 'my/codex-remote--context)
+               (lambda () '(:root "/tmp/project/")))
+              ((symbol-function 'my/codex-job--select)
+               (lambda (_context continuation) (funcall continuation "run-123")))
+              ((symbol-function 'my/codex-job--command)
+               (lambda (&rest args) args))
+              ((symbol-function 'my/codex-remote--run)
+               (lambda (_action command _context &rest _options)
+                 (setq captured command))))
+      (my/codex-job--pull "report"))
+    (should (equal captured
+                   '("job-pull" "run-123" "--profile" "report"
+                     "--max-bytes" "123456")))))
 
 (ert-deftest codex-remote-frozen-job-lines-show-source-command-and-analysis ()
   (let ((text
